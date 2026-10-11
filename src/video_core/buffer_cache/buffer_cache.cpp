@@ -32,6 +32,10 @@ namespace VideoCore {
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+// Buffer eviction is off for now: "idle" means not requested through ObtainBuffer, but the GPU
+// can still reach guest memory without that (it crashed with the threaded renderer on). The
+// VRAM cleanup setting frees images only until that is tracked reliably.
+static constexpr bool EVICT_IDLE_BUFFERS = false;
 static constexpr u64 RESIDENT_BUFFER_IDLE_TICKS = 300;
 static constexpr u64 RESIDENT_BUFFER_GC_COOLDOWN = 120;
 static constexpr u64 RESIDENT_BUFFER_GC_TARGET = 256_MB;
@@ -68,7 +72,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
-    vram_reclaim = EmulatorSettings.IsBbVramReclaim();
+    vram_reclaim = EVICT_IDLE_BUFFERS && EmulatorSettings.IsBbVramReclaim();
     const auto families = instance.GetBufferQueueFamilies();
     const vk::BufferCreateInfo probe_ci = {
         .flags =
