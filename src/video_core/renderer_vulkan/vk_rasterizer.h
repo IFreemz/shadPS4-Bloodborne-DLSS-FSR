@@ -41,7 +41,7 @@ class Rasterizer {
 public:
     /// The Bloodborne threaded renderer is in use.
     [[nodiscard]] bool ThreadedRendererActive() const noexcept {
-        return draw_pipe != nullptr && pipe_enabled;
+        return draw_pipe != nullptr && pipe_enabled.load(std::memory_order_relaxed);
     }
 
     /// Once per game frame (the presenter, when the frame is prepared): stutter report.
@@ -323,7 +323,7 @@ private:
     AmdGpu::CbDbExtent pipe_db_extent{};
     AmdGpu::ComputeProgram pipe_cs{};
     bool pipe_synced{};
-    bool pipe_enabled{};
+    std::atomic<bool> pipe_enabled{}; // read by the presentation thread
     std::vector<u16> pipe_blocks;
     std::chrono::steady_clock::time_point pipe_stats_time{};
     std::chrono::steady_clock::time_point vram_report_time{};

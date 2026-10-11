@@ -71,7 +71,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         Common::BbTuning::IsBloodborne(serial)) {
         pipe_regs = std::make_unique<AmdGpu::Regs>();
         pipe_enabled = EmulatorSettings.IsThreadedRenderer();
-        target_memo_enabled = pipe_enabled;
+        target_memo_enabled = pipe_enabled.load();
         texture_memo = std::make_unique<std::array<TextureMemoEntry, TextureMemoSize>>();
         scheduler.EnableThreadedRecording();
         sampler_memo = std::make_unique<std::array<SamplerMemoEntry, SamplerMemoSize>>();
