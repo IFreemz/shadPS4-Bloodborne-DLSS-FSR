@@ -414,6 +414,28 @@ struct GPUSettings {
     Setting<int> rcas_attenuation{250};
     Setting<bool> userfaultfd{false};
     Setting<bool> inline_fetch_shader{false};
+    // Bloodborne: records draws on a second thread (vk_draw_pipe.h).
+    Setting<bool> threaded_renderer{true};
+    // Bloodborne threaded renderer: statistics, time breakdown and hitch reports in the log.
+    Setting<bool> threaded_renderer_diagnostics{false};
+    // Bloodborne threaded renderer: GPU time per pass in the log (vk_gpu_profiler.h).
+    Setting<bool> threaded_renderer_gpu_profile{false};
+    // Bloodborne upscalers: replay the game's velocity draws at render resolution for object
+    // motion vectors (vk_bb_velocity_mirror). Off: camera motion only, ~2-3 ms less GPU time.
+    Setting<bool> bb_object_motion{true};
+    // Under the threaded renderer (each off: the emulator's original behaviour for that part).
+    // GPU readbacks on a second queue (copy engine), waiting only for the GPU work that wrote
+    // the data instead of all queued work.
+    Setting<bool> bb_readback_queue{true};
+    // Streaming: parallel copies, resident buffer memory in 64 MiB slabs, staging memory kept.
+    Setting<bool> bb_streaming{true};
+    // Copy shader batches in one compute dispatch, merged within 64 KiB.
+    Setting<bool> bb_merged_copies{true};
+    // Faster Windows locks and sleeps (applies at game start).
+    Setting<bool> bb_fast_locks{true};
+    // Flip a frame as soon as it's ready (between vblanks), evenly paced, instead of on the
+    // next vblank tick.
+    Setting<bool> bb_flip_when_ready{true};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -438,6 +460,17 @@ struct GPUSettings {
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
             make_override<GPUSettings>("userfaultfd", &GPUSettings::userfaultfd),
             make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
+            make_override<GPUSettings>("threaded_renderer", &GPUSettings::threaded_renderer),
+            make_override<GPUSettings>("threaded_renderer_diagnostics",
+                                       &GPUSettings::threaded_renderer_diagnostics),
+            make_override<GPUSettings>("threaded_renderer_gpu_profile",
+                                       &GPUSettings::threaded_renderer_gpu_profile),
+            make_override<GPUSettings>("bb_object_motion", &GPUSettings::bb_object_motion),
+            make_override<GPUSettings>("bb_readback_queue", &GPUSettings::bb_readback_queue),
+            make_override<GPUSettings>("bb_streaming", &GPUSettings::bb_streaming),
+            make_override<GPUSettings>("bb_merged_copies", &GPUSettings::bb_merged_copies),
+            make_override<GPUSettings>("bb_fast_locks", &GPUSettings::bb_fast_locks),
+            make_override<GPUSettings>("bb_flip_when_ready", &GPUSettings::bb_flip_when_ready),
         };
     }
 };
@@ -447,7 +480,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    direct_memory_access_enabled, dump_shaders, patch_shaders,
                                    vblank_frequency, full_screen, full_screen_mode, present_mode,
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
-                                   userfaultfd, inline_fetch_shader)
+                                   userfaultfd, inline_fetch_shader, threaded_renderer,
+                                   threaded_renderer_diagnostics, threaded_renderer_gpu_profile,
+                                   bb_object_motion, bb_readback_queue, bb_streaming,
+                                   bb_merged_copies, bb_fast_locks, bb_flip_when_ready)
 
 // -------------------------------
 // Vulkan settings
@@ -715,6 +751,15 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
+    SETTING_FORWARD_BOOL(m_gpu, ThreadedRenderer, threaded_renderer)
+    SETTING_FORWARD_BOOL(m_gpu, ThreadedRendererDiagnostics, threaded_renderer_diagnostics)
+    SETTING_FORWARD_BOOL(m_gpu, ThreadedRendererGpuProfile, threaded_renderer_gpu_profile)
+    SETTING_FORWARD_BOOL(m_gpu, BbObjectMotion, bb_object_motion)
+    SETTING_FORWARD_BOOL(m_gpu, BbReadbackQueue, bb_readback_queue)
+    SETTING_FORWARD_BOOL(m_gpu, BbStreaming, bb_streaming)
+    SETTING_FORWARD_BOOL(m_gpu, BbMergedCopies, bb_merged_copies)
+    SETTING_FORWARD_BOOL(m_gpu, BbFastLocks, bb_fast_locks)
+    SETTING_FORWARD_BOOL(m_gpu, BbFlipWhenReady, bb_flip_when_ready)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

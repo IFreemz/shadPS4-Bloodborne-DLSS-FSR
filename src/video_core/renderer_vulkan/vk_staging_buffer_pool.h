@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <chrono>
+
 #include <array>
 #include <memory>
 #include <vector>
@@ -74,7 +76,9 @@ private:
     StagingBufferRef RequestLarge(u64 size, VideoCore::MemoryType type, bool deferred,
                                   bool unsynchronized);
 
-    void TrimRing(Ring& ring);
+    void TrimRing(Ring& ring, size_t min_blocks);
+
+    void CountAllocation(u64 bytes, std::chrono::steady_clock::time_point start);
     void TrimLarge(std::vector<LargeBuffer>& cache);
 
     void PublishStats() const;
@@ -85,6 +89,7 @@ private:
     std::array<Ring, NUM_TYPES> rings;
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
     u64 frame = 0;
+    std::chrono::steady_clock::time_point frame_time{};
 };
 
 } // namespace Vulkan

@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "common/assert.h"
+#include "common/guest_stats.h"
 #include "common/native_clock.h"
 #include "common/thread.h"
 #include "core/libraries/kernel/kernel.h"
@@ -60,7 +61,15 @@ static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTime
     }
     const auto duration = std::chrono::nanoseconds(rqtp->tv_sec * 1'000'000'000 + rqtp->tv_nsec);
     std::chrono::nanoseconds remain;
+    const auto begin = std::chrono::steady_clock::now();
     const auto uninterrupted = Common::AccurateSleep(duration, &remain, interruptible);
+    Common::GuestStats::sleeps.fetch_add(1, std::memory_order_relaxed);
+    Common::GuestStats::sleep_requested_ns.fetch_add(duration.count(), std::memory_order_relaxed);
+    Common::GuestStats::sleep_actual_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             begin)
+            .count(),
+        std::memory_order_relaxed);
     if (rmtp) {
         rmtp->tv_sec = remain.count() / 1'000'000'000;
         rmtp->tv_nsec = remain.count() % 1'000'000'000;

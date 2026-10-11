@@ -3,11 +3,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 #include <tsl/robin_map.h>
 
+#include "common/bb_tuning.h"
 #include "common/lru_cache.h"
 #include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
@@ -116,11 +118,32 @@ public:
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
-        std::scoped_lock lk{mutex};
         Image& image = slot_images[image_id];
+        // Threaded renderer fast path (after bbport): skip the lock that guest fault handlers
+        // contend for when this image was already found clean, fully tracked and touched in
+        // this GC tick. Only clean_tick is read here: everything that would make the image need
+        // work again clears it under the lock, so a fault racing with this check is the same as
+        // one arriving just after it.
+        if (Common::BbTuning::Threaded() &&
+            std::atomic_ref<u64>(image.clean_tick).load(std::memory_order_acquire) ==
+                std::atomic_ref<u64>(gc_tick).load(std::memory_order_acquire) + 1) {
+            return;
+        }
+        std::scoped_lock lk{mutex};
         TrackImage(image_id);
         TouchImage(image);
         RefreshImage(image);
+        if (False(image.flags & ImageFlagBits::Dirty) &&
+            True(image.flags & ImageFlagBits::Registered) &&
+            image.track_addr == image.info.guest_address &&
+            image.track_addr_end == image.info.guest_address + image.info.guest_size) {
+            std::atomic_ref<u64>(image.clean_tick).store(gc_tick + 1, std::memory_order_release);
+        }
+    }
+
+    /// The image needs UpdateImage's full path again (called with the lock held).
+    static void ClearCleanTick(Image& image) {
+        std::atomic_ref<u64>(image.clean_tick).store(0, std::memory_order_release);
     }
 
     /// Resolves overlap between existing cache image and pending merged image
@@ -149,6 +172,30 @@ public:
         auto& image = slot_images[id];
         TouchImage(image);
         return image;
+    }
+
+    /// Changes whenever an image is registered or unregistered: FindImage results remembered
+    /// at one generation hold as long as it stays the same (threaded renderer memos).
+    [[nodiscard]] u64 RegistryGeneration() const noexcept {
+        return registry_generation.load(std::memory_order_acquire);
+    }
+
+    /// Changes whenever samplers are destroyed: remembered sampler handles hold while it stays.
+    [[nodiscard]] u64 SamplerGeneration() const noexcept {
+        return sampler_generation.load(std::memory_order_acquire);
+    }
+    /// The garbage collection tick (samplers and images not touched for a while are destroyed).
+    [[nodiscard]] u64 GcTick() const noexcept {
+        return std::atomic_ref<u64>(const_cast<u64&>(gc_tick)).load(std::memory_order_acquire);
+    }
+    /// GetSampler's LRU touch for a remembered sampler; once per GC tick is enough.
+    void TouchSampler(const AmdGpu::Sampler& sampler, bool is_depth);
+
+    /// FindImage's bookkeeping for an image found through such a memo.
+    void TouchFoundImage(ImageId id) {
+        auto& image = slot_images[id];
+        image.tick_accessed_last = scheduler.CurrentTick();
+        TouchImage(image);
     }
 
     /// Returns the image if the slot still holds the same image (uid), without refreshing it.
@@ -234,6 +281,26 @@ public:
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
+
+    /// What the cached images hold, by what the garbage collector can do with them.
+    struct MemoryReport {
+        struct Group {
+            u64 count{};
+            u64 bytes{};
+            u64 stale_count{}; ///< not used for 16+ collector ticks (old enough to collect)
+            u64 stale_bytes{};
+        };
+        Group clean;   ///< copies of guest memory: freed whenever they are old enough
+        Group written; ///< GPU-written linear images: freed (written back) only under pressure
+        Group stuck;   ///< GPU-written tiled images: never freed (no tiled write-back)
+        u64 extra_backing_bytes{}; ///< additional backing images (other sample counts)
+        u64 allocated_images{};    ///< all image slots, including ones awaiting deletion
+        u64 trigger{}, pressure{}, critical{}, gc_used{};
+        u64 evicted{}, written_back{}, skipped_stuck{}, skipped_written{}; ///< since last report
+        u64 gc_runs{};
+    };
+    /// Fills a report and resets the collector counters. Call on the thread running the collector.
+    MemoryReport TakeMemoryReport();
 
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
@@ -357,11 +424,15 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    u64 gc_evicted = 0, gc_written_back = 0, gc_skipped_stuck = 0, gc_skipped_written = 0;
+    u64 gc_runs = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
+    std::atomic<u64> registry_generation{0};
+    std::atomic<u64> sampler_generation{0};
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {

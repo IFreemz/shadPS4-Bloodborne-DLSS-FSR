@@ -13,6 +13,7 @@
 #include <fmt/xchar.h>
 #include <hwinfo/hwinfo.h>
 
+#include "common/bb_tuning.h"
 #include "common/debug.h"
 #include "common/logging/log.h"
 #include "common/string_util.h"
@@ -576,6 +577,14 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     } else {
         args.insert(args.begin(), guest_eboot_path);
     }
+
+    // Faster Windows locks and sleeps (threaded renderer toggle): decided before the game's
+    // threads start, as a lock can't change implementation while in use.
+    Common::BbTuning::fast_locks.store(Common::BbTuning::IsBloodborne(id) &&
+                                       EmulatorSettings.IsThreadedRenderer() &&
+                                       EmulatorSettings.IsBbFastLocks());
+    LOG_INFO(Loader, "Faster Windows locks and sleeps: {}",
+             Common::BbTuning::FastLocks() ? "on" : "off");
 
     const auto mods_folder = FileSys::OverlayPath(game_folder, "-mods");
 

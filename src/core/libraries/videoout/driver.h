@@ -8,6 +8,8 @@
 #include "core/libraries/videoout/video_out.h"
 
 #include <condition_variable>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <queue>
 
@@ -114,11 +116,22 @@ private:
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false,
                             u32 game_frame = 0);
     void PresentThread(std::stop_token token);
+    /// Threaded renderer (after bbport's bb:Present): swapchain work runs on its own thread so
+    /// a blocking acquire/present does not delay the vblank events the game paces itself by.
+    void SwapThread(std::stop_token token);
+    void RunPresenter(std::function<void()> work, bool if_idle = false);
+    bool UseSwapThread() const;
 
     std::mutex mutex;
     VideoOutPort main_port{};
+    std::mutex swap_mutex;
+    std::condition_variable_any swap_cv;
+    std::deque<std::function<void()>> swap_queue;
+    bool swap_busy = false;
+    std::jthread swap_thread; ///< before present_thread: destroyed after it
     std::jthread present_thread;
     std::queue<Request> requests;
+    std::condition_variable request_cv; ///< flip requests, for flips between vblanks
 };
 
 } // namespace Libraries::VideoOut

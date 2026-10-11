@@ -320,20 +320,24 @@ void PipelineCache::WarmUp() {
                                            std::move(profile_data));
         return;
     }
-    if (profile_data.size() != sizeof(Shader::Profile)) {
-        LOG_WARNING(Render,
-                    "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
-                    profile_data.size(), sizeof(Shader::Profile));
-        Storage::DataBase::Instance().Close();
-        return;
-    }
-
     Shader::Profile cached_profile{};
-    std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
-    if (cached_profile != profile) {
+    if (profile_data.size() == sizeof(Shader::Profile)) {
+        std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+    }
+    if (profile_data.size() != sizeof(Shader::Profile) || cached_profile != profile) {
+        // The cache used to be closed for the session here, so it was never rewritten and
+        // every later session compiled every shader again (a hitch on each new area). Start a
+        // fresh cache for this build and GPU instead (as bbport does).
         LOG_WARNING(Render,
-                    "Pipeline cache isn't compatible with current system. Ignoring the cache");
-        Storage::DataBase::Instance().Close();
+                    "Pipeline cache isn't compatible with current system (profile {} bytes, "
+                    "expected {}): rebuilding it",
+                    profile_data.size(), sizeof(Shader::Profile));
+        Storage::DataBase::Instance().Clear();
+        Storage::DataBase::Instance().FinishPreload();
+        profile_data.resize(sizeof(profile));
+        std::memcpy(profile_data.data(), &profile, sizeof(profile));
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                           std::move(profile_data));
         return;
     }
 

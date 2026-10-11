@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <xxhash.h>
 
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/guest_stats.h"
 #include "common/hash.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
@@ -125,6 +127,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         image.hash = XXH3_64bits(addr, image.info.guest_size);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
+    ClearCleanTick(image);
     UntrackImage(image_id);
 }
 
@@ -139,6 +142,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            ClearCleanTick(image);
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -169,6 +173,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        ClearCleanTick(image);
     });
 }
 
@@ -776,6 +781,7 @@ void TextureCache::RefreshImage(Image& image) {
 
     scheduler.EndRendering();
 
+    const auto upload_start = std::chrono::steady_clock::now();
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
@@ -784,6 +790,13 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    namespace GS = Common::GuestStats;
+    GS::image_uploads.fetch_add(1, std::memory_order_relaxed);
+    GS::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    GS::image_upload_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - upload_start)
+                                      .count(),
+                                  std::memory_order_relaxed);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
@@ -804,11 +817,20 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     return it->second.Handle();
 }
 
+void TextureCache::TouchSampler(const AmdGpu::Sampler& sampler, const bool is_depth) {
+    const u64 hash = HashCombine(XXH3_64bits(&sampler, sizeof(sampler)), is_depth);
+    std::scoped_lock lock{samplers_mutex};
+    if (const auto it = samplers.find(hash); it != samplers.end()) {
+        sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
+    }
+}
+
 void TextureCache::RegisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    registry_generation.fetch_add(1, std::memory_order_acq_rel);
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
@@ -820,6 +842,8 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    ClearCleanTick(image);
+    registry_generation.fetch_add(1, std::memory_order_acq_rel);
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
@@ -895,6 +919,7 @@ void TextureCache::UntrackImage(ImageId image_id) {
     if (!image.IsTracked()) {
         return;
     }
+    ClearCleanTick(image);
     const auto addr = image.track_addr;
     const auto size = image.track_addr_end - image.track_addr;
     image.track_addr = 0;
@@ -910,6 +935,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
     if (!image.IsTracked() || image_begin < image.track_addr) {
         return;
     }
+    ClearCleanTick(image);
     const auto addr = tracker.GetNextPageAddr(image_begin);
     const auto size = addr - image_begin;
     image.track_addr = addr;
@@ -929,6 +955,7 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
         return;
     }
     ASSERT(image.track_addr_end != 0);
+    ClearCleanTick(image);
     const auto addr = tracker.GetPageAddr(image_end);
     const auto size = image_end - addr;
     image.track_addr_end = addr;
@@ -948,6 +975,7 @@ void TextureCache::GarbageCollectImages() {
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
+    ++gc_runs;
     std::scoped_lock lock{mutex};
     bool pressured = false;
     bool aggresive = false;
@@ -971,14 +999,18 @@ void TextureCache::GarbageCollectImages() {
         const bool tiled = image.info.IsTiled();
         if (tiled && download) {
             // This is a workaround for now. We can't handle non-linear image downloads.
+            ++gc_skipped_stuck;
             return false;
         }
         if (download && !pressured) {
+            ++gc_skipped_written;
             return false;
         }
         if (download) {
             DownloadImageMemory(image_id);
+            ++gc_written_back;
         }
+        ++gc_evicted;
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
@@ -1005,6 +1037,54 @@ void TextureCache::GarbageCollectImages() {
     }
 }
 
+TextureCache::MemoryReport TextureCache::TakeMemoryReport() {
+    std::scoped_lock lock{mutex};
+    MemoryReport report{};
+    const auto group_of = [&report](const Image& image) -> MemoryReport::Group& {
+        if (!image.SafeToDownload()) {
+            return report.clean;
+        }
+        return image.info.IsTiled() ? report.stuck : report.written;
+    };
+    const auto image_bytes = [](const Image& image) {
+        u64 bytes = 0;
+        for (const auto& backing : image.backing_images) {
+            bytes += backing.image.size_bytes;
+        }
+        return bytes;
+    };
+    lru_cache.ForEachItemBelow(gc_tick, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        const u64 bytes = image_bytes(image);
+        auto& group = group_of(image);
+        ++group.count;
+        group.bytes += bytes;
+        if (image.backing) {
+            report.extra_backing_bytes += bytes - image.backing->image.size_bytes;
+        }
+    });
+    // The collector only looks at images untouched for at least 16 ticks.
+    if (gc_tick >= 16) {
+        lru_cache.ForEachItemBelow(gc_tick - 16, [&](ImageId image_id) {
+            const Image& image = slot_images[image_id];
+            auto& group = group_of(image);
+            ++group.stale_count;
+            group.stale_bytes += image_bytes(image);
+        });
+    }
+    report.allocated_images = slot_images.Size();
+    report.trigger = trigger_gc_memory;
+    report.pressure = pressure_gc_memory;
+    report.critical = critical_gc_memory;
+    report.gc_used = total_used_memory;
+    report.evicted = std::exchange(gc_evicted, 0);
+    report.written_back = std::exchange(gc_written_back, 0);
+    report.skipped_stuck = std::exchange(gc_skipped_stuck, 0);
+    report.skipped_written = std::exchange(gc_skipped_written, 0);
+    report.gc_runs = std::exchange(gc_runs, 0);
+    return report;
+}
+
 void TextureCache::GarbageCollectSamplers() {
     total_used_samplers = samplers.size();
     if (total_used_samplers < trigger_gc_samplers) {
@@ -1029,6 +1109,7 @@ void TextureCache::GarbageCollectSamplers() {
         }
         --num_deletions;
         const size_t lru_id = samplers.at(hash).lru_id;
+        sampler_generation.fetch_add(1, std::memory_order_acq_rel);
         samplers.erase(hash);
         sampler_lru_cache.Free(lru_id);
         return false;
@@ -1047,7 +1128,8 @@ void TextureCache::GarbageCollectSamplers() {
 
 void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
-        ++gc_tick;
+        // Atomic: UpdateImage's fast path reads it without the lock.
+        std::atomic_ref<u64>(gc_tick).store(gc_tick + 1, std::memory_order_release);
     };
 
     GarbageCollectImages();

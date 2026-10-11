@@ -7,6 +7,7 @@
 
 #include "common/assert.h"
 #include "common/error.h"
+#include "common/guest_stats.h"
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
 #include "common/singleton.h"
@@ -79,6 +80,7 @@ namespace Libraries::Kernel {
 
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
+    Common::GuestStats::file_opens.fetch_add(1, std::memory_order_relaxed);
 
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();

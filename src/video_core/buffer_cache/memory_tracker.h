@@ -7,6 +7,7 @@
 #include <deque>
 #include <vector>
 
+#include "common/guest_stats.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_manager.h"
 
@@ -55,6 +56,13 @@ public:
         });
     }
 
+    /// See RegionManager::ExtendWriteFault. The window must not cross a region.
+    void ExtendWriteFault(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->ExtendWriteFault(offset, size);
+        });
+    }
+
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         if (readbacks_mode == GpuReadbacksMode::Disabled) {
@@ -85,6 +93,15 @@ public:
                     manager->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::Set>(
                         offset, size, func);
                 } else {
+                    // Read-only bindings skip the region lock when no page in range is CPU
+                    // modified (after bbport). A guest write sets its page's bit in the fault
+                    // handler before the store, and the draw using the data reaches this thread
+                    // after the guest submitted it.
+                    if (!manager->template IsRegionModified<Type::CPU>(offset, size)) {
+                        Common::GuestStats::upload_checks_skipped.fetch_add(
+                            1, std::memory_order_relaxed);
+                        return;
+                    }
                     manager
                         ->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::None>(
                             offset, size, func);

@@ -198,12 +198,23 @@ private:
 };
 
 bool ForceDrawSeed() {
-    const char* value = std::getenv("SHADPS4_BB_MIRROR_DRAW_SEED");
-    return value && std::string_view{value} == "1";
+    // Read once: getenv is slow on Windows and this runs for every mirrored draw.
+    static const bool force = [] {
+        const char* value = std::getenv("SHADPS4_BB_MIRROR_DRAW_SEED");
+        return value && std::string_view{value} == "1";
+    }();
+    return force;
 }
 } // namespace
 struct BbVelocityMirror::Impl {
     bool requested{}, stopped{}, failed{}, frame_drawn{};
+    // Deferred replays of the current run of mirrored draws (one mirror pass, see Defer).
+    bool batch_active{};
+    RenderState batch_state{};
+    BbVelocityMirror::Commands batch_commands;
+    u64 flushes{};
+    Scheduler* scheduler{};
+    bool enabled{true};
     u64 draws{};
     std::unique_ptr<VideoCore::UniqueImage> image;
     std::unique_ptr<VideoCore::UniqueImage> depth;
@@ -240,6 +251,32 @@ struct BbVelocityMirror::Impl {
             vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
         layout = next;
     }
+    /// Same as Transit/TransitDepth, recorded in order through the scheduler (threaded
+    /// recording keeps the command buffer with its recording thread).
+    template <bool depth_image>
+    void TransitRecorded(Scheduler& scheduler, vk::ImageLayout next, vk::PipelineStageFlags2 stage,
+                         vk::AccessFlags2 access) {
+        auto& current = depth_image ? depth_layout : layout;
+        const vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask =
+                current == vk::ImageLayout::eUndefined
+                    ? vk::AccessFlagBits2::eNone
+                    : vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+            .dstStageMask = stage,
+            .dstAccessMask = access,
+            .oldLayout = current,
+            .newLayout = next,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = depth_image ? depth->image : image->image,
+            .subresourceRange = depth_image ? DepthRange(depth_format) : Range};
+        scheduler.Record([barrier](vk::CommandBuffer command) {
+            command.pipelineBarrier2(
+                vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+        });
+        current = next;
+    }
     void TransitDepth(vk::CommandBuffer command, vk::ImageLayout next,
                       vk::PipelineStageFlags2 stage, vk::AccessFlags2 access) {
         const vk::ImageMemoryBarrier2 barrier{
@@ -264,12 +301,16 @@ struct BbVelocityMirror::Impl {
 BbVelocityMirror::BbVelocityMirror() : impl{std::make_unique<Impl>()} {}
 BbVelocityMirror::~BbVelocityMirror() = default;
 bool BbVelocityMirror::Requested() const {
-    return impl->requested;
+    return impl->requested && impl->enabled;
 }
-bool BbVelocityMirror::BeginDraw(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
-                                 const GraphicsPipeline& pipeline, const RenderState& guest_state,
-                                 VideoCore::Image* guest_depth, u32 depth_layer,
-                                 const std::function<void()>& rebind) {
+void BbVelocityMirror::SetEnabled(bool enabled) {
+    impl->enabled = enabled;
+}
+bool BbVelocityMirror::Defer(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
+                             const GraphicsPipeline& pipeline, const RenderState& guest_state,
+                             VideoCore::Image* guest_depth, u32 depth_layer, const Capture& capture,
+                             bool& guest_pass_ended) {
+    guest_pass_ended = false;
     if (!impl->requested || impl->stopped || impl->failed || !pipeline.VelocityMirrorHandle() ||
         guest_state.width < MinSourceWidth || guest_state.height < MinSourceHeight ||
         guest_state.num_layers != 1 || guest_state.num_color_attachments != 1 ||
@@ -320,7 +361,8 @@ bool BbVelocityMirror::BeginDraw(const Instance& instance, Runtime& runtime, Sch
         std::abs(viewport.height) != float(SourceHeight))
         return false;
     if (impl->image && (impl->size != impl->target || impl->depth_format != depth_ci.format)) {
-        scheduler.Finish(); // the old images may still be in flight
+        scheduler.Finish(); // the old images may still be in flight (pending draws flushed)
+        guest_pass_ended = true;
         impl->image.reset();
         impl->depth.reset();
         impl->view.reset();
@@ -340,7 +382,12 @@ bool BbVelocityMirror::BeginDraw(const Instance& instance, Runtime& runtime, Sch
     scissors[0].offset.y = s32(std::lround(scissors[0].offset.y * fy));
     scissors[0].extent.width = u32(std::lround(scissors[0].extent.width * fx));
     scissors[0].extent.height = u32(std::lround(scissors[0].extent.height * fy));
-    scheduler.EndRendering();
+    if (!impl->frame_drawn) {
+        // Seeding the frame's mirror depth runs outside the guest pass (once per frame).
+        scheduler.EndRendering();
+        guest_pass_ended = true;
+    }
+    impl->scheduler = &scheduler;
     try {
         if (!impl->image) {
             impl->image = std::make_unique<VideoCore::UniqueImage>(instance.GetDevice(),
@@ -384,7 +431,9 @@ bool BbVelocityMirror::BeginDraw(const Instance& instance, Runtime& runtime, Sch
                 throw std::runtime_error("velocity mirror depth view unavailable");
             impl->depth_view = std::move(result_depth.value);
         }
-        const auto command = scheduler.CommandBuffer();
+        // Seeding (first mirrored draw of a frame) records directly; the per-draw path below
+        // goes through Record() and leaves the command buffer with the recording thread.
+        const auto command = impl->frame_drawn ? vk::CommandBuffer{} : scheduler.CommandBuffer();
         if (!impl->seed_logged) {
             impl->seed_logged = true;
             LOG_INFO(Render_Vulkan, "[BB-VELOCITY-MIRROR] Depth seeded by {}",
@@ -454,7 +503,6 @@ bool BbVelocityMirror::BeginDraw(const Instance& instance, Runtime& runtime, Sch
             auto& dynamic = scheduler.GetDynamicState();
             dynamic.Invalidate();
             dynamic.Commit(instance, command);
-            rebind();
         }
         if (!impl->frame_drawn && blit) {
             // Seed the exact original render-area depth/stencil BEFORE the first guest draw.
@@ -492,15 +540,6 @@ bool BbVelocityMirror::BeginDraw(const Instance& instance, Runtime& runtime, Sch
             runtime.FlushBarriers();
             impl->source_depth_uid = guest_depth->image_uid;
         }
-        impl->TransitDepth(command, vk::ImageLayout::eDepthStencilAttachmentOptimal,
-                           vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                               vk::PipelineStageFlagBits2::eLateFragmentTests,
-                           vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-                               vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
-        impl->Transit(command, vk::ImageLayout::eColorAttachmentOptimal,
-                      vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                      vk::AccessFlagBits2::eColorAttachmentRead |
-                          vk::AccessFlagBits2::eColorAttachmentWrite);
         RenderState mirror{};
         mirror.width = Width;
         mirror.height = Height;
@@ -517,10 +556,28 @@ bool BbVelocityMirror::BeginDraw(const Instance& instance, Runtime& runtime, Sch
             .image_layout = vk::ImageLayout::eColorAttachmentOptimal,
             .clear_value = {std::bit_cast<u32>(.5f), std::bit_cast<u32>(.5f), 0, 0},
             .is_clear = impl->frame_drawn ? 0u : 1u};
-        command.setViewportWithCount(viewports);
-        command.setScissorWithCount(scissors);
-        scheduler.BeginRendering(mirror);
-        command.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.VelocityMirrorHandle());
+        if (impl->batch_active) {
+            // Same mirror pass (whether it clears is decided by the batch's first draw)?
+            RenderState probe = mirror;
+            probe.color_attachments[0].is_clear = impl->batch_state.color_attachments[0].is_clear;
+            if (probe == impl->batch_state) {
+                mirror = impl->batch_state;
+            } else {
+                scheduler.EndRendering(); // the pass-end hook flushes the batch
+                guest_pass_ended = true;
+                FlushBatch(scheduler);
+            }
+        }
+        if (!impl->batch_active) {
+            impl->batch_state = mirror;
+            impl->batch_active = true;
+            impl->batch_commands.clear();
+        }
+        impl->batch_commands.emplace_back(
+            [handle = pipeline.VelocityMirrorHandle()](vk::CommandBuffer command) {
+                command.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
+            });
+        capture(impl->batch_commands, viewports, scissors);
         impl->frame_drawn = true;
         ++impl->draws;
         return true;
@@ -532,13 +589,47 @@ bool BbVelocityMirror::BeginDraw(const Instance& instance, Runtime& runtime, Sch
         return false;
     }
 }
-void BbVelocityMirror::EndDraw(Scheduler& scheduler) {
+bool BbVelocityMirror::HasBatch() const {
+    return impl->batch_active;
+}
+u64 BbVelocityMirror::Flushes() const {
+    return impl->flushes;
+}
+void BbVelocityMirror::FlushBatch(Scheduler& scheduler) {
+    if (!impl->batch_active) {
+        return;
+    }
+    impl->batch_active = false;
+    ++impl->flushes;
+    auto commands = std::move(impl->batch_commands);
+    impl->batch_commands.clear();
+    impl->TransitRecorded<true>(scheduler, vk::ImageLayout::eDepthStencilAttachmentOptimal,
+                                vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                    vk::PipelineStageFlagBits2::eLateFragmentTests,
+                                vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
+    impl->TransitRecorded<false>(scheduler, vk::ImageLayout::eColorAttachmentOptimal,
+                                 vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                 vk::AccessFlagBits2::eColorAttachmentRead |
+                                     vk::AccessFlagBits2::eColorAttachmentWrite);
+    scheduler.BeginRendering(impl->batch_state);
+    scheduler.Record([commands = std::move(commands)](vk::CommandBuffer command) mutable {
+        for (auto& replay : commands) {
+            replay(vk::CommandBuffer{command});
+        }
+    });
     scheduler.EndRendering();
+    // The replays changed the bound pipeline, descriptors and dynamic state.
     scheduler.GetDynamicState().Invalidate();
 }
 std::optional<BbVelocityMirror::Frame> BbVelocityMirror::ConsumeFrame(vk::CommandBuffer command) {
     if (!impl->requested || impl->stopped || impl->failed || !impl->frame_drawn || !impl->image)
         return {};
+    if (impl->batch_active && impl->scheduler) {
+        // Normally flushed when the guest pass ended; the caller records directly here.
+        impl->scheduler->EndRendering();
+        FlushBatch(*impl->scheduler);
+    }
     impl->frame_drawn = false;
     impl->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
                   vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
@@ -551,6 +642,8 @@ void BbVelocityMirror::Shutdown(Scheduler& scheduler) {
     if (!impl->requested || impl->stopped)
         return;
     impl->stopped = true;
+    impl->batch_active = false;
+    impl->batch_commands.clear();
     scheduler.Finish();
     impl->view.reset();
     impl->depth_view.reset();
