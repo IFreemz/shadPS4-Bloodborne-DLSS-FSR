@@ -7,9 +7,9 @@
 #include <cstring>
 
 #include "common/alignment.h"
+#include "common/assert.h"
 #include "common/bb_tuning.h"
 #include "common/elf_info.h"
-#include "common/assert.h"
 #include "common/guest_stats.h"
 #include "common/types.h"
 #include "core/devtools/widget/gpu_memory.h"
@@ -56,9 +56,8 @@ StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& sched
     auto& ring = rings[u32(MemoryType::HostUncached)];
     for (size_t i = 0; i < MIN_UPLOAD_BLOCKS; ++i) {
         auto& block = ring.blocks.emplace_back(Block{
-            .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler,
-                                                                MemoryType::HostUncached,
-                                                                BLOCK_SIZE),
+            .buffer = std::make_unique<VideoCore::StreamBuffer>(
+                instance, scheduler, MemoryType::HostUncached, BLOCK_SIZE),
             .last_used_frame = 0,
         });
         if (!block.buffer->mapped_data.empty()) {
@@ -204,9 +203,8 @@ void StagingBufferPool::TickFrame() {
     }
     ++frame;
     for (size_t type = 0; type < rings.size(); ++type) {
-        TrimRing(rings[type], streaming && type == u32(MemoryType::HostUncached)
-                                  ? MIN_UPLOAD_BLOCKS
-                                  : size_t{0});
+        TrimRing(rings[type], streaming && type == u32(MemoryType::HostUncached) ? MIN_UPLOAD_BLOCKS
+                                                                                 : size_t{0});
     }
     for (auto& cache : large_caches) {
         TrimLarge(cache);
@@ -239,10 +237,9 @@ void StagingBufferPool::TrimRing(Ring& ring, size_t min_blocks) {
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
     std::erase_if(cache, [this](const LargeBuffer& entry) {
-        const u64 idle = Common::BbTuning::Streaming() ? LARGE_IDLE_FRAMES_STREAMING
-                                                       : LARGE_IDLE_FRAMES;
-        return !entry.held && frame - entry.last_used_frame >= idle &&
-               scheduler.IsFree(entry.tick);
+        const u64 idle =
+            Common::BbTuning::Streaming() ? LARGE_IDLE_FRAMES_STREAMING : LARGE_IDLE_FRAMES;
+        return !entry.held && frame - entry.last_used_frame >= idle && scheduler.IsFree(entry.tick);
     });
 }
 

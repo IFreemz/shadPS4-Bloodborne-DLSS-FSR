@@ -12,8 +12,8 @@
 
 namespace Common::GuestStats {
 
-inline std::atomic<u64> mutex_waits{0};       ///< mutex locks that had to block
-inline std::atomic<u64> sleeps{0};            ///< guest sleeps (usleep, nanosleep)
+inline std::atomic<u64> mutex_waits{0};        ///< mutex locks that had to block
+inline std::atomic<u64> sleeps{0};             ///< guest sleeps (usleep, nanosleep)
 inline std::atomic<u64> sleep_requested_ns{0}; ///< total time asked for
 inline std::atomic<u64> sleep_actual_ns{0};    ///< total time actually slept
 
@@ -25,9 +25,9 @@ inline std::atomic<u64> protect_ns{0};
 inline std::atomic<u64> upload_checks_skipped{0};
 
 /// Renderer events for the threaded renderer's hitch report (frames much slower than usual).
-inline std::atomic<u64> gpu_wait_ns{0};      ///< CPU time spent waiting for the GPU
+inline std::atomic<u64> gpu_wait_ns{0}; ///< CPU time spent waiting for the GPU
 inline std::atomic<u64> gpu_waits{0};
-inline std::atomic<u64> slowest_wait_ns{0};  ///< slowest single GPU wait since the last report
+inline std::atomic<u64> slowest_wait_ns{0}; ///< slowest single GPU wait since the last report
 inline std::atomic<const char*> slowest_wait_file{nullptr};
 inline std::atomic<u32> slowest_wait_line{0};
 inline std::atomic<u64> pipelines_compiled{0};

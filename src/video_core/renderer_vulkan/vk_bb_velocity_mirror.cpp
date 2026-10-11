@@ -272,8 +272,8 @@ struct BbVelocityMirror::Impl {
             .image = depth_image ? depth->image : image->image,
             .subresourceRange = depth_image ? DepthRange(depth_format) : Range};
         scheduler.Record([barrier](vk::CommandBuffer command) {
-            command.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
-                                                        .pImageMemoryBarriers = &barrier});
+            command.pipelineBarrier2(
+                vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
         });
         current = next;
     }
@@ -559,8 +559,7 @@ bool BbVelocityMirror::Defer(const Instance& instance, Runtime& runtime, Schedul
         if (impl->batch_active) {
             // Same mirror pass (whether it clears is decided by the batch's first draw)?
             RenderState probe = mirror;
-            probe.color_attachments[0].is_clear =
-                impl->batch_state.color_attachments[0].is_clear;
+            probe.color_attachments[0].is_clear = impl->batch_state.color_attachments[0].is_clear;
             if (probe == impl->batch_state) {
                 mirror = impl->batch_state;
             } else {

@@ -3,9 +3,9 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
-#include "common/guest_stats.h"
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/guest_stats.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
@@ -394,8 +394,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (nop->header.count.Value() == 0) {
                     break;
                 }
-                if (rasterizer && (guest_markers_enabled || nop->data_block[0] ==
-                                                                PM4CmdNop::PayloadType::PatchedFlip)) {
+                if (rasterizer && (guest_markers_enabled ||
+                                   nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip)) {
                     rasterizer->DrainDrawPipe();
                 }
 
@@ -815,8 +815,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
-                if (rasterizer &&
-                    event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
+                if (rasterizer && event_eos->command != PM4CmdEventWriteEos::Command::GdsStore) {
                     // Threaded renderer: signalled in order with the queued draws.
                     const u64 packet = rasterizer->RunInOrder(
                         [](Vulkan::Rasterizer& r, const u8* data) {
@@ -983,8 +982,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         Common::GuestStats::cmd_state.store(
                             u8(Common::GuestStats::CmdState::GuestWait), std::memory_order_relaxed);
                         YIELD_GFX();
-                        Common::GuestStats::cmd_state.store(
-                            u8(Common::GuestStats::CmdState::Work), std::memory_order_relaxed);
+                        Common::GuestStats::cmd_state.store(u8(Common::GuestStats::CmdState::Work),
+                                                            std::memory_order_relaxed);
                     }
                     mem_semaphore->Decrement();
                 }
@@ -1033,8 +1032,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     : Common::GuestStats::CmdState::GuestWait),
                         std::memory_order_relaxed);
                     YIELD_GFX();
-                    Common::GuestStats::cmd_state.store(
-                        u8(Common::GuestStats::CmdState::Work), std::memory_order_relaxed);
+                    Common::GuestStats::cmd_state.store(u8(Common::GuestStats::CmdState::Work),
+                                                        std::memory_order_relaxed);
                 }
                 break;
             }

@@ -30,8 +30,8 @@ public:
     using Commands = std::vector<Common::UniqueFunction<void, vk::CommandBuffer>>;
     /// Records a mirror draw's bindings and draw into `out` (scheduler capture), with the
     /// mirror's viewport and scissor.
-    using Capture = std::function<void(Commands& out, const Viewports& viewports,
-                                       const Scissors& scissors)>;
+    using Capture =
+        std::function<void(Commands& out, const Viewports& viewports, const Scissors& scissors)>;
     /// Defers this guest draw's replay into the mirror pass of the current batch (one pass per
     /// run of mirrored draws instead of a pass break out of and back into the guest pass for
     /// each). The frame's first mirrored draw seeds the mirror depth, which records directly

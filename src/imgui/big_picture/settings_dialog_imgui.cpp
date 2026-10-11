@@ -855,8 +855,8 @@ void SettingsWindow::AddSettingSection(const char* title, const char* note, bool
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight() * 0.5f));
     ImGui::Separator();
     // Amber for experimental settings, the usual text colour otherwise.
-    const ImVec4 colour = experimental ? ImVec4(1.0f, 0.72f, 0.25f, 1.0f)
-                                       : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    const ImVec4 colour =
+        experimental ? ImVec4(1.0f, 0.72f, 0.25f, 1.0f) : ImGui::GetStyleColorVec4(ImGuiCol_Text);
     ImGui::TextColored(colour, "%s", title);
     ImGui::TableNextColumn();
     ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight() * 0.5f));

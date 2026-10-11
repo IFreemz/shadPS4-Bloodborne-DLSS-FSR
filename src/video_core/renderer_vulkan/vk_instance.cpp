@@ -457,8 +457,7 @@ bool Instance::CreateDevice() {
             LOG_INFO(Render_Vulkan, "GPU readbacks: no second queue, using the graphics queue");
         }
     }
-    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f,
-                                                    1.0f, 1.0f, 1.0f, 1.0f};
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
     std::vector<vk::DeviceQueueCreateInfo> queue_infos;
     for (u32 family = 0; family < queue_counts.size(); ++family)
         if (queue_counts[family])
@@ -695,8 +694,7 @@ bool Instance::CreateDevice() {
             buffer_queue_family_count = 2;
         }
         const auto flags = family_properties[readback_family].queueFlags;
-        LOG_INFO(Render_Vulkan, "GPU readbacks: queue {}.{} ({})", readback_family,
-                 readback_index,
+        LOG_INFO(Render_Vulkan, "GPU readbacks: queue {}.{} ({})", readback_family, readback_index,
                  (flags & vk::QueueFlagBits::eGraphics)  ? "second graphics queue"
                  : (flags & vk::QueueFlagBits::eCompute) ? "async compute queue"
                                                          : "copy engine");

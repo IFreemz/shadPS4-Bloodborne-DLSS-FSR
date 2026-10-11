@@ -193,10 +193,10 @@ private:
     };
     std::mutex readback_mutex;
     std::unordered_map<u64, ReadbackRegion> readback_regions; ///< by 1 MiB region
-    std::array<u64, 4> readback_writer_ns{};                ///< GPU wait time by writer state
+    std::array<u64, 4> readback_writer_ns{};                  ///< GPU wait time by writer state
     u64 readback_max_wait_ns{};
     std::mutex gpu_write_mutex;
-    std::unordered_map<u64, u64> gpu_write_ticks; ///< 64 KiB block -> tick of the last GPU write
+    std::unordered_map<u64, u64> gpu_write_ticks;    ///< 64 KiB block -> tick of the last GPU write
     u64 readback_queue_count{}, readback_queue_ns{}; ///< readbacks on the second queue (report)
 
     /// Notes that GPU work recorded now writes [device_addr, device_addr + size).

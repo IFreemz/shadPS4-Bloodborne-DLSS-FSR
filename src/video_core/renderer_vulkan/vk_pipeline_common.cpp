@@ -3,11 +3,11 @@
 
 #include <boost/container/static_vector.hpp>
 
+#include <boost/container/small_vector.hpp>
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
-#include <boost/container/small_vector.hpp>
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
@@ -84,11 +84,11 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     }
 
     if (uses_push_descriptors) {
-        scheduler.Record(
-            [bind_point, layout, pushed = PushedWrites{set_writes}](vk::CommandBuffer cmdbuf) mutable {
-                pushed.Fixup();
-                cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, pushed.writes);
-            });
+        scheduler.Record([bind_point, layout,
+                          pushed = PushedWrites{set_writes}](vk::CommandBuffer cmdbuf) mutable {
+            pushed.Fixup();
+            cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, pushed.writes);
+        });
         return;
     }
 

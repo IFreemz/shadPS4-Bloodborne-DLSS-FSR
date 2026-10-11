@@ -123,11 +123,10 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
 
     // In order through the recording thread (uploads run a few thousand times a second; a
     // direct command buffer here made the draw recorder wait for the recording thread).
-    scheduler.Record([src_handle = src->Handle(), dst_handle = dst->Handle(),
-                      regions = boost::container::small_vector<vk::BufferCopy, 4>(
-                          copies.begin(), copies.end())](vk::CommandBuffer cmdbuf) {
-        cmdbuf.copyBuffer(src_handle, dst_handle, regions);
-    });
+    scheduler.Record(
+        [src_handle = src->Handle(), dst_handle = dst->Handle(),
+         regions = boost::container::small_vector<vk::BufferCopy, 4>(copies.begin(), copies.end())](
+            vk::CommandBuffer cmdbuf) { cmdbuf.copyBuffer(src_handle, dst_handle, regions); });
 
     for (const auto& copy : copies) {
         AccessBuffer(src, copy.srcOffset, copy.size, vk::PipelineStageFlagBits2::eCopy,
@@ -742,7 +741,8 @@ void Runtime::FlushBarriers() {
     }
 
     scheduler.EndRendering();
-    scheduler.Record([memory_barrier = memory_barrier, has_memory = dep_info.memoryBarrierCount != 0,
+    scheduler.Record([memory_barrier = memory_barrier,
+                      has_memory = dep_info.memoryBarrierCount != 0,
                       barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 8>(
                           image_barriers.begin(), image_barriers.end())](vk::CommandBuffer cmdbuf) {
         const vk::DependencyInfo dep{

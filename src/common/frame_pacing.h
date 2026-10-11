@@ -109,7 +109,8 @@ inline void Record(Event event, u64 value = 0) {
     std::scoped_lock lock{mutex};
     if (!file_tried) {
         file_tried = true;
-        const auto path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "frame_pacing.csv";
+        const auto path =
+            Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "frame_pacing.csv";
 #ifdef _WIN32
         file = _wfopen(path.c_str(), L"w");
 #else

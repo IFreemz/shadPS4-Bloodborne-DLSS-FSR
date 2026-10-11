@@ -450,8 +450,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         Common::FramePacing::SetEnabled(EmulatorSettings.IsThreadedRendererDiagnostics());
         const bool flip_when_ready = !Vulkan::FrameGen::Requested() && presenter &&
                                      presenter->GetRasterizer().ThreadedRendererActive();
-        const auto frame_period = flip_when_ready ? std::chrono::nanoseconds(vblank_period)
-                                                  : std::chrono::nanoseconds(0);
+        const auto frame_period =
+            flip_when_ready ? std::chrono::nanoseconds(vblank_period) : std::chrono::nanoseconds(0);
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();

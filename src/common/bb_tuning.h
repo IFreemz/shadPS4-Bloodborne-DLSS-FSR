@@ -15,9 +15,9 @@
 namespace Common::BbTuning {
 
 inline bool IsBloodborne(std::string_view serial) {
-    static constexpr std::array<std::string_view, 8> serials{
-        "CUSA00207", "CUSA00208", "CUSA00299", "CUSA00900",
-        "CUSA01363", "CUSA03014", "CUSA03023", "CUSA03173"};
+    static constexpr std::array<std::string_view, 8> serials{"CUSA00207", "CUSA00208", "CUSA00299",
+                                                             "CUSA00900", "CUSA01363", "CUSA03014",
+                                                             "CUSA03023", "CUSA03173"};
     return std::ranges::find(serials, serial) != serials.end();
 }
 
@@ -27,8 +27,8 @@ inline std::atomic<bool> fast_locks{false};
 
 /// Set by the rasterizer at every submission: the threaded renderer is running and the toggle
 /// is on. Off: the original code paths.
-inline std::atomic<bool> streaming{false};     ///< parallel copies, resident memory slabs, staging
-inline std::atomic<bool> merged_copies{false}; ///< copy shader batches in one dispatch
+inline std::atomic<bool> streaming{false};      ///< parallel copies, resident memory slabs, staging
+inline std::atomic<bool> merged_copies{false};  ///< copy shader batches in one dispatch
 inline std::atomic<bool> readback_queue{false}; ///< GPU readbacks on the second queue
 
 inline bool FastLocks() {

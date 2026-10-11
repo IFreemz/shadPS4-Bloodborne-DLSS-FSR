@@ -10,7 +10,6 @@
 #include "common/bb_tuning.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
-#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "common/guest_stats.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -20,6 +19,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -75,9 +75,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         texture_memo = std::make_unique<std::array<TextureMemoEntry, TextureMemoSize>>();
         scheduler.EnableThreadedRecording();
         sampler_memo = std::make_unique<std::array<SamplerMemoEntry, SamplerMemoSize>>();
-        const_ring = std::make_unique<VideoCore::Buffer>(instance, 0, ConstRingSize,
-                                                         VideoCore::MemoryType::Stream,
-                                                         "Constant ring");
+        const_ring = std::make_unique<VideoCore::Buffer>(
+            instance, 0, ConstRingSize, VideoCore::MemoryType::Stream, "Constant ring");
         if (const_ring->mapped_data.empty()) {
             const_ring.reset();
         }
@@ -200,8 +199,8 @@ VideoCore::ImageId Rasterizer::FindTargetImage(u32 slot, ImageDesc& desc, const 
     image_memo_misses.fetch_add(1, std::memory_order_relaxed);
     if (slot < AmdGpu::NUM_COLOR_BUFFERS) {
         const auto* k = static_cast<const AmdGpu::ColorBuffer*>(key);
-        const auto hint = *reinterpret_cast<const AmdGpu::CbDbExtent*>(
-            static_cast<const u8*>(key) + sizeof(AmdGpu::ColorBuffer));
+        const auto hint = *reinterpret_cast<const AmdGpu::CbDbExtent*>(static_cast<const u8*>(key) +
+                                                                       sizeof(AmdGpu::ColorBuffer));
         std::construct_at(&desc, *k, hint);
     } else {
         const auto& regs = Regs();
@@ -245,8 +244,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             AmdGpu::ColorBuffer buffer;
             AmdGpu::CbDbExtent hint;
         } key{col_buf, hint};
-        image_id = bound_images.emplace_back(
-            FindTargetImage(cb, desc, &key, sizeof(key)));
+        image_id = bound_images.emplace_back(FindTargetImage(cb, desc, &key, sizeof(key)));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     }
@@ -339,8 +337,8 @@ void Rasterizer::CopyInsteadOfDraw(const BbTemporalDlss::DrawReplacement& replac
     auto& [target_id, desc] = cb_descs[0];
     texture_cache.UpdateImage(target_id);
     texture_cache.FindRenderTarget(target_id, desc);
-    texture_cache.TouchMeta(Regs().color_buffers[0].CmaskAddress(),
-                            desc.view_info.range.base.layer, false);
+    texture_cache.TouchMeta(Regs().color_buffers[0].CmaskAddress(), desc.view_info.range.base.layer,
+                            false);
     auto& target = texture_cache.GetImage(target_id);
     scheduler.EndRendering();
     vk::Image source_image = replacement.owned;
@@ -445,8 +443,7 @@ void Rasterizer::ReplayVelocityMirror(const GraphicsPipeline* pipeline, const Re
     // ends): the draw's bindings and draw are captured with the mirror's viewport.
     velocity_mirror.Defer(
         instance, runtime, scheduler, *pipeline, state, depth, layer,
-        [&](BbVelocityMirror::Commands& out, const Viewports& viewports,
-            const Scissors& scissors) {
+        [&](BbVelocityMirror::Commands& out, const Viewports& viewports, const Scissors& scissors) {
             scheduler.BeginCapture(&out);
             RecordDrawBindings(pipeline, is_indexed, &viewports, &scissors);
             draw();
@@ -495,9 +492,10 @@ void Rasterizer::RebindAfterMirror(const GraphicsPipeline* pipeline, const Rende
 void Rasterizer::RecordVertexBindings() {
     const auto& v = last_vertex;
     if (v.dynamic) {
-        scheduler.Record([bindings = v.bindings, attributes = v.attributes](vk::CommandBuffer cmdbuf) {
-            cmdbuf.setVertexInputEXT(bindings, attributes);
-        });
+        scheduler.Record(
+            [bindings = v.bindings, attributes = v.attributes](vk::CommandBuffer cmdbuf) {
+                cmdbuf.setVertexInputEXT(bindings, attributes);
+            });
     }
     if (v.num_buffers == 0) {
         return;
@@ -510,8 +508,8 @@ void Rasterizer::RecordVertexBindings() {
     } else {
         scheduler.Record([num_buffers = v.num_buffers, buffers = v.buffers, offsets = v.offsets,
                           sizes = v.sizes, strides = v.strides](vk::CommandBuffer cmdbuf) {
-            cmdbuf.bindVertexBuffers2(0, num_buffers, buffers.data(), offsets.data(),
-                                      sizes.data(), strides.data());
+            cmdbuf.bindVertexBuffers2(0, num_buffers, buffers.data(), offsets.data(), sizes.data(),
+                                      strides.data());
         });
     }
 }
@@ -608,8 +606,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     const u32 num_instances = regs.num_instances.NumInstances();
     const auto record_draw = [=](vk::CommandBuffer cmdbuf) {
         if (is_indexed) {
-            cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(vertex_offset),
-                               instance_offset);
+            cmdbuf.drawIndexed(num_indices, num_instances, 0, s32(vertex_offset), instance_offset);
         } else {
             cmdbuf.draw(num_indices, num_instances, vertex_offset, instance_offset);
         }
@@ -732,8 +729,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
             }
         } else {
             if (count_address != 0) {
-                cmdbuf.drawIndirectCount(buffer_handle, base, count_handle, count_offset,
-                                         max_count, stride);
+                cmdbuf.drawIndirectCount(buffer_handle, base, count_handle, count_offset, max_count,
+                                         stride);
             } else {
                 cmdbuf.drawIndirect(buffer_handle, base, max_count, stride);
             }
@@ -830,8 +827,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     DispatchIndirectRecord(pipeline, args);
 }
 
-void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline,
-                                        const IndirectArgs& args) {
+void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, const IndirectArgs& args) {
     if (DrawPipe::OnStageB()) {
         scheduler.PopPendingOperations();
         if (target_memo_enabled.load(std::memory_order_relaxed)) {
@@ -1003,8 +999,8 @@ void Rasterizer::LogVramReport() {
              "VRAM collector: {} runs, {} images freed ({} written back), skipped {} tiled and {} "
              "GPU-written | measures {} MiB, starts at {}, pressure {}, critical {}",
              images.gc_runs, images.evicted, images.written_back, images.skipped_stuck,
-             images.skipped_written, mib(images.gc_used), mib(images.trigger),
-             mib(images.pressure), mib(images.critical));
+             images.skipped_written, mib(images.gc_used), mib(images.trigger), mib(images.pressure),
+             mib(images.critical));
 }
 
 void Rasterizer::ReportHitch() {
@@ -1057,10 +1053,13 @@ void Rasterizer::ReportHitch() {
     const bool hitch = hitch_frames > 60 && ms > std::max(1.5 * hitch_avg_ms, hitch_avg_ms + 5.0);
     if (hitch) {
         // Where the GPU command thread's time went during the frame (~250 us samples).
-        static constexpr std::array<const char*, 7> names{
-            "waiting for the game", "preparing draws", "waiting for the draw recorder",
-            "waiting on game/GPU memory", "waiting for a display buffer", "running commands",
-            "waiting for the GPU"};
+        static constexpr std::array<const char*, 7> names{"waiting for the game",
+                                                          "preparing draws",
+                                                          "waiting for the draw recorder",
+                                                          "waiting on game/GPU memory",
+                                                          "waiting for a display buffer",
+                                                          "running commands",
+                                                          "waiting for the GPU"};
         // Sample counts as shares of the frame (the sampler's real period varies by OS timer).
         std::array<u64, names.size()> samples{};
         u64 total_samples = 0;
@@ -1204,7 +1203,8 @@ bool Rasterizer::PrepareVertexInputs(const GraphicsPipeline* pipeline) {
         }
     }
     for (const auto& range : merged) {
-        vtx_ranges.push_back({range.base, memory->ClampRangeSize(range.base, range.end - range.base)});
+        vtx_ranges.push_back(
+            {range.base, memory->ClampRangeSize(range.base, range.end - range.base)});
     }
     for (const auto& buffer : vtx_buffers) {
         u8 index = NoRange;
@@ -1702,8 +1702,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     };
     const auto memo_hit = [&](const TextureMemoEntry* memo, const std::array<u64, 4>& sharp_words,
                               u32 memo_flags) {
-        return memo && memo->valid && memo->flags == memo_flags &&
-               memo->generation == generation && memo->sharp == sharp_words;
+        return memo && memo->valid && memo->flags == memo_flags && memo->generation == generation &&
+               memo->sharp == sharp_words;
     };
     const auto finish_binding = [&](VideoCore::ImageId& image_id,
                                     const Shader::ImageResource& image_desc) {
@@ -1728,12 +1728,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         std::array<u64, 4> sharp_words{};
         static_assert(sizeof(tsharp) == sizeof(sharp_words));
         std::memcpy(sharp_words.data(), &tsharp, sizeof(sharp_words));
-        const u32 base_flags =
-            (u32(image_desc.is_depth) << 0) | (u32(image_desc.is_array) << 1) |
-            (u32(image_desc.is_written) << 2) | (u32(image_desc.is_atomic) << 3) |
-            (u32(image_desc.is_r128) << 4) | (u32(mip_fallback_mode) << 5) |
-            (u32(image_desc.constant_mip_index) << 8) | (u32(image_desc.post_op) << 24) |
-            0x80000000u;
+        const u32 base_flags = (u32(image_desc.is_depth) << 0) | (u32(image_desc.is_array) << 1) |
+                               (u32(image_desc.is_written) << 2) |
+                               (u32(image_desc.is_atomic) << 3) | (u32(image_desc.is_r128) << 4) |
+                               (u32(mip_fallback_mode) << 5) |
+                               (u32(image_desc.constant_mip_index) << 8) |
+                               (u32(image_desc.post_op) << 24) | 0x80000000u;
 
         // A remembered single binding skips the checks below: they gave the same answer for
         // this T# when it was remembered.
@@ -1950,7 +1950,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         } else {
             vk_sampler = texture_cache.GetSampler(ssharp, Regs().ta_bc_base, sampler.is_depth);
             if (memo) {
-                *memo = {sharp_words,         sampler.is_depth,        true,
+                *memo = {sharp_words,        sampler.is_depth,       true,
                          sampler_generation, texture_cache.GcTick(), vk_sampler};
             }
         }
@@ -2027,8 +2027,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     target_memo.valid = false;
     RenderState state = BeginRenderingFull(pipeline);
     // States that clear a target differ for the next draw; feedback loops are not remembered.
-    bool clears = state.depth_stencil_attachment.depth_clear ||
-                  state.depth_stencil_attachment.stencil_clear;
+    bool clears =
+        state.depth_stencil_attachment.depth_clear || state.depth_stencil_attachment.stencil_clear;
     for (u32 i = 0; i < state.num_color_attachments; ++i) {
         clears |= state.color_attachments[i].is_clear != 0;
     }
@@ -2181,8 +2181,7 @@ void Rasterizer::Resolve() {
     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
     auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
 
-    ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
-                                 Regs().color_buffers[0].Address(),
+    ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}", Regs().color_buffers[0].Address(),
                                  Regs().color_buffers[1].Address()));
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
@@ -2359,9 +2358,8 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
         return;
     }
     dynamic_state.dirty_state = dirty_before;
-    scheduler.Record([snapshot = dynamic_state, &instance = instance](vk::CommandBuffer cmdbuf) mutable {
-        snapshot.Commit(instance, cmdbuf);
-    });
+    scheduler.Record([snapshot = dynamic_state, &instance = instance](
+                         vk::CommandBuffer cmdbuf) mutable { snapshot.Commit(instance, cmdbuf); });
     dynamic_state.MarkCommitted(instance);
 }
 
@@ -2680,7 +2678,6 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
              (f32)(color & 0xff) / 255.0f, (f32)((color >> 24) & 0xff) / 255.0f})});
 }
 
-
 // ---------------------------------------------------------------------------------------------
 // Threaded renderer (vk_draw_pipe.h)
 // ---------------------------------------------------------------------------------------------
@@ -2848,10 +2845,10 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
             continue;
         }
         infos[num_stages++] = info;
-        stage_bytes += sizeof(PacketStage) +
-                       AlignPacket(static_cast<u32>(info->user_data.size() +
-                                                    info->flattened_ud_buf.size()) *
-                                   sizeof(u32));
+        stage_bytes +=
+            sizeof(PacketStage) +
+            AlignPacket(static_cast<u32>(info->user_data.size() + info->flattened_ud_buf.size()) *
+                        sizeof(u32));
     }
     ASSERT(num_stages <= Shader::Info::MaxUdSnapshots);
 
@@ -3086,7 +3083,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         const auto& stage = *reinterpret_cast<const PacketStage*>(in);
         in += sizeof(PacketStage);
         const auto* words = reinterpret_cast<const u32*>(in);
-        Shader::Info::ud_snapshots[i] = {stage.info,          words,
+        Shader::Info::ud_snapshots[i] = {stage.info,           words,
                                          stage.user_data_size, words + stage.user_data_size,
                                          stage.flat_size,      stage.pgm_base};
         in += AlignPacket((stage.user_data_size + stage.flat_size) * sizeof(u32));
@@ -3193,7 +3190,8 @@ void Rasterizer::LogDrawPipeStats() {
              percent(busy - pipe_stats_busy));
     const u64 memo_hits = target_memo_hits.load(std::memory_order_relaxed);
     const u64 memo_misses = target_memo_misses.load(std::memory_order_relaxed);
-    const u64 memo_draws = (memo_hits - pipe_stats_memo_hits) + (memo_misses - pipe_stats_memo_misses);
+    const u64 memo_draws =
+        (memo_hits - pipe_stats_memo_hits) + (memo_misses - pipe_stats_memo_misses);
     if (memo_draws != 0) {
         LOG_INFO(Render_Vulkan, "  render state memo: {:.0f}% of draws reused the open pass",
                  100.0 * (memo_hits - pipe_stats_memo_hits) / memo_draws);
@@ -3233,8 +3231,8 @@ void Rasterizer::LogDrawPipeStats() {
     }
     {
         const u64 frames = stat_frames - pipe_stats_frames;
-        LOG_INFO(Render_Vulkan, "  game frames: {:.1f}/s, {:.0f} draws per frame",
-                 frames / seconds, frames ? double(stat_draws - pipe_stats_draws) / frames : 0.0);
+        LOG_INFO(Render_Vulkan, "  game frames: {:.1f}/s, {:.0f} draws per frame", frames / seconds,
+                 frames ? double(stat_draws - pipe_stats_draws) / frames : 0.0);
         // GPU time from timestamps around each submission of this scheduler (the presenter's
         // own work, e.g. frame generation, is not included).
         const auto [busy_ns, idle_ns, submits] = scheduler.TakeGpuTiming();
@@ -3252,11 +3250,13 @@ void Rasterizer::LogDrawPipeStats() {
     {
         // Where the time goes: the command thread's state, and whether the draw recorder was
         // working meanwhile (sampled every ~250 us).
-        static constexpr std::array<const char*, 7> names{
-            "waiting for the game to submit", "decoding/preparing draws",
-            "waiting for the draw recorder",  "waiting on game/GPU memory (WaitRegMem)",
-            "waiting for a flip (display buffer)", "running commands (flips, readbacks)",
-            "waiting for the GPU"};
+        static constexpr std::array<const char*, 7> names{"waiting for the game to submit",
+                                                          "decoding/preparing draws",
+                                                          "waiting for the draw recorder",
+                                                          "waiting on game/GPU memory (WaitRegMem)",
+                                                          "waiting for a flip (display buffer)",
+                                                          "running commands (flips, readbacks)",
+                                                          "waiting for the GPU"};
         std::array<u64, 14> counts{};
         u64 total = 0;
         for (size_t i = 0; i < counts.size(); ++i) {
@@ -3272,16 +3272,19 @@ void Rasterizer::LogDrawPipeStats() {
                 if (all * 200 < total) {
                     continue; // under 0.5%
                 }
-                line += fmt::format("{}{} {:.1f}% (recorder idle {:.1f}%)", line.empty() ? "" : "; ",
-                                    names[i], 100.0 * all / total, 100.0 * counts[i * 2] / total);
+                line +=
+                    fmt::format("{}{} {:.1f}% (recorder idle {:.1f}%)", line.empty() ? "" : "; ",
+                                names[i], 100.0 * all / total, 100.0 * counts[i * 2] / total);
             }
             LOG_INFO(Render_Vulkan, "  command thread time: {}", line);
-            LOG_INFO(Render_Vulkan, "  draw recorder idle {:.1f}% of the time", 100.0 * recorder_idle / total);
+            LOG_INFO(Render_Vulkan, "  draw recorder idle {:.1f}% of the time",
+                     100.0 * recorder_idle / total);
         }
     }
     {
         const u64 faults = write_faults.load(std::memory_order_relaxed);
-        LOG_INFO(Render_Vulkan, "  guest write faults: {:.0f}/s", (faults - pipe_stats_faults) / seconds);
+        LOG_INFO(Render_Vulkan, "  guest write faults: {:.0f}/s",
+                 (faults - pipe_stats_faults) / seconds);
         pipe_stats_faults = faults;
     }
     {
@@ -3319,7 +3322,8 @@ void Rasterizer::LogDrawPipeStats() {
         const double draws = double(profiled - pipe_stats_profile_draws);
         std::string line;
         for (size_t i = 0; i < ns.size(); ++i) {
-            line += fmt::format(" {} {:.0f}%", SectionNames[i], total ? 100.0 * ns[i] / total : 0.0);
+            line +=
+                fmt::format(" {} {:.0f}%", SectionNames[i], total ? 100.0 * ns[i] / total : 0.0);
         }
         LOG_INFO(Render_Vulkan, "  draw recorder per draw: {:.2f} us;{}", total / draws / 1000.0,
                  line);
@@ -3329,7 +3333,8 @@ void Rasterizer::LogDrawPipeStats() {
     for (const auto& [key, site] : pipe_drain_sites) {
         sites.push_back(&site);
     }
-    std::ranges::sort(sites, [](const DrainSite* a, const DrainSite* b) { return a->time > b->time; });
+    std::ranges::sort(sites,
+                      [](const DrainSite* a, const DrainSite* b) { return a->time > b->time; });
     for (size_t i = 0; i < std::min<size_t>(sites.size(), 8); ++i) {
         const auto* site = sites[i];
         std::string_view function{site->function};
@@ -3370,10 +3375,10 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
     key ^= (ps ? ps->pgm_hash : 0) * 0xC4CEB9FE1A85EC53ull;
     key ^= u64(state.num_color_attachments) << 7;
     profiler->Mark(key, [&] {
-        return fmt::format("pass {}x{} ({} color{}) vs {:08x} ps {:08x}", state.width,
-                           state.height, state.num_color_attachments,
-                           state.depth_stencil_attachment.has_depth ? " + depth" : "",
-                           vs.pgm_hash, ps ? ps->pgm_hash : 0);
+        return fmt::format("pass {}x{} ({} color{}) vs {:08x} ps {:08x}", state.width, state.height,
+                           state.num_color_attachments,
+                           state.depth_stencil_attachment.has_depth ? " + depth" : "", vs.pgm_hash,
+                           ps ? ps->pgm_hash : 0);
     });
 }
 

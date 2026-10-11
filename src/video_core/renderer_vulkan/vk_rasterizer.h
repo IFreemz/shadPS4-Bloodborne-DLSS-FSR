@@ -3,10 +3,10 @@
 
 #pragma once
 
+#include <deque>
 #include <functional>
 #include <memory>
 #include <source_location>
-#include <deque>
 #include <unordered_map>
 
 #include "common/guest_stats.h"
@@ -506,8 +506,8 @@ private:
         Count,
     };
     static constexpr std::array<const char*, static_cast<size_t>(Section::Count)> SectionNames{
-        "packet",  "pending ops", "render targets", "buffers", "textures",
-        "dlss",    "begin pass",  "vertex/index",   "barriers", "descriptors",
+        "packet",  "pending ops",   "render targets", "buffers",  "textures",
+        "dlss",    "begin pass",    "vertex/index",   "barriers", "descriptors",
         "dynamic", "record+mirror", "reset"};
     bool profile_draw{};
     u32 profile_counter{};
@@ -522,7 +522,7 @@ private:
         }
         const auto now = std::chrono::steady_clock::now();
         profile_ns[static_cast<size_t>(finished)].fetch_add((now - profile_last).count(),
-                                                           std::memory_order_relaxed);
+                                                            std::memory_order_relaxed);
         profile_last = now;
     }
     // Last member: destroyed (stopped) first, while everything the draw recording thread uses

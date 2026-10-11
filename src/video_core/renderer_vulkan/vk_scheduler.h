@@ -5,25 +5,25 @@
 
 #include <array>
 #include <atomic>
-#include <deque>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <new>
-#include <thread>
-#include <queue>
 #include <source_location>
 #include <string>
-#include <unordered_map>
+#include <thread>
 #include <type_traits>
+#include <unordered_map>
+#include <queue>
 
 #include "common/interval_set.h"
+#include "common/polyfill_thread.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
-#include "common/polyfill_thread.h"
 #include "vulkan/vulkan.hpp"
 
 namespace tracy {
@@ -376,8 +376,8 @@ public:
     void Push(Func&& func) {
         using T = std::decay_t<Func>;
         static_assert(alignof(T) <= EntryAlign, "recorded command is over-aligned");
-        constexpr u32 size = static_cast<u32>((sizeof(Entry) + sizeof(T) + EntryAlign - 1) &
-                                              ~(EntryAlign - 1));
+        constexpr u32 size =
+            static_cast<u32>((sizeof(Entry) + sizeof(T) + EntryAlign - 1) & ~(EntryAlign - 1));
         static_assert(size <= ChunkCapacity, "recorded command is too large");
         if (!current || current->used + size > ChunkCapacity) {
             Kick(true);

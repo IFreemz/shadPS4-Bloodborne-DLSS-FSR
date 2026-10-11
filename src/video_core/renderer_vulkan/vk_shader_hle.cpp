@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "common/bb_tuning.h"
 #include "common/alignment.h"
+#include "common/bb_tuning.h"
 #include "shader_recompiler/info.h"
-#include "video_core/renderer_vulkan/vk_rasterizer.h"
-#include "video_core/renderer_vulkan/vk_runtime.h"
-#include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/host_shaders/buffer_multi_copy_comp.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
-#include "video_core/host_shaders/buffer_multi_copy_comp.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
@@ -65,9 +65,8 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
             .bindingCount = static_cast<u32>(bindings.size()),
             .pBindings = bindings.data(),
         }));
-        const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
-                                          .offset = 0,
-                                          .size = sizeof(u32)};
+        const vk::PushConstantRange range{
+            .stageFlags = vk::ShaderStageFlagBits::eCompute, .offset = 0, .size = sizeof(u32)};
         p.layout = Check(device.createPipelineLayoutUnique({
             .setLayoutCount = 1,
             .pSetLayouts = &*p.set_layout,

@@ -6,8 +6,8 @@
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
-#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
@@ -133,10 +133,11 @@ std::string Scheduler::TakeRecordingStats() {
     const double seconds = std::chrono::duration<double>(now - last).count();
     last = now;
     const s64 busy = recorder ? recorder->busy_ns.exchange(0, std::memory_order_relaxed) : 0;
-    std::string out = fmt::format("recording thread busy {:.1f}%; ", seconds > 0 ? busy / seconds / 1e7 : 0.0);
+    std::string out =
+        fmt::format("recording thread busy {:.1f}%; ", seconds > 0 ? busy / seconds / 1e7 : 0.0);
     out += fmt::format("{} deferred, {} direct;",
-                                  deferred_records.exchange(0, std::memory_order_relaxed),
-                                  direct_records.exchange(0, std::memory_order_relaxed));
+                       deferred_records.exchange(0, std::memory_order_relaxed),
+                       direct_records.exchange(0, std::memory_order_relaxed));
     for (size_t i = 0; i < std::min<size_t>(sites.size(), 6); ++i) {
         out += fmt::format(" {} x{}", sites[i].first, sites[i].second);
     }
@@ -148,10 +149,11 @@ void Scheduler::EnableThreadedRecording() {
         const auto props = instance.GetPhysicalDevice().getProperties();
         if (props.limits.timestampComputeAndGraphics) {
             timer_period_ns = props.limits.timestampPeriod;
-            auto [result, pool] = instance.GetDevice().createQueryPoolUnique(vk::QueryPoolCreateInfo{
-                .queryType = vk::QueryType::eTimestamp,
-                .queryCount = TimerPairs * 2,
-            });
+            auto [result, pool] =
+                instance.GetDevice().createQueryPoolUnique(vk::QueryPoolCreateInfo{
+                    .queryType = vk::QueryType::eTimestamp,
+                    .queryCount = TimerPairs * 2,
+                });
             if (result == vk::Result::eSuccess) {
                 timer_pool = std::move(pool);
             }
@@ -225,7 +227,8 @@ void CommandRecorder::Run(std::stop_token stop) {
         u64 available = head.load(std::memory_order_acquire);
         if (available == at) {
             // Spin briefly (commands follow each other while a frame is recorded), then sleep.
-            const auto spin_until = std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+            const auto spin_until =
+                std::chrono::steady_clock::now() + std::chrono::microseconds(100);
             for (u32 spins = 1; available == at; ++spins) {
                 if (stop.stop_requested()) {
                     return;

@@ -131,7 +131,8 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
         if (remaining) {
             const auto end_sleep = std::chrono::high_resolution_clock::now();
             const auto sleep_time = end_sleep - begin_sleep;
-            *remaining = duration > sleep_time ? duration - sleep_time : std::chrono::nanoseconds(0);
+            *remaining =
+                duration > sleep_time ? duration - sleep_time : std::chrono::nanoseconds(0);
         }
         return ret == WAIT_OBJECT_0;
     }
@@ -145,9 +146,8 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
         // waitable timer rounds up to the system timer period (1 ms at best), so a guest
         // usleep(100) took 1-2 ms. Creating a timer per call also cost two system calls.
         thread_local HANDLE timer = [] {
-            HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr,
-                                                   CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                                   TIMER_ALL_ACCESS);
+            HANDLE handle = CreateWaitableTimerExW(
+                nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
             if (!handle) {
                 handle = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
             }

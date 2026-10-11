@@ -122,8 +122,8 @@ public:
         // nothing to refresh or track; skip the lock that guest fault handlers contend for.
         // A write fault racing with this check is equivalent to one arriving just after it.
         {
-            const auto flags = std::atomic_ref<ImageFlagBits>(image.flags).load(
-                std::memory_order_acquire);
+            const auto flags =
+                std::atomic_ref<ImageFlagBits>(image.flags).load(std::memory_order_acquire);
             if (False(flags & ImageFlagBits::Dirty) && True(flags & ImageFlagBits::Registered) &&
                 image.track_addr == image.info.guest_address &&
                 image.track_addr_end == image.info.guest_address + image.info.guest_size) {
@@ -281,9 +281,9 @@ public:
             u64 stale_count{}; ///< not used for 16+ collector ticks (old enough to collect)
             u64 stale_bytes{};
         };
-        Group clean;     ///< copies of guest memory: freed whenever they are old enough
-        Group written;   ///< GPU-written linear images: freed (written back) only under pressure
-        Group stuck;     ///< GPU-written tiled images: never freed (no tiled write-back)
+        Group clean;   ///< copies of guest memory: freed whenever they are old enough
+        Group written; ///< GPU-written linear images: freed (written back) only under pressure
+        Group stuck;   ///< GPU-written tiled images: never freed (no tiled write-back)
         u64 extra_backing_bytes{}; ///< additional backing images (other sample counts)
         u64 allocated_images{};    ///< all image slots, including ones awaiting deletion
         u64 trigger{}, pressure{}, critical{}, gc_used{};

@@ -7,13 +7,13 @@
 #include <array>
 #include <condition_variable>
 #include <coroutine>
+#include <deque>
 #include <exception>
 #include <mutex>
 #include <semaphore>
 #include <span>
 #include <thread>
 #include <vector>
-#include <deque>
 #include <queue>
 
 #include "common/assert.h"
@@ -103,8 +103,8 @@ struct Liverpool {
     /// Marks a register field written outside the Set*Reg packets.
     template <typename T>
     void MarkRegWritten(const T& field) noexcept {
-        const auto word = static_cast<u32>(reinterpret_cast<const u32*>(&field) -
-                                           regs.reg_array.data());
+        const auto word =
+            static_cast<u32>(reinterpret_cast<const u32*>(&field) - regs.reg_array.data());
         pipe_dirty.Mark(word, static_cast<u32>((sizeof(T) + 3) / 4));
     }
 

@@ -248,15 +248,15 @@ void BufferCache::LogReadbackReport() {
                  "  region {:#x}: {} downloads, {:.0f} KiB each, waited {:.1f} ms | written by: "
                  "unsubmitted {}, running {}, finished {}, unknown {} | threads: {}",
                  key << 20, region->count, region->bytes / 1024.0 / region->count,
-                 region->gpu_wait_ns / 1e6, region->writer[0], region->writer[1],
-                 region->writer[2], region->writer[3], threads.empty() ? "-" : threads);
+                 region->gpu_wait_ns / 1e6, region->writer[0], region->writer[1], region->writer[2],
+                 region->writer[3], threads.empty() ? "-" : threads);
     }
 }
 
 void BufferCache::NoteGpuWrite(VAddr device_addr, u64 size) {
     // Only needed for the second readback queue and the readback report.
-    if (size == 0 || (!readback_fence &&
-                      !Common::GuestStats::diagnostics.load(std::memory_order_relaxed))) {
+    if (size == 0 ||
+        (!readback_fence && !Common::GuestStats::diagnostics.load(std::memory_order_relaxed))) {
         return;
     }
     const u64 tick = scheduler.CurrentTick();
@@ -355,8 +355,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     // The data was written by work already submitted: copy it on the second queue, which
     // waits only for that work. Otherwise (unsubmitted or unknown writer) copy in order on the
     // graphics queue and wait for everything queued.
-    const bool second_queue =
-        submitted && readback_fence && Common::BbTuning::ReadbackQueue();
+    const bool second_queue = submitted && readback_fence && Common::BbTuning::ReadbackQueue();
     if (second_queue) {
         ReadbackOnSecondQueue(arena, download.buffer, copies, tick);
     } else {
@@ -381,10 +380,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         }
         const std::string& thread =
             readback_context.active ? readback_context.thread : std::string{"GPU thread"};
-        ++region.threads[fmt::format("{} ({})", thread,
-                                     readback_context.active && !readback_context.is_write
-                                         ? "read"
-                                         : "write")];
+        ++region.threads[fmt::format(
+            "{} ({})", thread,
+            readback_context.active && !readback_context.is_write ? "read" : "write")];
     }
 
     download.buffer->Invalidate(download.offset, download.size);
@@ -530,8 +528,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     const auto resident_start = std::chrono::steady_clock::now();
     SCOPE_EXIT {
         Common::GuestStats::resident_ns.fetch_add(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - resident_start)
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 resident_start)
                 .count(),
             std::memory_order_relaxed);
     };
@@ -619,8 +617,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             };
             boost::container::small_vector<Piece, 64> pieces;
             for (const auto& copy : copies) {
-                for (u64 offset = 0; offset < copy.size;
-                     offset += Common::CopyPool::ChunkSize) {
+                for (u64 offset = 0; offset < copy.size; offset += Common::CopyPool::ChunkSize) {
                     pieces.push_back({copy.dstOffset + offset, copy.srcOffset + offset,
                                       std::min(Common::CopyPool::ChunkSize, copy.size - offset)});
                 }

@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <chrono>
 #include <algorithm>
+#include <chrono>
 #include <utility>
-#include "common/guest_stats.h"
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
+#include "common/guest_stats.h"
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
@@ -433,8 +433,8 @@ struct SignalImpl : public PageManager::Impl {
         const auto start = std::chrono::steady_clock::now();
         impl.Protect(address, size, perms);
         Common::GuestStats::protect_ns.fetch_add(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start)
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 start)
                 .count(),
             std::memory_order_relaxed);
         Common::GuestStats::protect_calls.fetch_add(1, std::memory_order_relaxed);

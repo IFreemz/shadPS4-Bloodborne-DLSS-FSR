@@ -5,9 +5,9 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <source_location>
 #include <thread>
 #include <queue>
-#include <source_location>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
