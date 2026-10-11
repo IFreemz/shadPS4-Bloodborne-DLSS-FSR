@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/bb_tuning.h"
 #include "common/alignment.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -169,7 +170,9 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     // 64 KiB instead of 64 MiB (bbport): the copies are a few KiB spread over up to 57 MiB, and
     // each batch synchronizes (uploads, marks GPU-modified) its whole range. bbport measured the
     // copy shader's GPU time 1.5 -> 0.6 ms/frame.
-    static constexpr vk::DeviceSize MaxDistanceForMerge = 64_KB;
+    // Off (threaded renderer toggle): the original 64 MiB and one copy command per batch.
+    const bool merged = Common::BbTuning::MergedCopies();
+    const vk::DeviceSize MaxDistanceForMerge = merged ? 64_KB : 64_MB;
     u32 batch_start = 0;
     u32 batch_end = 0;
 
@@ -222,7 +225,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         if (auto* profiler = GpuProfiler::Get()) {
             profiler->Mark(0xC0B1ull, [] { return std::string{"copy shader HLE"}; });
         }
-        if (!MultiCopy(rasterizer, src_buf, dst_buf, vk_copies)) {
+        if (!merged || !MultiCopy(rasterizer, src_buf, dst_buf, vk_copies)) {
             runtime.CopyBuffer(src_buf, dst_buf, vk_copies);
         }
         batch_start = batch_end;

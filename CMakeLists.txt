@@ -834,6 +834,10 @@ set(COMMON src/common/logging/classes.cpp
            src/common/thread.cpp
            src/common/thread.h
            src/common/guest_stats.h
+           src/common/bb_tuning.h
+           src/common/frame_pacing.h
+           src/common/copy_pool.cpp
+           src/common/copy_pool.h
            src/common/types.h
            src/common/uint128.h
            src/common/unique_function.h

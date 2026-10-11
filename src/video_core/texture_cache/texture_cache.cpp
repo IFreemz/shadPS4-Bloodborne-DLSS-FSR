@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <xxhash.h>
 
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/guest_stats.h"
 #include "common/hash.h"
 #include "common/scope_exit.h"
 #include "core/emulator_settings.h"
@@ -776,6 +778,7 @@ void TextureCache::RefreshImage(Image& image) {
 
     scheduler.EndRendering();
 
+    const auto upload_start = std::chrono::steady_clock::now();
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
@@ -784,6 +787,13 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    namespace GS = Common::GuestStats;
+    GS::image_uploads.fetch_add(1, std::memory_order_relaxed);
+    GS::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    GS::image_upload_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - upload_start)
+                                      .count(),
+                                  std::memory_order_relaxed);
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
@@ -958,6 +968,7 @@ void TextureCache::GarbageCollectImages() {
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
+    ++gc_runs;
     std::scoped_lock lock{mutex};
     bool pressured = false;
     bool aggresive = false;
@@ -981,14 +992,18 @@ void TextureCache::GarbageCollectImages() {
         const bool tiled = image.info.IsTiled();
         if (tiled && download) {
             // This is a workaround for now. We can't handle non-linear image downloads.
+            ++gc_skipped_stuck;
             return false;
         }
         if (download && !pressured) {
+            ++gc_skipped_written;
             return false;
         }
         if (download) {
             DownloadImageMemory(image_id);
+            ++gc_written_back;
         }
+        ++gc_evicted;
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
@@ -1013,6 +1028,54 @@ void TextureCache::GarbageCollectImages() {
         configure(true);
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
+}
+
+TextureCache::MemoryReport TextureCache::TakeMemoryReport() {
+    std::scoped_lock lock{mutex};
+    MemoryReport report{};
+    const auto group_of = [&report](const Image& image) -> MemoryReport::Group& {
+        if (!image.SafeToDownload()) {
+            return report.clean;
+        }
+        return image.info.IsTiled() ? report.stuck : report.written;
+    };
+    const auto image_bytes = [](const Image& image) {
+        u64 bytes = 0;
+        for (const auto& backing : image.backing_images) {
+            bytes += backing.image.size_bytes;
+        }
+        return bytes;
+    };
+    lru_cache.ForEachItemBelow(gc_tick, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        const u64 bytes = image_bytes(image);
+        auto& group = group_of(image);
+        ++group.count;
+        group.bytes += bytes;
+        if (image.backing) {
+            report.extra_backing_bytes += bytes - image.backing->image.size_bytes;
+        }
+    });
+    // The collector only looks at images untouched for at least 16 ticks.
+    if (gc_tick >= 16) {
+        lru_cache.ForEachItemBelow(gc_tick - 16, [&](ImageId image_id) {
+            const Image& image = slot_images[image_id];
+            auto& group = group_of(image);
+            ++group.stale_count;
+            group.stale_bytes += image_bytes(image);
+        });
+    }
+    report.allocated_images = slot_images.Size();
+    report.trigger = trigger_gc_memory;
+    report.pressure = pressure_gc_memory;
+    report.critical = critical_gc_memory;
+    report.gc_used = total_used_memory;
+    report.evicted = std::exchange(gc_evicted, 0);
+    report.written_back = std::exchange(gc_written_back, 0);
+    report.skipped_stuck = std::exchange(gc_skipped_stuck, 0);
+    report.skipped_written = std::exchange(gc_skipped_written, 0);
+    report.gc_runs = std::exchange(gc_runs, 0);
+    return report;
 }
 
 void TextureCache::GarbageCollectSamplers() {

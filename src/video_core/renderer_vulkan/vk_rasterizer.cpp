@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstring>
 #include <string_view>
+#include "common/bb_tuning.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -27,6 +28,8 @@
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
+
+#include <vk_mem_alloc.h>
 
 namespace Vulkan {
 
@@ -63,12 +66,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     // Threaded renderer: Bloodborne only (the drains assume its command streams), and not
     // with userfaultfd tracking (its fault thread routes the recording thread's faults to the
     // GPU command thread, which would wait for that thread).
-    static constexpr std::array<std::string_view, 8> BloodborneSerials{
-        "CUSA00207", "CUSA00208", "CUSA00299", "CUSA00900",
-        "CUSA01363", "CUSA03014", "CUSA03023", "CUSA03173"};
     const auto serial = Common::ElfInfo::Instance().GameSerial();
     if (!EmulatorSettings.IsNullGPU() && !EmulatorSettings.IsUserfaultfdTracking() &&
-        std::ranges::find(BloodborneSerials, serial) != BloodborneSerials.end()) {
+        Common::BbTuning::IsBloodborne(serial)) {
         pipe_regs = std::make_unique<AmdGpu::Regs>();
         pipe_enabled = EmulatorSettings.IsThreadedRenderer();
         target_memo_enabled = pipe_enabled;
@@ -896,12 +896,25 @@ void Rasterizer::OnSubmit() {
             hitch_frames = 0;
         }
         diagnostics.store(diag, std::memory_order_relaxed);
+        Common::GuestStats::diagnostics.store(diag, std::memory_order_relaxed);
+        // The toggles under the threaded renderer (off with it: original behaviour).
+        namespace BB = Common::BbTuning;
+        BB::streaming.store(pipe_enabled && EmulatorSettings.IsBbStreaming(),
+                            std::memory_order_relaxed);
+        BB::merged_copies.store(pipe_enabled && EmulatorSettings.IsBbMergedCopies(),
+                                std::memory_order_relaxed);
+        BB::readback_queue.store(pipe_enabled && EmulatorSettings.IsBbReadbackQueue(),
+                                 std::memory_order_relaxed);
         scheduler.SetGpuTiming(diag);
         GpuProfiler::OnFrame(instance, scheduler,
                              pipe_enabled && EmulatorSettings.IsThreadedRendererGpuProfile());
         if (diag) {
+            const auto start = std::chrono::steady_clock::now();
             LogDrawPipeStats();
-            ReportHitch();
+            diag_log_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - start)
+                                      .count(),
+                                  std::memory_order_relaxed);
         }
     }
     auto lap = std::chrono::steady_clock::now();
@@ -916,8 +929,82 @@ void Rasterizer::OnSubmit() {
     time_step(housekeeping_ns[1]);
     texture_cache.RunGarbageCollector();
     time_step(housekeeping_ns[2]);
+    if (diagnostics.load(std::memory_order_relaxed)) {
+        const auto start = std::chrono::steady_clock::now();
+        LogVramReport();
+        buffer_cache.LogReadbackReport();
+        diag_log_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count(),
+                              std::memory_order_relaxed);
+        lap = std::chrono::steady_clock::now();
+    }
     runtime.TickFrame();
     time_step(housekeeping_ns[3]);
+    for (size_t i = 0; i < housekeeping_ns.size(); ++i) {
+        housekeeping_total[i].fetch_add(static_cast<u64>(housekeeping_ns[i]),
+                                        std::memory_order_relaxed);
+    }
+}
+
+void Rasterizer::OnGameFrame() {
+    if (draw_pipe && diagnostics.load(std::memory_order_relaxed)) {
+        ReportHitch();
+    } else {
+        hitch_last = {};
+        hitch_frames = 0;
+    }
+}
+
+void Rasterizer::LogVramReport() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - vram_report_time < std::chrono::seconds(10)) {
+        return;
+    }
+    vram_report_time = now;
+    const auto mib = [](u64 bytes) { return bytes >> 20; };
+
+    const auto heaps = instance.GetMemoryHeapReport();
+    const u64 buffers = buffer_cache.ResidentBytes();
+    const auto images = texture_cache.TakeMemoryReport();
+
+    // Memory the allocator holds in device-local heaps, and how much of it is in use.
+    // vmaGetHeapBudgets is cheap (running totals); vmaCalculateStatistics walks every allocation.
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> vma_budgets{};
+    vmaGetHeapBudgets(instance.GetAllocator(), vma_budgets.data());
+    u64 vma_blocks = 0, vma_used = 0;
+    const auto& memory_props = instance.GetMemoryProperties();
+    for (u32 i = 0; i < memory_props.memoryHeapCount; ++i) {
+        if (memory_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            vma_blocks += vma_budgets[i].statistics.blockBytes;
+            vma_used += vma_budgets[i].statistics.allocationBytes;
+        }
+    }
+    const u64 known = buffers + vma_blocks;
+    const s64 other = static_cast<s64>(heaps.local_usage) - static_cast<s64>(known);
+    const u64 image_bytes = images.clean.bytes + images.written.bytes + images.stuck.bytes;
+
+    LOG_INFO(Render,
+             "VRAM: {} of {} MiB budget used, {} MiB in system memory | guest buffers {} MiB "
+             "(never released) | allocator {} MiB held, {} MiB in use | outside both {} MiB",
+             mib(heaps.local_usage), mib(heaps.local_budget), mib(heaps.host_usage), mib(buffers),
+             mib(vma_blocks), mib(vma_used), other / (1 << 20));
+    LOG_INFO(Render,
+             "VRAM images: {} MiB in {} images ({} slots) | clean {} MiB / {} (old {} MiB / {}) | "
+             "GPU-written {} MiB / {} (old {} MiB / {}) | GPU-written tiled, never freed {} MiB / "
+             "{} (old {} MiB / {}) | extra backings {} MiB",
+             mib(image_bytes), images.clean.count + images.written.count + images.stuck.count,
+             images.allocated_images, mib(images.clean.bytes), images.clean.count,
+             mib(images.clean.stale_bytes), images.clean.stale_count, mib(images.written.bytes),
+             images.written.count, mib(images.written.stale_bytes), images.written.stale_count,
+             mib(images.stuck.bytes), images.stuck.count, mib(images.stuck.stale_bytes),
+             images.stuck.stale_count, mib(images.extra_backing_bytes));
+    LOG_INFO(Render,
+             "VRAM collector: {} runs, {} images freed ({} written back), skipped {} tiled and {} "
+             "GPU-written | measures {} MiB, starts at {}, pressure {}, critical {}",
+             images.gc_runs, images.evicted, images.written_back, images.skipped_stuck,
+             images.skipped_written, mib(images.gc_used), mib(images.trigger),
+             mib(images.pressure), mib(images.critical));
 }
 
 void Rasterizer::ReportHitch() {
@@ -934,7 +1021,29 @@ void Rasterizer::ReportHitch() {
         .protect_ns = GS::protect_ns.load(std::memory_order_relaxed),
         .protect_calls = GS::protect_calls.load(std::memory_order_relaxed),
         .faults = write_faults.load(std::memory_order_relaxed),
+        .mutex_waits = GS::mutex_waits.load(std::memory_order_relaxed),
+        .sleeps = GS::sleeps.load(std::memory_order_relaxed),
+        .sleep_ns = GS::sleep_actual_ns.load(std::memory_order_relaxed),
+        .uploads = GS::image_uploads.load(std::memory_order_relaxed),
+        .upload_bytes = GS::image_upload_bytes.load(std::memory_order_relaxed),
+        .upload_ns = GS::image_upload_ns.load(std::memory_order_relaxed),
+        .image_copy_ns = GS::image_copy_ns.load(std::memory_order_relaxed),
+        .buffer_bytes = GS::buffer_upload_bytes.load(std::memory_order_relaxed),
+        .buffer_ns = GS::buffer_upload_ns.load(std::memory_order_relaxed),
+        .resident_ns = GS::resident_ns.load(std::memory_order_relaxed),
+        .staging_count = GS::staging_allocations.load(std::memory_order_relaxed),
+        .staging_bytes = GS::staging_allocation_bytes.load(std::memory_order_relaxed),
+        .staging_ns = GS::staging_allocation_ns.load(std::memory_order_relaxed),
+        .file_opens = GS::file_opens.load(std::memory_order_relaxed),
+        .resident_bytes = buffer_cache.ResidentBytes(),
+        .diag_ns = diag_log_ns.load(std::memory_order_relaxed),
     };
+    for (size_t i = 0; i < now.states.size(); ++i) {
+        now.states[i] = state_samples[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < now.housekeeping.size(); ++i) {
+        now.housekeeping[i] = housekeeping_total[i].load(std::memory_order_relaxed);
+    }
     const auto last = std::exchange(hitch_last, now);
     const u64 slowest_ns = GS::slowest_wait_ns.exchange(0, std::memory_order_relaxed);
     if (last.time == std::chrono::steady_clock::time_point{}) {
@@ -942,9 +1051,31 @@ void Rasterizer::ReportHitch() {
     }
     // Counters the 10 s statistics reset count from zero again.
     const auto delta = [](u64 a, u64 b) { return a >= b ? a - b : a; };
+    const auto ms_of = [](u64 ns) { return ns / 1e6; };
     const double ms = std::chrono::duration<double, std::milli>(now.time - last.time).count();
-    const bool hitch = hitch_frames > 120 && ms > std::max(2.5 * hitch_avg_ms, 25.0);
+    // A game frame noticeably slower than the usual ones (average of non-stutter frames).
+    const bool hitch = hitch_frames > 60 && ms > std::max(1.5 * hitch_avg_ms, hitch_avg_ms + 5.0);
     if (hitch) {
+        // Where the GPU command thread's time went during the frame (~250 us samples).
+        static constexpr std::array<const char*, 7> names{
+            "waiting for the game", "preparing draws", "waiting for the draw recorder",
+            "waiting on game/GPU memory", "waiting for a display buffer", "running commands",
+            "waiting for the GPU"};
+        // Sample counts as shares of the frame (the sampler's real period varies by OS timer).
+        std::array<u64, names.size()> samples{};
+        u64 total_samples = 0;
+        for (size_t i = 0; i < names.size(); ++i) {
+            samples[i] = delta(now.states[i * 2], last.states[i * 2]) +
+                         delta(now.states[i * 2 + 1], last.states[i * 2 + 1]);
+            total_samples += samples[i];
+        }
+        std::string states;
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (samples[i] != 0) {
+                states += fmt::format("{}{} {:.1f}", states.empty() ? "" : ", ", names[i],
+                                      ms * samples[i] / total_samples);
+            }
+        }
         const char* file = GS::slowest_wait_file.load(std::memory_order_relaxed);
         std::string_view site = file ? file : "-";
         if (const auto slash = site.find_last_of("/\\"); slash != std::string_view::npos) {
@@ -952,23 +1083,42 @@ void Rasterizer::ReportHitch() {
         }
         LOG_WARNING(
             Render_Vulkan,
-            "Hitch: frame {:.1f} ms (usual {:.1f} ms): draw recorder busy {:.1f} ms, command "
-            "thread waited {:.1f} ms, {} packets; GPU waits {} ({:.1f} ms, longest {:.1f} ms at "
-            "{}:{}); {} pipelines compiled, {} arena binds, page protection {} calls {:.1f} ms, {} "
-            "write faults; previous frame end: buffer tick {:.1f} ms, downloads {:.1f} ms, GC "
-            "{:.1f} ms, runtime tick {:.1f} ms",
-            ms, hitch_avg_ms, std::chrono::duration<double, std::milli>(now.busy - last.busy).count(),
-            std::chrono::duration<double, std::milli>(now.drain - last.drain).count(),
+            "Stutter: frame {:.1f} ms (usual {:.1f} ms) | GPU thread ms: {} | draw recorder busy "
+            "{:.1f} ms, {} packets | GPU waits {} ({:.1f} ms, longest {:.1f} ms at {}:{}) | {} "
+            "pipelines compiled | {} texture uploads ({:.1f} MiB, {:.1f} ms, copying {:.1f} ms) | "
+            "buffer uploads {:.1f} MiB, {:.1f} ms | {} buffer ranges made resident ({:.1f} MiB, "
+            "{:.1f} ms) | {} staging allocations ({:.1f} MiB, {:.1f} ms) | page protection {} "
+            "calls {:.1f} ms, {} write faults | "
+            "game: {} files opened, {} mutex waits, {} sleeps ({:.1f} ms) | end of submissions: "
+            "buffer tick {:.1f}, downloads {:.1f}, GC {:.1f}, runtime tick {:.1f} ms | "
+            "diagnostics logging {:.1f} ms",
+            ms, hitch_avg_ms, states.empty() ? "-" : states,
+            std::chrono::duration<double, std::milli>(now.busy - last.busy).count(),
             now.packets - last.packets, delta(now.gpu_waits, last.gpu_waits),
-            delta(now.gpu_wait_ns, last.gpu_wait_ns) / 1e6, slowest_ns / 1e6, site,
+            ms_of(delta(now.gpu_wait_ns, last.gpu_wait_ns)), ms_of(slowest_ns), site,
             GS::slowest_wait_line.load(std::memory_order_relaxed),
-            delta(now.pipelines, last.pipelines), delta(now.arena_binds, last.arena_binds),
+            delta(now.pipelines, last.pipelines), delta(now.uploads, last.uploads),
+            delta(now.upload_bytes, last.upload_bytes) / 1048576.0,
+            ms_of(delta(now.upload_ns, last.upload_ns)),
+            ms_of(delta(now.image_copy_ns, last.image_copy_ns)),
+            delta(now.buffer_bytes, last.buffer_bytes) / 1048576.0,
+            ms_of(delta(now.buffer_ns, last.buffer_ns)), delta(now.arena_binds, last.arena_binds),
+            delta(now.resident_bytes, last.resident_bytes) / 1048576.0,
+            ms_of(delta(now.resident_ns, last.resident_ns)),
+            delta(now.staging_count, last.staging_count),
+            delta(now.staging_bytes, last.staging_bytes) / 1048576.0,
+            ms_of(delta(now.staging_ns, last.staging_ns)),
             delta(now.protect_calls, last.protect_calls),
-            delta(now.protect_ns, last.protect_ns) / 1e6, delta(now.faults, last.faults),
-            housekeeping_ns[0] / 1e6, housekeeping_ns[1] / 1e6, housekeeping_ns[2] / 1e6,
-            housekeeping_ns[3] / 1e6);
-    } else {
-        // Usual frame time, hitches left out.
+            ms_of(delta(now.protect_ns, last.protect_ns)), delta(now.faults, last.faults),
+            delta(now.file_opens, last.file_opens), delta(now.mutex_waits, last.mutex_waits),
+            delta(now.sleeps, last.sleeps), ms_of(delta(now.sleep_ns, last.sleep_ns)),
+            ms_of(delta(now.housekeeping[0], last.housekeeping[0])),
+            ms_of(delta(now.housekeeping[1], last.housekeeping[1])),
+            ms_of(delta(now.housekeeping[2], last.housekeeping[2])),
+            ms_of(delta(now.housekeeping[3], last.housekeeping[3])),
+            ms_of(delta(now.diag_ns, last.diag_ns)));
+    } else if (ms < 200.0) {
+        // Usual frame time, stutters (and long pauses such as loading) left out.
         hitch_avg_ms = hitch_frames == 0 ? ms : hitch_avg_ms * 0.95 + ms * 0.05;
     }
     ++hitch_frames;

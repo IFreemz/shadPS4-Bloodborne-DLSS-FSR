@@ -273,6 +273,26 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// What the cached images hold, by what the garbage collector can do with them.
+    struct MemoryReport {
+        struct Group {
+            u64 count{};
+            u64 bytes{};
+            u64 stale_count{}; ///< not used for 16+ collector ticks (old enough to collect)
+            u64 stale_bytes{};
+        };
+        Group clean;     ///< copies of guest memory: freed whenever they are old enough
+        Group written;   ///< GPU-written linear images: freed (written back) only under pressure
+        Group stuck;     ///< GPU-written tiled images: never freed (no tiled write-back)
+        u64 extra_backing_bytes{}; ///< additional backing images (other sample counts)
+        u64 allocated_images{};    ///< all image slots, including ones awaiting deletion
+        u64 trigger{}, pressure{}, critical{}, gc_used{};
+        u64 evicted{}, written_back{}, skipped_stuck{}, skipped_written{}; ///< since last report
+        u64 gc_runs{};
+    };
+    /// Fills a report and resets the collector counters. Call on the thread running the collector.
+    MemoryReport TakeMemoryReport();
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -395,6 +415,8 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    u64 gc_evicted = 0, gc_written_back = 0, gc_skipped_stuck = 0, gc_skipped_written = 0;
+    u64 gc_runs = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;

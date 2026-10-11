@@ -44,6 +44,9 @@ public:
         return draw_pipe != nullptr && pipe_enabled;
     }
 
+    /// Once per game frame (the presenter, when the frame is prepared): stutter report.
+    void OnGameFrame();
+
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
@@ -187,8 +190,10 @@ private:
     void DispatchRecord(const ComputePipeline* pipeline);
     void DispatchIndirectRecord(const ComputePipeline* pipeline, const IndirectArgs& args);
     void LogDrawPipeStats();
-    /// Logs a frame that took much longer than usual, with what happened during it.
+    /// Logs a game frame that took noticeably longer than usual, with what happened during it.
     void ReportHitch();
+    /// Every 10 s with diagnostics on: where VRAM goes (images, buffers, the rest).
+    void LogVramReport();
     /// GPU profile (vk_gpu_profiler.h): a timestamp where a render pass or dispatch starts.
     void MarkPass(const GraphicsPipeline* pipeline, const RenderState& state);
     void MarkDispatch(const ComputePipeline* pipeline);
@@ -197,6 +202,11 @@ private:
         std::chrono::nanoseconds busy{}, drain{};
         u64 packets{}, gpu_wait_ns{}, gpu_waits{}, pipelines{}, arena_binds{}, protect_ns{},
             protect_calls{}, faults{};
+        std::array<u64, static_cast<size_t>(Common::GuestStats::CmdState::Count) * 2> states{};
+        u64 mutex_waits{}, sleeps{}, sleep_ns{}, uploads{}, upload_bytes{}, upload_ns{},
+            image_copy_ns{}, buffer_bytes{}, buffer_ns{}, resident_ns{}, staging_count{},
+            staging_bytes{}, staging_ns{}, file_opens{}, resident_bytes{}, diag_ns{};
+        std::array<u64, 4> housekeeping{};
     };
     HitchSnapshot hitch_last{};
     /// Diagnostics setting (statistics, time breakdown, hitch reports, draw profile).
@@ -208,6 +218,8 @@ private:
     double hitch_avg_ms{};
     u64 hitch_frames{};
     std::array<s64, 4> housekeeping_ns{}; ///< previous frame: buffer tick, downloads, GC, runtime
+    std::array<std::atomic<u64>, 4> housekeeping_total{}; ///< the same, added up
+    std::atomic<u64> diag_log_ns{}; ///< time spent writing the 10 s statistics and VRAM report
     /// Registers, render target size hints and compute registers of the draw being recorded:
     /// the draw recording thread's copy there, the live ones elsewhere.
     const AmdGpu::Regs& Regs() const;
@@ -314,6 +326,7 @@ private:
     bool pipe_enabled{};
     std::vector<u16> pipe_blocks;
     std::chrono::steady_clock::time_point pipe_stats_time{};
+    std::chrono::steady_clock::time_point vram_report_time{};
     u64 pipe_stats_packets{};
     u64 pipe_stats_drains{};
     std::chrono::nanoseconds pipe_stats_drain_time{};

@@ -3,11 +3,17 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
+#include <cstring>
 
 #include "common/alignment.h"
+#include "common/bb_tuning.h"
+#include "common/elf_info.h"
 #include "common/assert.h"
+#include "common/guest_stats.h"
 #include "common/types.h"
 #include "core/devtools/widget/gpu_memory.h"
+#include "core/emulator_settings.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -18,8 +24,17 @@ using VideoCore::MemoryType;
 
 namespace {
 
+// "Frames" here advance at most every 16 ms (TickFrame runs once per guest submission, ~1600
+// a second in Bloodborne, which freed idle staging after ~0.2 s: every streaming burst then
+// allocated fresh memory): ~5 s and ~2 s.
 constexpr u64 RING_IDLE_FRAMES = 300;
 constexpr u64 LARGE_IDLE_FRAMES = 120;
+constexpr u64 LARGE_IDLE_FRAMES_STREAMING = 600; // ~10 s
+constexpr auto FRAME_PERIOD = std::chrono::milliseconds(16);
+// Upload blocks (16 MiB each) allocated at startup and always kept: streaming a new area uploads
+// 200-450 MiB in one frame, and allocating pinned memory mid-game once took 176 ms for 144 MiB
+// (and copies into fresh pages are slower). Large dedicated uploads are kept ~10 s.
+constexpr size_t MIN_UPLOAD_BLOCKS = 24;
 constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
 constexpr u64 BLOCK_SIZE = 16_MB;
 
@@ -31,7 +46,26 @@ u64 RoundAllocationSize(u64 size) {
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
-    : instance{instance_}, scheduler{scheduler_} {}
+    : instance{instance_}, scheduler{scheduler_} {
+    // Bloodborne threaded renderer with streaming optimisations only.
+    if (!Common::BbTuning::IsBloodborne(Common::ElfInfo::Instance().GameSerial()) ||
+        !EmulatorSettings.IsThreadedRenderer() || !EmulatorSettings.IsBbStreaming()) {
+        return;
+    }
+    // Allocated and touched now, so the pages are committed before the game streams.
+    auto& ring = rings[u32(MemoryType::HostUncached)];
+    for (size_t i = 0; i < MIN_UPLOAD_BLOCKS; ++i) {
+        auto& block = ring.blocks.emplace_back(Block{
+            .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler,
+                                                                MemoryType::HostUncached,
+                                                                BLOCK_SIZE),
+            .last_used_frame = 0,
+        });
+        if (!block.buffer->mapped_data.empty()) {
+            std::memset(block.buffer->mapped_data.data(), 0, block.buffer->mapped_data.size());
+        }
+    }
+}
 
 StagingBufferPool::~StagingBufferPool() = default;
 
@@ -64,11 +98,13 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
             best = &ring.blocks[(ring.current + 1) % ring.blocks.size()];
             best_offset = 0;
         } else {
+            const auto start = std::chrono::steady_clock::now();
             best = &ring.blocks.emplace_back(Block{
                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type,
                                                                     BLOCK_SIZE),
                 .last_used_frame = frame,
             });
+            CountAllocation(BLOCK_SIZE, start);
             ring.current = ring.blocks.size() - 1;
             best_offset = *best->buffer->Reserve(size, alignment, false);
         }
@@ -107,6 +143,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     }
 
     if (!best) {
+        const auto start = std::chrono::steady_clock::now();
         best = &cache.emplace_back(LargeBuffer{
             .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
                                                           type, "StagingBufferPool:Dedicated"),
@@ -114,6 +151,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
             .last_used_frame = frame,
             .held = false,
         });
+        CountAllocation(RoundAllocationSize(size), start);
     }
 
     best->tick = scheduler.CurrentTick();
@@ -143,10 +181,32 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
     it->last_used_frame = frame;
 }
 
+void StagingBufferPool::CountAllocation(u64 bytes, std::chrono::steady_clock::time_point start) {
+    namespace GS = Common::GuestStats;
+    GS::staging_allocations.fetch_add(1, std::memory_order_relaxed);
+    GS::staging_allocation_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    GS::staging_allocation_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count(),
+                                        std::memory_order_relaxed);
+}
+
 void StagingBufferPool::TickFrame() {
+    // Streaming optimisations: frames advance at most every 16 ms and upload blocks are kept.
+    // Off: the original, one frame per guest submission.
+    const bool streaming = Common::BbTuning::Streaming();
+    if (streaming) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - frame_time < FRAME_PERIOD) {
+            return;
+        }
+        frame_time = now;
+    }
     ++frame;
-    for (Ring& ring : rings) {
-        TrimRing(ring);
+    for (size_t type = 0; type < rings.size(); ++type) {
+        TrimRing(rings[type], streaming && type == u32(MemoryType::HostUncached)
+                                  ? MIN_UPLOAD_BLOCKS
+                                  : size_t{0});
     }
     for (auto& cache : large_caches) {
         TrimLarge(cache);
@@ -154,9 +214,12 @@ void StagingBufferPool::TickFrame() {
     PublishStats();
 }
 
-void StagingBufferPool::TrimRing(Ring& ring) {
+void StagingBufferPool::TrimRing(Ring& ring, size_t min_blocks) {
     auto& blocks = ring.blocks;
     for (size_t i = blocks.size(); i-- > 0;) {
+        if (blocks.size() <= min_blocks) {
+            break;
+        }
         const Block& block = blocks[i];
         if (frame - block.last_used_frame < RING_IDLE_FRAMES ||
             !scheduler.IsFree(block.buffer->LastTick())) {
@@ -176,7 +239,9 @@ void StagingBufferPool::TrimRing(Ring& ring) {
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
     std::erase_if(cache, [this](const LargeBuffer& entry) {
-        return !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
+        const u64 idle = Common::BbTuning::Streaming() ? LARGE_IDLE_FRAMES_STREAMING
+                                                       : LARGE_IDLE_FRAMES;
+        return !entry.held && frame - entry.last_used_frame >= idle &&
                scheduler.IsFree(entry.tick);
     });
 }

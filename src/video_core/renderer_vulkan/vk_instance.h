@@ -3,8 +3,8 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
-
 #include <span>
 #include <unordered_map>
 
@@ -84,6 +84,23 @@ public:
 
     bool HasSeparatePresentQueue() const {
         return present_queue != graphics_queue;
+    }
+
+    /// A queue for GPU readbacks that runs beside rendering (a copy engine when there is one):
+    /// a readback then waits only for the work that wrote its data, not all queued work.
+    bool HasReadbackQueue() const {
+        return bool(readback_queue);
+    }
+    vk::Queue GetReadbackQueue() const {
+        return readback_queue;
+    }
+    u32 GetReadbackQueueFamily() const {
+        return readback_family;
+    }
+    /// Queue families buffers are shared between (graphics, and the readback queue's family
+    /// when it differs). One entry: exclusive to the graphics family.
+    std::span<const u32> GetBufferQueueFamilies() const {
+        return {buffer_queue_families.data(), buffer_queue_family_count};
     }
 
     TracyVkCtx GetProfilerContext() const {
@@ -477,6 +494,14 @@ public:
     /// Returns the amount of memory used.
     [[nodiscard]] u64 GetDeviceMemoryUsage() const;
 
+    /// Memory use per heap kind right now (VK_EXT_memory_budget), for the VRAM report.
+    struct MemoryHeapReport {
+        u64 local_usage{};  ///< device-local heaps: what this process uses
+        u64 local_budget{}; ///< device-local heaps: what the driver lets it use now
+        u64 host_usage{};   ///< system-memory heaps the GPU can reach (spill-over shows here)
+    };
+    [[nodiscard]] MemoryHeapReport GetMemoryHeapReport() const;
+
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
         return total_memory_budget;
@@ -530,6 +555,10 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue readback_queue;
+    u32 readback_family{~0u};
+    std::array<u32, 2> buffer_queue_families{};
+    u32 buffer_queue_family_count{1};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;

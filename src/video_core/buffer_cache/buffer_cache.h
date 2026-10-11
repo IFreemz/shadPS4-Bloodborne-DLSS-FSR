@@ -3,7 +3,14 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <deque>
+#include <map>
+#include <mutex>
+#include <span>
+#include <string>
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -90,6 +97,10 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 
+    /// Diagnostics: GPU readbacks since the last call (where, who, how long, and whether the
+    /// GPU work that wrote the data had been submitted or had finished), logged every 10 s.
+    void LogReadbackReport();
+
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
@@ -106,6 +117,11 @@ public:
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
+
+    /// VRAM made resident for guest buffers so far (it's never released).
+    [[nodiscard]] u64 ResidentBytes() const noexcept {
+        return resident_bytes.load(std::memory_order_relaxed);
+    }
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
@@ -168,6 +184,39 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+
+    /// Readback diagnostics (diagnostics setting only).
+    struct ReadbackRegion {
+        u64 count{}, bytes{}, gpu_wait_ns{}, guest_blocked_ns{};
+        std::array<u64, 4> writer{}; ///< current batch, in flight, finished, unknown
+        std::map<std::string, u64> threads;
+    };
+    std::mutex readback_mutex;
+    std::unordered_map<u64, ReadbackRegion> readback_regions; ///< by 1 MiB region
+    std::array<u64, 4> readback_writer_ns{};                ///< GPU wait time by writer state
+    u64 readback_max_wait_ns{};
+    std::mutex gpu_write_mutex;
+    std::unordered_map<u64, u64> gpu_write_ticks; ///< 64 KiB block -> tick of the last GPU write
+    u64 readback_queue_count{}, readback_queue_ns{}; ///< readbacks on the second queue (report)
+
+    /// Notes that GPU work recorded now writes [device_addr, device_addr + size).
+    void NoteGpuWrite(VAddr device_addr, u64 size);
+    /// Tick of the last recorded GPU write into the range (0: none known).
+    u64 LastGpuWriteTick(VAddr device_addr, u64 size);
+    /// Copies `copies` from the arena into the download buffer on the readback queue once the
+    /// work signalled with `tick` is done, and waits for the copy alone.
+    void ReadbackOnSecondQueue(const Buffer* arena, const Buffer* destination,
+                               std::span<const vk::BufferCopy> copies, u64 tick);
+    vk::UniqueCommandPool readback_pool;
+    vk::UniqueCommandBuffer readback_cmdbuf;
+    vk::UniqueFence readback_fence;
+    std::mutex readback_queue_mutex;
+    std::chrono::steady_clock::time_point readback_report_time{};
+    std::atomic<u64> resident_bytes{};
+    static constexpr u64 ResidentSlabSize = 64ULL << 20;
+    vk::DeviceMemory resident_slab{};
+    u64 resident_slab_size{};
+    u64 resident_slab_used{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};

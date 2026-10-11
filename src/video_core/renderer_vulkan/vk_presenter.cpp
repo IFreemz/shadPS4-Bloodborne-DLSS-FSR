@@ -51,6 +51,7 @@
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
+#include "common/frame_pacing.h"
 
 namespace Vulkan {
 
@@ -1127,6 +1128,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     } else {
         recent_frame_ticks.clear();
     }
+    rasterizer->OnGameFrame();
     return frame;
 }
 
@@ -1495,6 +1497,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             FrameGen::TimingScope timing{"queue_present"};
             presented = swapchain.Present();
             FrameGen::ReplayPresentStall(true);
+        }
+        if (is_game_frame && !is_reusing_frame) {
+            Common::FramePacing::Record(Common::FramePacing::Event::Present);
         }
         {
             FrameGen::TimingScope timing{"end_present"};

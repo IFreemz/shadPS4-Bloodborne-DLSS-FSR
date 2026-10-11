@@ -65,6 +65,10 @@ void SettingsWindow::LoadSettings(std::string profile) {
     threadedRendererDiagnosticsSetting = EmulatorSettings.IsThreadedRendererDiagnostics();
     threadedRendererGpuProfileSetting = EmulatorSettings.IsThreadedRendererGpuProfile();
     bbObjectMotionSetting = EmulatorSettings.IsBbObjectMotion();
+    bbReadbackQueueSetting = EmulatorSettings.IsBbReadbackQueue();
+    bbStreamingSetting = EmulatorSettings.IsBbStreaming();
+    bbMergedCopiesSetting = EmulatorSettings.IsBbMergedCopies();
+    bbFastLocksSetting = EmulatorSettings.IsBbFastLocks();
 
     /////////// Input Tab
     motionControlsSetting = EmulatorSettings.IsMotionControlsEnabled();
@@ -126,6 +130,10 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetThreadedRendererDiagnostics(threadedRendererDiagnosticsSetting, isSpecific);
     EmulatorSettings.SetThreadedRendererGpuProfile(threadedRendererGpuProfileSetting, isSpecific);
     EmulatorSettings.SetBbObjectMotion(bbObjectMotionSetting, isSpecific);
+    EmulatorSettings.SetBbReadbackQueue(bbReadbackQueueSetting, isSpecific);
+    EmulatorSettings.SetBbStreaming(bbStreamingSetting, isSpecific);
+    EmulatorSettings.SetBbMergedCopies(bbMergedCopiesSetting, isSpecific);
+    EmulatorSettings.SetBbFastLocks(bbFastLocksSetting, isSpecific);
 
     /////////// Input Tab
     EmulatorSettings.SetMotionControlsEnabled(motionControlsSetting, isSpecific);
@@ -717,12 +725,34 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingSliderFloat("RCAS Attenuation", rcasAttenuationSetting, 0.0f, 3.0f, 3);
             }
 
-            AddSettingCheckbox("Threaded Renderer (Bloodborne)", threadedRendererSetting);
-            AddSettingCheckbox("Threaded Renderer: diagnostics in the log",
-                               threadedRendererDiagnosticsSetting);
-            AddSettingCheckbox("Threaded Renderer: GPU time per pass in the log",
-                               threadedRendererGpuProfileSetting);
-            AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting);
+            // Bloodborne-only, experimental: everything the threaded renderer work added. Off
+            // (the switch, or one toggle under it) is the standard shadPS4 behaviour.
+            AddSettingSection("Bloodborne - Experimental",
+                              "Used by Bloodborne only. If something goes wrong, turn off "
+                              "Threaded Renderer to get standard shadPS4 behaviour.",
+                              true);
+            AddSettingCheckbox("Threaded Renderer", threadedRendererSetting,
+                               "Faster rendering and smoother frame pacing. Switches all below");
+            if (threadedRendererSetting) {
+                // Each off: the emulator's original behaviour for that part (troubleshooting).
+                AddSettingCheckbox("    Streaming optimisations", bbStreamingSetting,
+                                   "Smaller hitches entering new areas");
+                AddSettingCheckbox("    GPU readbacks on the copy queue", bbReadbackQueueSetting,
+                                   "Fewer small stutters (turning on needs a restart)");
+                AddSettingCheckbox("    Merged copy shaders", bbMergedCopiesSetting,
+                                   "Less GPU copy work");
+                AddSettingCheckbox("    Faster Windows locks and sleeps", bbFastLocksSetting,
+                                   "Less CPU overhead (needs a restart)");
+            }
+            // Not under the threaded renderer: the upscalers use it either way.
+            AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,
+                               "Motion of moving objects for DLSS / FSR");
+            AddSettingSection("Diagnostics", "For troubleshooting. Slower when on: leave off.",
+                              false);
+            AddSettingCheckbox("Diagnostics in the log", threadedRendererDiagnosticsSetting,
+                               "Frame time, stutter, VRAM and readback reports");
+            AddSettingCheckbox("GPU time per pass in the log", threadedRendererGpuProfileSetting,
+                               "Which render passes take the GPU's time");
 
             ImGui::EndTable();
         }
@@ -811,6 +841,29 @@ void SettingsWindow::AddSettingCheckbox(std::string name, bool& value) {
     ImGui::TextWrapped("%s", name.c_str());
     ImGui::TableNextColumn();
     ImGui::Checkbox(label.c_str(), &value);
+}
+
+void SettingsWindow::AddSettingCheckbox(std::string name, bool& value, const char* hint) {
+    AddSettingCheckbox(name, value);
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", hint);
+}
+
+void SettingsWindow::AddSettingSection(const char* title, const char* note, bool experimental) {
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight() * 0.5f));
+    ImGui::Separator();
+    // Amber for experimental settings, the usual text colour otherwise.
+    const ImVec4 colour = experimental ? ImVec4(1.0f, 0.72f, 0.25f, 1.0f)
+                                       : ImGui::GetStyleColorVec4(ImGuiCol_Text);
+    ImGui::TextColored(colour, "%s", title);
+    ImGui::TableNextColumn();
+    ImGui::Dummy(ImVec2(0.0f, ImGui::GetTextLineHeight() * 0.5f));
+    ImGui::Separator();
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("%s", note);
+    ImGui::PopTextWrapPos();
 }
 
 void SettingsWindow::AddSettingSliderInt(std::string name, int& value, int min, int max) {

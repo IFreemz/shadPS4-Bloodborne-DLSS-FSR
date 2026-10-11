@@ -4,6 +4,7 @@
 #include "mutex.h"
 
 #include "common/assert.h"
+#include "common/bb_tuning.h"
 #include "common/guest_stats.h"
 
 #ifdef _WIN64
@@ -15,10 +16,23 @@ namespace Libraries::Kernel {
 
 #ifdef _WIN64
 
-TimedMutex::TimedMutex() = default;
-TimedMutex::~TimedMutex() = default;
+TimedMutex::TimedMutex() : fast{Common::BbTuning::FastLocks()} {
+    if (!fast) {
+        mtx = CreateMutex(nullptr, false, nullptr);
+        ASSERT(mtx);
+    }
+}
+
+TimedMutex::~TimedMutex() {
+    if (mtx) {
+        CloseHandle(mtx);
+    }
+}
 
 bool TimedMutex::try_lock() {
+    if (!fast) {
+        return WaitForSingleObjectEx(mtx, 0, true) == WAIT_OBJECT_0;
+    }
     u32 expected = Free;
     return state.compare_exchange_strong(expected, Locked, std::memory_order_acquire,
                                          std::memory_order_relaxed);
@@ -31,6 +45,14 @@ void TimedMutex::Wait(u32 timeout_ms) {
 }
 
 void TimedMutex::lock() {
+    if (!fast) {
+        for (;;) {
+            u64 res = WaitForSingleObjectEx(mtx, INFINITE, true);
+            if (res == WAIT_OBJECT_0) {
+                return;
+            }
+        }
+    }
     if (try_lock()) {
         return;
     }
@@ -47,6 +69,10 @@ void TimedMutex::lock() {
 }
 
 void TimedMutex::unlock() {
+    if (!fast) {
+        ReleaseMutex(mtx);
+        return;
+    }
     if (state.exchange(Free, std::memory_order_release) == Contended) {
         WakeByAddressSingle(&state);
     }

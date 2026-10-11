@@ -11,6 +11,7 @@
 #include "core/libraries/fiber/fiber.h"
 #include "core/libraries/kernel/threads/pthread.h"
 
+#include "common/bb_tuning.h"
 #include "common/error.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
@@ -115,6 +116,25 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    const bool interruptible) {
+    if (!BbTuning::FastLocks()) {
+        // The original sleep (a new waitable timer per call).
+        const auto begin_sleep = std::chrono::high_resolution_clock::now();
+
+        LARGE_INTEGER interval{
+            .QuadPart = -1 * (duration.count() / 100u),
+        };
+        HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
+        SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
+        const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
+        ::CloseHandle(timer);
+
+        if (remaining) {
+            const auto end_sleep = std::chrono::high_resolution_clock::now();
+            const auto sleep_time = end_sleep - begin_sleep;
+            *remaining = duration > sleep_time ? duration - sleep_time : std::chrono::nanoseconds(0);
+        }
+        return ret == WAIT_OBJECT_0;
+    }
     const auto begin_sleep = std::chrono::steady_clock::now();
     DWORD ret = WAIT_OBJECT_0;
     if (duration.count() <= 0) {

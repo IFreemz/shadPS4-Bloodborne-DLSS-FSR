@@ -125,10 +125,15 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
       buffer{instance.GetDevice(), instance.GetAllocator()} {
 
+    // Shared with the readback queue's family when it has one of its own (GPU readbacks).
+    const auto families = instance.GetBufferQueueFamilies();
     vk::BufferCreateInfo buffer_ci = {
         .size = size_bytes,
         .usage = AllFlags,
-        .sharingMode = vk::SharingMode::eExclusive,
+        .sharingMode =
+            families.size() > 1 ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = families.size() > 1 ? static_cast<u32>(families.size()) : 0u,
+        .pQueueFamilyIndices = families.size() > 1 ? families.data() : nullptr,
     };
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, mem_type, &alloc_info);

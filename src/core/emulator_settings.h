@@ -423,6 +423,16 @@ struct GPUSettings {
     // Bloodborne upscalers: replay the game's velocity draws at render resolution for object
     // motion vectors (vk_bb_velocity_mirror). Off: camera motion only, ~2-3 ms less GPU time.
     Setting<bool> bb_object_motion{true};
+    // Under the threaded renderer (each off: the emulator's original behaviour for that part).
+    // GPU readbacks on a second queue (copy engine), waiting only for the GPU work that wrote
+    // the data instead of all queued work.
+    Setting<bool> bb_readback_queue{true};
+    // Streaming: parallel copies, resident buffer memory in 64 MiB slabs, staging memory kept.
+    Setting<bool> bb_streaming{true};
+    // Copy shader batches in one compute dispatch, merged within 64 KiB.
+    Setting<bool> bb_merged_copies{true};
+    // Faster Windows locks and sleeps (applies at game start).
+    Setting<bool> bb_fast_locks{true};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -453,6 +463,10 @@ struct GPUSettings {
             make_override<GPUSettings>("threaded_renderer_gpu_profile",
                                        &GPUSettings::threaded_renderer_gpu_profile),
             make_override<GPUSettings>("bb_object_motion", &GPUSettings::bb_object_motion),
+            make_override<GPUSettings>("bb_readback_queue", &GPUSettings::bb_readback_queue),
+            make_override<GPUSettings>("bb_streaming", &GPUSettings::bb_streaming),
+            make_override<GPUSettings>("bb_merged_copies", &GPUSettings::bb_merged_copies),
+            make_override<GPUSettings>("bb_fast_locks", &GPUSettings::bb_fast_locks),
         };
     }
 };
@@ -464,7 +478,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,
                                    userfaultfd, inline_fetch_shader, threaded_renderer,
                                    threaded_renderer_diagnostics, threaded_renderer_gpu_profile,
-                                   bb_object_motion)
+                                   bb_object_motion, bb_readback_queue, bb_streaming,
+                                   bb_merged_copies, bb_fast_locks)
 
 // -------------------------------
 // Vulkan settings
@@ -736,6 +751,10 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, ThreadedRendererDiagnostics, threaded_renderer_diagnostics)
     SETTING_FORWARD_BOOL(m_gpu, ThreadedRendererGpuProfile, threaded_renderer_gpu_profile)
     SETTING_FORWARD_BOOL(m_gpu, BbObjectMotion, bb_object_motion)
+    SETTING_FORWARD_BOOL(m_gpu, BbReadbackQueue, bb_readback_queue)
+    SETTING_FORWARD_BOOL(m_gpu, BbStreaming, bb_streaming)
+    SETTING_FORWARD_BOOL(m_gpu, BbMergedCopies, bb_merged_copies)
+    SETTING_FORWARD_BOOL(m_gpu, BbFastLocks, bb_fast_locks)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

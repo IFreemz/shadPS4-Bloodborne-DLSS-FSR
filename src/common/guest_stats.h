@@ -32,6 +32,25 @@ inline std::atomic<const char*> slowest_wait_file{nullptr};
 inline std::atomic<u32> slowest_wait_line{0};
 inline std::atomic<u64> pipelines_compiled{0};
 inline std::atomic<u64> arena_binds{0}; ///< buffer arena ranges made resident
+/// Texture uploads from guest memory (copy, detile, upload) and the GPU thread time they took.
+inline std::atomic<u64> image_uploads{0};
+inline std::atomic<u64> image_upload_bytes{0};
+inline std::atomic<u64> image_upload_ns{0};
+/// Guest memory copied into staging for texture uploads (part of image_upload_ns).
+inline std::atomic<u64> image_copy_ns{0};
+/// Buffer data uploaded from guest memory, and the time the copies took.
+inline std::atomic<u64> buffer_upload_bytes{0};
+inline std::atomic<u64> buffer_upload_ns{0};
+/// Staging memory the upload pool had to allocate (it keeps and reuses what it has).
+inline std::atomic<u64> staging_allocations{0};
+inline std::atomic<u64> staging_allocation_bytes{0};
+inline std::atomic<u64> staging_allocation_ns{0};
+/// Time spent making buffer memory resident (allocation and page table updates).
+inline std::atomic<u64> resident_ns{0};
+/// Diagnostics setting is on (the rasterizer sets it): extra bookkeeping for the reports.
+inline std::atomic<bool> diagnostics{false};
+/// Files the game opened (streaming).
+inline std::atomic<u64> file_opens{0};
 
 /// What the GPU command thread is doing, sampled with the draw recorder's state to find where
 /// frame time goes (Rasterizer's state sampler).

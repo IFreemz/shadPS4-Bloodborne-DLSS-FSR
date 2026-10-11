@@ -131,6 +131,7 @@ private:
     std::jthread swap_thread; ///< before present_thread: destroyed after it
     std::jthread present_thread;
     std::queue<Request> requests;
+    std::condition_variable request_cv; ///< flip requests, for flips between vblanks
 };
 
 } // namespace Libraries::VideoOut

@@ -1,9 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/frame_pacing.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -350,6 +352,9 @@ void VideoOutDriver::DrawLastFrame() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/, u32 game_frame /*= 0*/) {
+    if (index != -1) {
+        Common::FramePacing::Record(Common::FramePacing::Event::Submit);
+    }
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
@@ -385,6 +390,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
+        Common::FramePacing::Record(Common::FramePacing::Event::Ready);
     }
 
     std::scoped_lock lock{mutex};
@@ -397,6 +403,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .eop = is_eop,
         .game_frame = game_frame,
     });
+    request_cv.notify_one();
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -418,8 +425,33 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
+    // After bbport: while the Bloodborne threaded renderer runs, a flip request is taken as soon
+    // as it arrives (between vblanks) instead of on the next vblank tick, at most one per vblank
+    // period (the vblank frequency stays the frame rate cap). On a 165 Hz vblank, 100 fps was
+    // otherwise shown 12, 12, 6 ms apart. Other games, and frame generation (which paces its
+    // presents by the vblank ticks), keep the original flip-on-tick path unchanged.
+    auto next_flip = std::chrono::steady_clock::now();
+    const auto take_flip = [&](const Request& request, std::chrono::nanoseconds frame_period,
+                               std::chrono::steady_clock::time_point now) {
+        if (frame_period.count() != 0) {
+            next_flip = std::max(next_flip + frame_period, now - frame_period);
+        }
+        if (request.index != -1) {
+            Common::FramePacing::Record(Common::FramePacing::Event::Flip,
+                                        main_port.vblank_status.count);
+        }
+        Flip(request);
+        FRAME_END;
+    };
+
     while (!token.stop_requested()) {
         timer.Start();
+        const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period;
+        Common::FramePacing::SetEnabled(EmulatorSettings.IsThreadedRendererDiagnostics());
+        const bool flip_when_ready = !Vulkan::FrameGen::Requested() && presenter &&
+                                     presenter->GetRasterizer().ThreadedRendererActive();
+        const auto frame_period = flip_when_ready ? std::chrono::nanoseconds(vblank_period)
+                                                  : std::chrono::nanoseconds(0);
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
@@ -430,7 +462,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
         Vulkan::FrameGen::RecordTiming("vblank", 0, 0, vblank_status.count);
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        const bool flip_slot = !flip_when_ready || now >= next_flip;
+        if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             Vulkan::FrameGen::RecordTiming("flip_dequeue", request.game_frame, 0,
                                            vblank_status.count);
@@ -443,8 +477,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
-                Flip(request);
-                FRAME_END;
+                take_flip(request, frame_period, now);
             }
         }
 
@@ -472,7 +505,32 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             main_port.vblank_cv.notify_all();
         }
 
-        timer.End();
+        if (!flip_when_ready || main_port.flip_rate != 0) {
+            timer.End();
+            continue;
+        }
+        // Until the next vblank: take flip requests as they arrive.
+        while (!token.stop_requested()) {
+            {
+                std::unique_lock lk{mutex};
+                if (!request_cv.wait_until(lk, tick_deadline,
+                                           [this] { return !requests.empty(); })) {
+                    break; // next vblank
+                }
+            }
+            if (std::chrono::steady_clock::now() < next_flip) {
+                if (next_flip >= tick_deadline) {
+                    break;
+                }
+                std::this_thread::sleep_until(next_flip);
+            }
+            const auto flip_now = std::chrono::steady_clock::now();
+            const auto request = receive_request();
+            if (request) {
+                take_flip(request, frame_period, flip_now);
+            }
+        }
+        std::this_thread::sleep_until(tick_deadline);
     }
 }
 

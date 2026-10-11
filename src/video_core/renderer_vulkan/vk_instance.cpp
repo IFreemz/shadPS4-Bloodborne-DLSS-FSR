@@ -5,8 +5,11 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
+#include "common/bb_tuning.h"
 #include "common/debug.h"
+#include "common/elf_info.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -420,7 +423,42 @@ bool Instance::CreateDevice() {
             if (slot.family != ~0u)
                 queue_counts[slot.family] = std::max(queue_counts[slot.family], slot.index + 1);
     }
-    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f};
+    // GPU readbacks: a queue beside rendering, preferring a copy engine, then an async compute
+    // queue, then a second graphics queue. Bloodborne threaded renderer with its toggle on
+    // only, and not with frame generation (Streamline and FSR frame generation manage queues of
+    // their own). Without it buffers stay exclusive to the graphics queue, as originally.
+    u32 readback_index = 0;
+    if (!FrameGen::Requested() &&
+        Common::BbTuning::IsBloodborne(Common::ElfInfo::Instance().GameSerial()) &&
+        EmulatorSettings.IsThreadedRenderer() && EmulatorSettings.IsBbReadbackQueue() &&
+        feature_chain.get<vk::PhysicalDeviceVulkan13Features>().synchronization2) {
+        using F = vk::QueueFlagBits;
+        const auto pick = [&](auto&& wanted) {
+            for (u32 family = 0; family < family_properties.size(); ++family) {
+                const auto flags = family_properties[family].queueFlags;
+                if (wanted(family, flags) &&
+                    queue_counts[family] < family_properties[family].queueCount) {
+                    readback_family = family;
+                    readback_index = queue_counts[family]++;
+                    return true;
+                }
+            }
+            return false;
+        };
+        const bool picked =
+            pick([](u32, vk::QueueFlags flags) {
+                return (flags & F::eTransfer) && !(flags & (F::eGraphics | F::eCompute));
+            }) ||
+            pick([](u32, vk::QueueFlags flags) {
+                return (flags & F::eCompute) && !(flags & F::eGraphics);
+            }) ||
+            pick([&](u32 family, vk::QueueFlags) { return family == queue_family_index; });
+        if (!picked) {
+            LOG_INFO(Render_Vulkan, "GPU readbacks: no second queue, using the graphics queue");
+        }
+    }
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f,
+                                                    1.0f, 1.0f, 1.0f, 1.0f};
     std::vector<vk::DeviceQueueCreateInfo> queue_infos;
     for (u32 family = 0; family < queue_counts.size(); ++family)
         if (queue_counts[family])
@@ -649,6 +687,20 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, present_queue_index);
+    buffer_queue_families[0] = queue_family_index;
+    if (readback_family != ~0u) {
+        readback_queue = device->getQueue(readback_family, readback_index);
+        if (readback_family != queue_family_index) {
+            buffer_queue_families[1] = readback_family;
+            buffer_queue_family_count = 2;
+        }
+        const auto flags = family_properties[readback_family].queueFlags;
+        LOG_INFO(Render_Vulkan, "GPU readbacks: queue {}.{} ({})", readback_family,
+                 readback_index,
+                 (flags & vk::QueueFlagBits::eGraphics)  ? "second graphics queue"
+                 : (flags & vk::QueueFlagBits::eCompute) ? "async compute queue"
+                                                         : "copy engine");
+    }
     if (present_queue_index != 0) {
         LOG_INFO(Render_Vulkan, "[FRAME-GEN] Local test: render queue {}.0, present queue {}.{}",
                  queue_family_index, queue_family_index, present_queue_index);
@@ -849,6 +901,28 @@ u64 Instance::GetDeviceMemoryUsage() const {
         total_usage += memory_budget_props.heapUsage[heap];
     }
     return total_usage;
+}
+
+Instance::MemoryHeapReport Instance::GetMemoryHeapReport() const {
+    MemoryHeapReport report{};
+    if (!supports_memory_budget) {
+        return report;
+    }
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+    vk::PhysicalDeviceMemoryProperties2 props = {
+        .pNext = &memory_budget_props,
+    };
+    physical_device.getMemoryProperties2(&props);
+    const auto& memory_props = props.memoryProperties;
+    for (u32 i = 0; i < memory_props.memoryHeapCount; ++i) {
+        if (memory_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            report.local_usage += memory_budget_props.heapUsage[i];
+            report.local_budget += memory_budget_props.heapBudget[i];
+        } else {
+            report.host_usage += memory_budget_props.heapUsage[i];
+        }
+    }
+    return report;
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {
