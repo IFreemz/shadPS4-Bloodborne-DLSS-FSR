@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
 #include <tsl/robin_map.h>
@@ -427,6 +428,8 @@ private:
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
     u64 gc_tick = 0;
+    /// VRAM cleanup: images whose write-back failed, and the tick they may be tried again.
+    std::unordered_map<u32, u64> writeback_retry;
     u64 gc_evicted = 0, gc_written_back = 0, gc_skipped_stuck = 0, gc_skipped_written = 0;
     u64 gc_runs = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;

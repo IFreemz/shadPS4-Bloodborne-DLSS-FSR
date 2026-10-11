@@ -29,6 +29,7 @@ static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr size_t MAX_GC_IMAGE_SCANS = 256;
 static constexpr size_t MAX_GC_WRITEBACKS = 4;
+static constexpr u64 WRITEBACK_RETRY_TICKS = 600;
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -1174,10 +1175,19 @@ void TextureCache::GarbageCollectImages() {
             // Eviction requires completed writeback, rather than merely scheduling
             // a copy whose eventual failure cannot be reported to this collector.
             if (download) {
+                // A failed write-back (after a wait for the GPU) is likely to fail again.
+                const auto retry = writeback_retry.find(image_id.index);
+                if (retry != writeback_retry.end() && gc_tick < retry->second) {
+                    return false;
+                }
                 ++writebacks;
                 if (!WriteBackForEviction(image_id)) {
+                    writeback_retry[image_id.index] = gc_tick + WRITEBACK_RETRY_TICKS;
                     ++failed_writebacks;
                     return false;
+                }
+                if (retry != writeback_retry.end()) {
+                    writeback_retry.erase(retry);
                 }
                 ++gc_written_back;
             }
