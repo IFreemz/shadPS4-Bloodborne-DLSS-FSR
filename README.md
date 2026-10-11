@@ -329,6 +329,10 @@ F1 shows why upscaling isn't running.
   `hotkey_toggle_dlss = f1`; you can bind another key there.
 - **G-SYNC / FreeSync flicker**: uneven frame pacing in emulation, not DLSS. Use an FPS patch
   matching your vblank (60 FPS++ with 60) rather than *Uncap FPS++*.
+- **No sound effects in menus**: if Windows uses *Dolby Atmos for Home Theater* (or another
+  spatial sound format) for your audio device, turn it off in Windows' sound settings. Thanks to
+  @DarthBane768 for tracking this down
+  ([#15](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues/15)).
 
 ## FAQ
 
