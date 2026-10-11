@@ -146,6 +146,7 @@ private:
     bool bbStreamingSetting;
     bool bbMergedCopiesSetting;
     bool bbFastLocksSetting;
+    bool bbFlipWhenReadySetting;
     bool rcasEnabledSetting;
     float rcasAttenuationSetting;
 

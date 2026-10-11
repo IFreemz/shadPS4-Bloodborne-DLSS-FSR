@@ -425,16 +425,26 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
-    // After bbport: while the Bloodborne threaded renderer runs, a flip request is taken as soon
-    // as it arrives (between vblanks) instead of on the next vblank tick, at most one per vblank
-    // period (the vblank frequency stays the frame rate cap). On a 165 Hz vblank, 100 fps was
-    // otherwise shown 12, 12, 6 ms apart. Other games, and frame generation (which paces its
-    // presents by the vblank ticks), keep the original flip-on-tick path unchanged.
-    auto next_flip = std::chrono::steady_clock::now();
-    const auto take_flip = [&](const Request& request, std::chrono::nanoseconds frame_period,
-                               std::chrono::steady_clock::time_point now) {
-        if (frame_period.count() != 0) {
-            next_flip = std::max(next_flip + frame_period, now - frame_period);
+    // After bbport: while the Bloodborne threaded renderer runs ("Show frames when ready"), a
+    // flip request is taken as soon as it arrives (between vblanks) instead of on the next
+    // vblank tick. On a 165 Hz vblank, 100 fps was otherwise shown 12, 12, 6 ms apart.
+    // Flips keep an even rhythm of one vblank period (the vblank frequency stays the frame rate
+    // cap), and two flips are never closer than 7/8 of it: a late frame is not followed by a
+    // catch-up flip right after it. With G-Sync the display refreshes on every flip, so uneven
+    // flips are refresh rate swings (brightness flicker). Vblank ticks then run on a fixed
+    // schedule with precise waits. Other games, and frame generation (which paces its presents
+    // by the vblank ticks), keep the original flip-on-tick path unchanged.
+    using Clock = std::chrono::steady_clock;
+    const auto min_gap = vblank_period * 7 / 8;
+    const auto slack = vblank_period - min_gap;
+    auto next_flip = Clock::now();
+    auto last_flip = Clock::now();
+    auto next_tick = Clock::now();
+    bool ready_mode = false;
+    const auto take_flip = [&](const Request& request, Clock::time_point now) {
+        if (ready_mode) {
+            next_flip = std::max(next_flip + vblank_period, now + min_gap);
+            last_flip = now;
         }
         if (request.index != -1) {
             Common::FramePacing::Record(Common::FramePacing::Event::Flip,
@@ -443,33 +453,60 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         Flip(request);
         FRAME_END;
     };
+    // OS sleeps wake up to a millisecond late: sleep most of the way, spin the rest.
+    constexpr std::chrono::nanoseconds spin = std::chrono::microseconds(1500);
+    const auto wait_until = [&](Clock::time_point deadline) {
+        const auto left = deadline - Clock::now();
+        if (left > spin) {
+            Common::AccurateSleep(left - spin, nullptr, false);
+        }
+        while (Clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+    };
 
     while (!token.stop_requested()) {
-        timer.Start();
-        const auto tick_deadline = std::chrono::steady_clock::now() + vblank_period;
         Common::FramePacing::SetEnabled(EmulatorSettings.IsThreadedRendererDiagnostics());
         const bool flip_when_ready = !Vulkan::FrameGen::Requested() && presenter &&
-                                     presenter->GetRasterizer().ThreadedRendererActive();
-        const auto frame_period =
-            flip_when_ready ? std::chrono::nanoseconds(vblank_period) : std::chrono::nanoseconds(0);
+                                     presenter->GetRasterizer().ThreadedRendererActive() &&
+                                     EmulatorSettings.IsBbFlipWhenReady();
+        if (flip_when_ready != ready_mode) {
+            // Switching pacing: start both clocks fresh.
+            ready_mode = flip_when_ready;
+            timer = Common::AccurateTimer{vblank_period};
+            next_tick = next_flip = last_flip = Clock::now();
+        }
+        if (!ready_mode) {
+            timer.Start();
+        }
+        const auto tick_deadline =
+            ready_mode ? next_tick + vblank_period : Clock::now() + vblank_period;
 
         if (DebugState.IsGuestThreadsPaused()) {
             DrawLastFrame();
-            timer.End();
+            if (ready_mode) {
+                wait_until(tick_deadline);
+                next_tick = tick_deadline;
+            } else {
+                timer.End();
+            }
             continue;
         }
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
         Vulkan::FrameGen::RecordTiming("vblank", 0, 0, vblank_status.count);
-        const auto now = std::chrono::steady_clock::now();
-        const bool flip_slot = !flip_when_ready || now >= next_flip;
+        const auto now = Clock::now();
+        // On a tick, a flip up to `slack` before its slot is fine (ticks and flips run on
+        // separate schedules), as long as it keeps the minimum gap.
+        const bool flip_slot =
+            !ready_mode || (now + slack >= next_flip && now >= last_flip + min_gap);
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             Vulkan::FrameGen::RecordTiming("flip_dequeue", request.game_frame, 0,
                                            vblank_status.count);
             if (!request) {
-                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
+                if (ready_mode || timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
                     } else if (ImGui::Core::MustKeepDrawing()) {
@@ -477,7 +514,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                 }
             } else {
-                take_flip(request, frame_period, now);
+                take_flip(request, now);
             }
         }
 
@@ -505,32 +542,32 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             main_port.vblank_cv.notify_all();
         }
 
-        if (!flip_when_ready || main_port.flip_rate != 0) {
+        if (!ready_mode) {
             timer.End();
             continue;
         }
-        // Until the next vblank: take flip requests as they arrive.
-        while (!token.stop_requested()) {
+        // Until the next vblank: take flip requests as they arrive (not with a flip rate, which
+        // asks for flips on vblank ticks).
+        while (main_port.flip_rate == 0 && !token.stop_requested()) {
             {
                 std::unique_lock lk{mutex};
-                if (!request_cv.wait_until(lk, tick_deadline,
+                if (!request_cv.wait_until(lk, tick_deadline - spin,
                                            [this] { return !requests.empty(); })) {
                     break; // next vblank
                 }
             }
-            if (std::chrono::steady_clock::now() < next_flip) {
-                if (next_flip >= tick_deadline) {
-                    break;
-                }
-                std::this_thread::sleep_until(next_flip);
+            if (next_flip >= tick_deadline) {
+                break; // its slot is at (or after) the next vblank
             }
-            const auto flip_now = std::chrono::steady_clock::now();
+            wait_until(next_flip);
             const auto request = receive_request();
             if (request) {
-                take_flip(request, frame_period, flip_now);
+                take_flip(request, Clock::now());
             }
         }
-        std::this_thread::sleep_until(tick_deadline);
+        wait_until(tick_deadline);
+        // Fixed schedule; after a long stall (a breakpoint, a hitch) start again from now.
+        next_tick = Clock::now() - tick_deadline > vblank_period ? Clock::now() : tick_deadline;
     }
 }
 

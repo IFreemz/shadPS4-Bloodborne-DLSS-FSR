@@ -69,6 +69,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbStreamingSetting = EmulatorSettings.IsBbStreaming();
     bbMergedCopiesSetting = EmulatorSettings.IsBbMergedCopies();
     bbFastLocksSetting = EmulatorSettings.IsBbFastLocks();
+    bbFlipWhenReadySetting = EmulatorSettings.IsBbFlipWhenReady();
 
     /////////// Input Tab
     motionControlsSetting = EmulatorSettings.IsMotionControlsEnabled();
@@ -134,6 +135,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbStreaming(bbStreamingSetting, isSpecific);
     EmulatorSettings.SetBbMergedCopies(bbMergedCopiesSetting, isSpecific);
     EmulatorSettings.SetBbFastLocks(bbFastLocksSetting, isSpecific);
+    EmulatorSettings.SetBbFlipWhenReady(bbFlipWhenReadySetting, isSpecific);
 
     /////////// Input Tab
     EmulatorSettings.SetMotionControlsEnabled(motionControlsSetting, isSpecific);
@@ -743,6 +745,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Less GPU copy work");
                 AddSettingCheckbox("    Faster Windows locks and sleeps", bbFastLocksSetting,
                                    "Less CPU overhead (needs a restart)");
+                AddSettingCheckbox("    Show frames when ready", bbFlipWhenReadySetting,
+                                   "Smoother above 60 fps. Off: frames on vblank ticks");
             }
             // Not under the threaded renderer: the upscalers use it either way.
             AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,

@@ -433,6 +433,9 @@ struct GPUSettings {
     Setting<bool> bb_merged_copies{true};
     // Faster Windows locks and sleeps (applies at game start).
     Setting<bool> bb_fast_locks{true};
+    // Flip a frame as soon as it's ready (between vblanks), evenly paced, instead of on the
+    // next vblank tick.
+    Setting<bool> bb_flip_when_ready{true};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -467,6 +470,7 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_streaming", &GPUSettings::bb_streaming),
             make_override<GPUSettings>("bb_merged_copies", &GPUSettings::bb_merged_copies),
             make_override<GPUSettings>("bb_fast_locks", &GPUSettings::bb_fast_locks),
+            make_override<GPUSettings>("bb_flip_when_ready", &GPUSettings::bb_flip_when_ready),
         };
     }
 };
@@ -479,7 +483,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    userfaultfd, inline_fetch_shader, threaded_renderer,
                                    threaded_renderer_diagnostics, threaded_renderer_gpu_profile,
                                    bb_object_motion, bb_readback_queue, bb_streaming,
-                                   bb_merged_copies, bb_fast_locks)
+                                   bb_merged_copies, bb_fast_locks, bb_flip_when_ready)
 
 // -------------------------------
 // Vulkan settings
@@ -755,6 +759,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbStreaming, bb_streaming)
     SETTING_FORWARD_BOOL(m_gpu, BbMergedCopies, bb_merged_copies)
     SETTING_FORWARD_BOOL(m_gpu, BbFastLocks, bb_fast_locks)
+    SETTING_FORWARD_BOOL(m_gpu, BbFlipWhenReady, bb_flip_when_ready)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {
