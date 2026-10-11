@@ -27,12 +27,16 @@ inline std::atomic<bool> fast_locks{false};
 
 /// Set by the rasterizer at every submission: the threaded renderer is running and the toggle
 /// is on. Off: the original code paths.
+inline std::atomic<bool> threaded{false};       ///< the threaded renderer itself
 inline std::atomic<bool> streaming{false};      ///< parallel copies, resident memory slabs, staging
 inline std::atomic<bool> merged_copies{false};  ///< copy shader batches in one dispatch
 inline std::atomic<bool> readback_queue{false}; ///< GPU readbacks on the second queue
 
 inline bool FastLocks() {
     return fast_locks.load(std::memory_order_relaxed);
+}
+inline bool Threaded() {
+    return threaded.load(std::memory_order_relaxed);
 }
 inline bool Streaming() {
     return streaming.load(std::memory_order_relaxed);

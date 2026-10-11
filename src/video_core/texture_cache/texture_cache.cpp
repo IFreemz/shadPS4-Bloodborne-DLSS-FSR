@@ -127,6 +127,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
         image.hash = XXH3_64bits(addr, image.info.guest_size);
     }
     image.flags |= ImageFlagBits::MaybeCpuDirty;
+    ClearCleanTick(image);
     UntrackImage(image_id);
 }
 
@@ -141,6 +142,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            ClearCleanTick(image);
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
             // This page access may or may not modify the image.
@@ -171,6 +173,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        ClearCleanTick(image);
     });
 }
 
@@ -839,6 +842,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    ClearCleanTick(image);
     registry_generation.fetch_add(1, std::memory_order_acq_rel);
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
@@ -915,6 +919,7 @@ void TextureCache::UntrackImage(ImageId image_id) {
     if (!image.IsTracked()) {
         return;
     }
+    ClearCleanTick(image);
     const auto addr = image.track_addr;
     const auto size = image.track_addr_end - image.track_addr;
     image.track_addr = 0;
@@ -930,6 +935,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
     if (!image.IsTracked() || image_begin < image.track_addr) {
         return;
     }
+    ClearCleanTick(image);
     const auto addr = tracker.GetNextPageAddr(image_begin);
     const auto size = addr - image_begin;
     image.track_addr = addr;
@@ -949,6 +955,7 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
         return;
     }
     ASSERT(image.track_addr_end != 0);
+    ClearCleanTick(image);
     const auto addr = tracker.GetPageAddr(image_end);
     const auto size = image_end - addr;
     image.track_addr_end = addr;
@@ -1121,7 +1128,8 @@ void TextureCache::GarbageCollectSamplers() {
 
 void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
-        ++gc_tick;
+        // Atomic: UpdateImage's fast path reads it without the lock.
+        std::atomic_ref<u64>(gc_tick).store(gc_tick + 1, std::memory_order_release);
     };
 
     GarbageCollectImages();

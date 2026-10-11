@@ -172,9 +172,13 @@ CommandRecorder::CommandRecorder() {
 
 CommandRecorder::~CommandRecorder() {
     Sync();
-    thread.request_stop();
-    head.fetch_add(0, std::memory_order_seq_cst);
+    // Hand over an empty slot as the exit signal. head.wait() only returns once the value
+    // changes, so the thread must be woken by a real new entry, not just a notify.
+    const u64 at = head.load(std::memory_order_relaxed);
+    ring[at % RingSize] = nullptr;
+    head.store(at + 1, std::memory_order_seq_cst);
     head.notify_all();
+    thread.join();
 }
 
 CommandRecorder::Chunk* CommandRecorder::AcquireChunk() {
@@ -244,6 +248,9 @@ void CommandRecorder::Run(std::stop_token stop) {
             }
         }
         Chunk* chunk = ring[at % RingSize];
+        if (!chunk) {
+            return; // shutdown
+        }
         const auto start = std::chrono::steady_clock::now();
         for (size_t offset = 0; offset < chunk->used;) {
             auto* entry = reinterpret_cast<Entry*>(chunk->data + offset);

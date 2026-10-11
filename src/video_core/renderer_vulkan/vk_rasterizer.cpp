@@ -895,6 +895,7 @@ void Rasterizer::OnSubmit() {
         Common::GuestStats::diagnostics.store(diag, std::memory_order_relaxed);
         // The toggles under the threaded renderer (off with it: original behaviour).
         namespace BB = Common::BbTuning;
+        BB::threaded.store(pipe_enabled, std::memory_order_relaxed);
         BB::streaming.store(pipe_enabled && EmulatorSettings.IsBbStreaming(),
                             std::memory_order_relaxed);
         BB::merged_copies.store(pipe_enabled && EmulatorSettings.IsBbMergedCopies(),

@@ -9,6 +9,7 @@
 #include <boost/container/small_vector.hpp>
 #include <tsl/robin_map.h>
 
+#include "common/bb_tuning.h"
 #include "common/lru_cache.h"
 #include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
@@ -118,23 +119,31 @@ public:
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         Image& image = slot_images[image_id];
-        // Fast path (after bbport): a clean, registered image whose whole range is tracked has
-        // nothing to refresh or track; skip the lock that guest fault handlers contend for.
-        // A write fault racing with this check is equivalent to one arriving just after it.
-        {
-            const auto flags =
-                std::atomic_ref<ImageFlagBits>(image.flags).load(std::memory_order_acquire);
-            if (False(flags & ImageFlagBits::Dirty) && True(flags & ImageFlagBits::Registered) &&
-                image.track_addr == image.info.guest_address &&
-                image.track_addr_end == image.info.guest_address + image.info.guest_size) {
-                TouchImage(image);
-                return;
-            }
+        // Threaded renderer fast path (after bbport): skip the lock that guest fault handlers
+        // contend for when this image was already found clean, fully tracked and touched in
+        // this GC tick. Only clean_tick is read here: everything that would make the image need
+        // work again clears it under the lock, so a fault racing with this check is the same as
+        // one arriving just after it.
+        if (Common::BbTuning::Threaded() &&
+            std::atomic_ref<u64>(image.clean_tick).load(std::memory_order_acquire) ==
+                std::atomic_ref<u64>(gc_tick).load(std::memory_order_acquire) + 1) {
+            return;
         }
         std::scoped_lock lk{mutex};
         TrackImage(image_id);
         TouchImage(image);
         RefreshImage(image);
+        if (False(image.flags & ImageFlagBits::Dirty) &&
+            True(image.flags & ImageFlagBits::Registered) &&
+            image.track_addr == image.info.guest_address &&
+            image.track_addr_end == image.info.guest_address + image.info.guest_size) {
+            std::atomic_ref<u64>(image.clean_tick).store(gc_tick + 1, std::memory_order_release);
+        }
+    }
+
+    /// The image needs UpdateImage's full path again (called with the lock held).
+    static void ClearCleanTick(Image& image) {
+        std::atomic_ref<u64>(image.clean_tick).store(0, std::memory_order_release);
     }
 
     /// Resolves overlap between existing cache image and pending merged image
@@ -177,7 +186,7 @@ public:
     }
     /// The garbage collection tick (samplers and images not touched for a while are destroyed).
     [[nodiscard]] u64 GcTick() const noexcept {
-        return gc_tick;
+        return std::atomic_ref<u64>(const_cast<u64&>(gc_tick)).load(std::memory_order_acquire);
     }
     /// GetSampler's LRU touch for a remembered sampler; once per GC tick is enough.
     void TouchSampler(const AmdGpu::Sampler& sampler, bool is_depth);
