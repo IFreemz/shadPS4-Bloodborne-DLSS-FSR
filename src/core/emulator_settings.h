@@ -436,9 +436,9 @@ struct GPUSettings {
     // Flip a frame as soon as it's ready (between vblanks), evenly paced, instead of on the
     // next vblank tick.
     Setting<bool> bb_flip_when_ready{true};
-    // VRAM cleanup (applies at game start): frees idle textures and buffers when VRAM runs low.
+    // VRAM cleanup (applies at game start): frees idle textures when VRAM runs low.
     // Off: the emulator's original cache behaviour.
-    Setting<bool> bb_vram_reclaim{false};
+    Setting<bool> bb_vram_reclaim{true};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
