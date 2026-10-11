@@ -436,6 +436,9 @@ struct GPUSettings {
     // Flip a frame as soon as it's ready (between vblanks), evenly paced, instead of on the
     // next vblank tick.
     Setting<bool> bb_flip_when_ready{true};
+    // VRAM cleanup (applies at game start): frees idle textures and buffers when VRAM runs low.
+    // Off: the emulator's original cache behaviour.
+    Setting<bool> bb_vram_reclaim{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -471,6 +474,7 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_merged_copies", &GPUSettings::bb_merged_copies),
             make_override<GPUSettings>("bb_fast_locks", &GPUSettings::bb_fast_locks),
             make_override<GPUSettings>("bb_flip_when_ready", &GPUSettings::bb_flip_when_ready),
+            make_override<GPUSettings>("bb_vram_reclaim", &GPUSettings::bb_vram_reclaim),
         };
     }
 };
@@ -483,7 +487,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    userfaultfd, inline_fetch_shader, threaded_renderer,
                                    threaded_renderer_diagnostics, threaded_renderer_gpu_profile,
                                    bb_object_motion, bb_readback_queue, bb_streaming,
-                                   bb_merged_copies, bb_fast_locks, bb_flip_when_ready)
+                                   bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim)
 
 // -------------------------------
 // Vulkan settings
@@ -760,6 +764,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbMergedCopies, bb_merged_copies)
     SETTING_FORWARD_BOOL(m_gpu, BbFastLocks, bb_fast_locks)
     SETTING_FORWARD_BOOL(m_gpu, BbFlipWhenReady, bb_flip_when_ready)
+    SETTING_FORWARD_BOOL(m_gpu, BbVramReclaim, bb_vram_reclaim)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

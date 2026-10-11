@@ -147,6 +147,7 @@ private:
     bool bbMergedCopiesSetting;
     bool bbFastLocksSetting;
     bool bbFlipWhenReadySetting;
+    bool bbVramReclaimSetting;
     bool rcasEnabledSetting;
     float rcasAttenuationSetting;
 

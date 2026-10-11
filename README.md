@@ -5,6 +5,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # shadPS4 Bloodborne DLSS & FSR
 
+> **New: [1.9.0-pre.1 (experimental)](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.9.0-pre.1).** It has @eFMann's threaded renderer and frame pacing work, for smoother and faster Bloodborne. Please try it and tell us in the [issues](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues) how it runs on your setup. The stable version is [1.8.5](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.8.5).
+
 Temporal upscaling for Bloodborne on [shadPS4](https://github.com/shadps4-emu/shadPS4): NVIDIA
 DLSS on GeForce RTX cards, AMD FSR 3.1 on everything else, plus frame generation (DLSS on RTX 40
 and 50 series, up to 4x on RTX 50; FSR on every other GPU).

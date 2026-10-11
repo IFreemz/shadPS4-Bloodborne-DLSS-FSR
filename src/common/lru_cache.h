@@ -74,6 +74,24 @@ public:
         }
     }
 
+    // Resume bounded scans without changing resource-use ages. Skipped entries
+    // cannot permanently hide later eligible entries.
+    template <typename Func>
+    void ForEachItemBelow(TickType tick, size_t max_items, Func&& func) {
+        Item* iterator = scan_item ? scan_item : first_item;
+        while (iterator && max_items-- > 0) {
+            if (static_cast<s64>(tick) - static_cast<s64>(iterator->tick) < 0) {
+                scan_item = nullptr;
+                return;
+            }
+            scan_item = iterator->next;
+            if (func(iterator->obj)) {
+                return;
+            }
+            iterator = scan_item;
+        }
+    }
+
 private:
     size_t Build() {
         if (free_items.empty()) {
@@ -106,6 +124,9 @@ private:
     }
 
     void Detach(Item& item) {
+        if (scan_item == &item) {
+            scan_item = item.next;
+        }
         if (item.prev) {
             item.prev->next = item.next;
         }
@@ -130,6 +151,7 @@ private:
     std::deque<size_t> free_items;
     Item* first_item{};
     Item* last_item{};
+    Item* scan_item{};
 };
 
 } // namespace Common

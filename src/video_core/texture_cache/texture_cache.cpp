@@ -13,6 +13,7 @@
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/cache_memory_policy.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -26,6 +27,8 @@ namespace VideoCore {
 
 static constexpr u32 MAX_IMAGES = std::numeric_limits<u16>::max();
 static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
+static constexpr size_t MAX_GC_IMAGE_SCANS = 256;
+static constexpr size_t MAX_GC_WRITEBACKS = 4;
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -34,7 +37,8 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       buffer_cache{buffer_cache_}, tracker{tracker_}, slot_images{MAX_IMAGES},
       slot_image_views{MAX_IMAGE_VIEWS}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
-      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
+      vram_reclaim{EmulatorSettings.IsBbVramReclaim()} {
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -66,6 +70,20 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         std::max<s64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       min_critical_floor));
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
+
+    // VRAM cleanup on large budgets: start writeback and eviction before the cache approaches
+    // the full Vulkan budget. Smaller budgets already start early, and keep their thresholds.
+    // This is a soft target: active or unsafe-to-download images remain.
+    if (vram_reclaim && device_local_memory >= static_cast<s64>(LargeBudget)) {
+        pressure_gc_memory = std::min(pressure_gc_memory, CachePressureTarget(device_local_memory));
+        critical_gc_memory = std::min(critical_gc_memory, CacheCriticalTarget(device_local_memory));
+        trigger_gc_memory = std::min(trigger_gc_memory, pressure_gc_memory);
+    }
+    if (vram_reclaim) {
+        LOG_INFO(Render, "VRAM cleanup on. Image cache targets: scan={} MiB pressure={} MiB "
+                         "critical={} MiB",
+                 trigger_gc_memory >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20);
+    }
 }
 
 TextureCache::~TextureCache() = default;
@@ -78,10 +96,10 @@ void TextureCache::ProcessDownloadImages() {
     download_images.clear();
 }
 
-void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
+bool TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
-        return;
+        return true;
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
@@ -107,17 +125,128 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (sync) {
         scheduler.Finish();
         download.Invalidate();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download.mapped, download_size);
-    } else {
-        scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
-                download.Invalidate();
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
-                                                          download.mapped, download_size);
-                runtime.GetStagingPool().FreeDeferred(download);
-            });
+        return Core::Memory::Instance()->TryWriteBacking(
+            std::bit_cast<u8*>(image.info.guest_address), download.mapped, download_size);
     }
+    scheduler.DeferPriorityOperation(
+        [this, device_addr = image.info.guest_address, download, download_size] {
+            download.Invalidate();
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                      download.mapped, download_size);
+            runtime.GetStagingPool().FreeDeferred(download);
+        });
+    return true;
+}
+
+// VRAM cleanup: writes a GPU-modified image back to guest memory before it is freed, tiled
+// images included. Synchronous; false when the image can't be written back completely.
+bool TextureCache::WriteBackForEviction(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        return true;
+    }
+    const auto& info = image.info;
+    if (info.guest_address == 0 || info.guest_size == 0 || info.resources.levels == 0 ||
+        info.resources.levels > info.mips_layout.size() || info.resources.layers == 0) {
+        return false;
+    }
+    if (image.info.props.is_tiled) {
+        const auto& meta = info.meta_info;
+        if (meta.cmask_addr || meta.fmask_addr || meta.htile_addr || info.stencil_addr ||
+            info.props.is_depth || info.props.has_stencil || info.num_samples != 1) {
+            return false;
+        }
+        switch (info.num_bits) {
+        case 8:
+        case 16:
+        case 32:
+        case 64:
+        case 96:
+        case 128:
+            break;
+        default:
+            return false;
+        }
+        // The tiling shader dispatches whole groups of 64 texels.
+        if (info.guest_size % ((info.num_bits / 8) * 64) != 0) {
+            return false;
+        }
+        // Validate the complete mip layout before acquiring a writable buffer.
+        for (u32 mip = 0; mip < info.resources.levels; ++mip) {
+            const auto& mip_info = info.mips_layout[mip];
+            if (mip_info.size == 0 || mip_info.pitch == 0 || mip_info.height == 0 ||
+                mip_info.offset > info.guest_size ||
+                mip_info.size > info.guest_size - mip_info.offset) {
+                return false;
+            }
+        }
+        const auto [buffer, offset] =
+            buffer_cache.ObtainBuffer(image.info.guest_address, image.info.guest_size, true);
+        if (offset > buffer->size_bytes || info.guest_size > buffer->size_bytes - offset) {
+            return false;
+        }
+        boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
+        for (u32 mip = 0; mip < image.info.resources.levels; ++mip) {
+            const auto& mip_info = image.info.mips_layout[mip];
+            image_copies.push_back({
+                .bufferOffset = mip_info.offset,
+                .bufferRowLength = mip_info.pitch,
+                .bufferImageHeight = mip_info.height,
+                .imageSubresource =
+                    {
+                        .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                        .mipLevel = mip,
+                        .baseArrayLayer = 0,
+                        .layerCount = image.info.resources.layers,
+                    },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {std::max(image.info.size.width >> mip, 1u),
+                                std::max(image.info.size.height >> mip, 1u),
+                                image.info.props.is_volume
+                                    ? std::max(image.info.size.depth >> mip, 1u)
+                                    : 1u},
+            });
+        }
+        if (image_copies.empty()) {
+            return false;
+        }
+        tile_manager.TileImage(image, image_copies, buffer, offset);
+        return buffer_cache.DownloadMemoryFromBuffer(buffer, image.info.guest_address,
+                                                     image.info.guest_size);
+    }
+    // The existing linear path copies only mip zero and one aspect. Do not
+    // evict multi-mip or multi-aspect images through an incomplete writeback.
+    if ((info.resources.levels != 1 || info.props.has_stencil || info.stencil_addr ||
+                 info.props.is_block || info.num_samples != 1)) {
+        return false;
+    }
+    const u64 download_size = u64{info.pitch} * info.size.height * info.size.depth *
+                              info.resources.layers * (info.num_bits / 8);
+    if (download_size == 0 || download_size > info.guest_size) {
+        return false;
+    }
+    const auto download =
+        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, false);
+    const vk::BufferImageCopy image_download = {
+        .bufferOffset = download.offset,
+        .bufferRowLength = image.info.pitch,
+        .bufferImageHeight = image.info.size.height,
+        .imageSubresource =
+            {
+                .aspectMask = image.info.props.is_depth ? vk::ImageAspectFlagBits::eDepth
+                                                        : vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = image.info.resources.layers,
+            },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
+    };
+    runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
+    scheduler.Finish();
+    download.Invalidate();
+    return Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
+                                                     download.mapped, download_size);
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -981,6 +1110,12 @@ void TextureCache::GarbageCollectImages() {
     bool aggresive = false;
     u64 ticks_to_destroy = 0;
     size_t num_deletions = 0;
+    size_t scanned = 0;
+    size_t deleted = 0;
+    size_t skipped_surface = 0;
+    size_t skipped_pressure = 0;
+    size_t failed_writebacks = 0;
+    const u64 observed_usage = total_used_memory;
 
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
@@ -989,51 +1124,106 @@ void TextureCache::GarbageCollectImages() {
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
     };
+    // VRAM cleanup off: the original collector. On: tiled images are written back too (so they
+    // can be freed at all), and only images whose write-back completed are freed.
+    size_t writebacks = 0;
     const auto clean_up = [&](ImageId image_id) {
         if (num_deletions == 0) {
             return true;
         }
-        --num_deletions;
+        if (!vram_reclaim) {
+            --num_deletions;
+        }
+        ++scanned;
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
-        const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            // This is a workaround for now. We can't handle non-linear image downloads.
-            ++gc_skipped_stuck;
-            return false;
-        }
-        if (download && !pressured) {
-            ++gc_skipped_written;
-            return false;
-        }
-        if (download) {
-            DownloadImageMemory(image_id);
-            ++gc_written_back;
+        if (!vram_reclaim) {
+            const bool tiled = image.info.IsTiled();
+            if (tiled && download) {
+                // This is a workaround for now. We can't handle non-linear image downloads.
+                ++gc_skipped_stuck;
+                return false;
+            }
+            if (download && !pressured) {
+                ++gc_skipped_written;
+                return false;
+            }
+            if (download) {
+                DownloadImageMemory(image_id);
+                ++gc_written_back;
+            }
+        } else {
+            const auto& meta = image.info.meta_info;
+            const bool has_auxiliary_surface = meta.cmask_addr || meta.fmask_addr ||
+                                               meta.htile_addr || image.info.stencil_addr ||
+                                               image.info.num_samples > 1;
+            if (download && image.info.IsTiled() && has_auxiliary_surface) {
+                // This writeback path only preserves the tiled pixel surface. Keep images with
+                // separate compression, depth/stencil, or multisample state resident.
+                ++skipped_surface;
+                return false;
+            }
+            if (download && !pressured) {
+                ++skipped_pressure;
+                return false;
+            }
+            if (download && writebacks >= MAX_GC_WRITEBACKS) {
+                // Each write-back waits for the GPU: spread them over passes.
+                return false;
+            }
+            // Eviction requires completed writeback, rather than merely scheduling
+            // a copy whose eventual failure cannot be reported to this collector.
+            if (download) {
+                ++writebacks;
+                if (!WriteBackForEviction(image_id)) {
+                    ++failed_writebacks;
+                    return false;
+                }
+                ++gc_written_back;
+            }
         }
         ++gc_evicted;
         FreeImage(image_id);
+        if (vram_reclaim) {
+            --num_deletions;
+            ++deleted;
+        }
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
                 aggresive = false;
-                return false;
+                return vram_reclaim && num_deletions == 0;
             }
             if (pressured && total_used_memory < pressure_gc_memory) {
                 num_deletions >>= 1;
                 pressured = false;
             }
         }
-        return false;
+        return vram_reclaim && num_deletions == 0;
+    };
+    const auto collect = [&] {
+        if (vram_reclaim) {
+            lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, MAX_GC_IMAGE_SCANS, clean_up);
+        } else {
+            lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        }
     };
 
     // Try to remove anything old enough and not high priority.
     configure(false);
-    lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+    collect();
 
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
-        lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
+        collect();
+    }
+    if (vram_reclaim && gc_tick % 300 == 0) {
+        LOG_DEBUG(Render,
+                 "Image GC: usage={} MiB pressure={} MiB critical={} MiB scanned={} deleted={} "
+                 "retained_surface={} retained_until_pressure={} writeback_rejected={}",
+                 observed_usage >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20, scanned,
+                 deleted, skipped_surface, skipped_pressure, failed_writebacks);
     }
 }
 

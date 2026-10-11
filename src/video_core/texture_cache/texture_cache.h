@@ -361,7 +361,10 @@ private:
     }
 
     /// Copies image memory back to CPU.
-    void DownloadImageMemory(ImageId image_id, bool sync = false);
+    bool DownloadImageMemory(ImageId image_id, bool sync = false);
+
+    /// VRAM cleanup: synchronously writes an image back to guest memory before it is freed.
+    bool WriteBackForEviction(ImageId image_id);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
@@ -429,6 +432,7 @@ private:
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
+    const bool vram_reclaim; ///< VRAM cleanup setting, read at start
     PageTable page_table;
     std::mutex mutex;
     std::atomic<u64> registry_generation{0};

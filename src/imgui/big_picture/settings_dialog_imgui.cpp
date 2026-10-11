@@ -70,6 +70,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbMergedCopiesSetting = EmulatorSettings.IsBbMergedCopies();
     bbFastLocksSetting = EmulatorSettings.IsBbFastLocks();
     bbFlipWhenReadySetting = EmulatorSettings.IsBbFlipWhenReady();
+    bbVramReclaimSetting = EmulatorSettings.IsBbVramReclaim();
 
     /////////// Input Tab
     motionControlsSetting = EmulatorSettings.IsMotionControlsEnabled();
@@ -136,6 +137,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbMergedCopies(bbMergedCopiesSetting, isSpecific);
     EmulatorSettings.SetBbFastLocks(bbFastLocksSetting, isSpecific);
     EmulatorSettings.SetBbFlipWhenReady(bbFlipWhenReadySetting, isSpecific);
+    EmulatorSettings.SetBbVramReclaim(bbVramReclaimSetting, isSpecific);
 
     /////////// Input Tab
     EmulatorSettings.SetMotionControlsEnabled(motionControlsSetting, isSpecific);
@@ -751,6 +753,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             // Not under the threaded renderer: the upscalers use it either way.
             AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,
                                "Motion of moving objects for DLSS / FSR");
+            AddSettingCheckbox("VRAM cleanup", bbVramReclaimSetting,
+                               "Frees unused VRAM in long sessions (needs a restart)");
             AddSettingSection("Diagnostics", "For troubleshooting. Slower when on: leave off.",
                               false);
             AddSettingCheckbox("Diagnostics in the log", threadedRendererDiagnosticsSetting,
