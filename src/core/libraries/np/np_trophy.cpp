@@ -958,6 +958,9 @@ int PS4_SYSV_ABI sceNpTrophyUnlockTrophy(OrbisNpTrophyContext context, OrbisNpTr
 
     if (platinumId == nullptr)
         return ORBIS_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+    // Every return below must leave a valid id: some return ORBIS_OK early (the user's trophy
+    // file is missing), and the game reads it.
+    *platinumId = ORBIS_NP_TROPHY_INVALID_TROPHY_ID;
 
     Common::SlotId contextId;
     contextId.index = context - 1;
