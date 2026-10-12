@@ -504,14 +504,9 @@ public:
     [[nodiscard]] MemoryHeapReport GetMemoryHeapReport() const;
 
     /// Returns the total memory budget available to the device.
-    [[nodiscard]] u64 GetTotalMemoryBudget() const {
-        // Testing: SHADPS4_VRAM_BUDGET_MB simulates a smaller GPU's memory budget.
-        static const u64 override_budget = [] {
-            const char* value = std::getenv("SHADPS4_VRAM_BUDGET_MB");
-            return value ? u64{std::strtoull(value, nullptr, 10)} << 20 : u64{0};
-        }();
-        return override_budget ? override_budget : total_memory_budget;
-    }
+    /// Testing: SHADPS4_VRAM_BUDGET_MB or the "VRAM budget for testing" setting simulate a
+    /// smaller GPU's memory budget.
+    [[nodiscard]] u64 GetTotalMemoryBudget() const;
 
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;

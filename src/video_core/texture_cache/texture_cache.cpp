@@ -30,6 +30,8 @@ static constexpr u32 MAX_IMAGE_VIEWS = std::numeric_limits<u16>::max();
 static constexpr size_t MAX_GC_IMAGE_SCANS = 256;
 static constexpr size_t MAX_GC_WRITEBACKS = 4;
 static constexpr u64 WRITEBACK_RETRY_TICKS = 600;
+// Write-back copies in flight at once (each holds a staging buffer the size of its image).
+static constexpr size_t MAX_PENDING_WRITEBACKS = 8;
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
@@ -79,10 +81,20 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
         pressure_gc_memory = std::min(pressure_gc_memory, CachePressureTarget(device_local_memory));
         critical_gc_memory = std::min(critical_gc_memory, CacheCriticalTarget(device_local_memory));
         trigger_gc_memory = std::min(trigger_gc_memory, pressure_gc_memory);
+    } else if (vram_reclaim) {
+        // Smaller budgets (after bbport): the original marks (1.8 / 2.7 GB on a 6 GB card) sit
+        // below what the game uses in normal play, so the collector stayed in pressure mode,
+        // evicting textures used a second ago and loading them again (stutter, lower FPS).
+        // Pressure at 85 % and critical at 95 % of the budget; below that, images go once
+        // unused for GcIdleSeconds (GarbageCollectImages), which keeps VRAM from growing.
+        pressure_gc_memory = static_cast<u64>(device_local_memory) / 100 * 85;
+        critical_gc_memory = static_cast<u64>(device_local_memory) / 100 * 95;
+        trigger_gc_memory = 0;
     }
     if (vram_reclaim) {
-        LOG_INFO(Render, "VRAM cleanup on. Image cache targets: scan={} MiB pressure={} MiB "
-                         "critical={} MiB",
+        LOG_INFO(Render,
+                 "VRAM cleanup on. Image cache targets: scan={} MiB pressure={} MiB "
+                 "critical={} MiB",
                  trigger_gc_memory >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20);
     }
 }
@@ -139,12 +151,26 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     return true;
 }
 
-// VRAM cleanup: writes a GPU-modified image back to guest memory before it is freed, tiled
-// images included. Synchronous; false when the image can't be written back completely.
-bool TextureCache::WriteBackForEviction(ImageId image_id) {
+// VRAM cleanup: an image may be written back over its guest memory only while that memory still
+// belongs to it. A CPU write next to the image untracks its first or last page without marking it
+// dirty, after which writes inside the image there go unseen; a GPU buffer write that doesn't
+// start at the image's address doesn't mark it either.
+bool TextureCache::SafeToWriteBack(const Image& image) {
+    const VAddr begin = image.info.guest_address;
+    const VAddr end = begin + image.info.guest_size;
+    if (image.track_addr != begin || image.track_addr_end != end) {
+        return false;
+    }
+    return !buffer_cache.IsRegionGpuModified(begin, image.info.guest_size);
+}
+
+// VRAM cleanup: records the copy of a GPU-modified image (tiled ones re-tiled to their guest
+// layout) into a staging buffer, to be written to guest memory and the image freed once the GPU
+// has done it. False when the image can't be written back completely.
+bool TextureCache::BeginWriteBack(ImageId image_id) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
-        return true;
+        return false;
     }
     const auto& info = image.info;
     if (info.guest_address == 0 || info.guest_size == 0 || info.resources.levels == 0 ||
@@ -181,11 +207,6 @@ bool TextureCache::WriteBackForEviction(ImageId image_id) {
                 return false;
             }
         }
-        const auto [buffer, offset] =
-            buffer_cache.ObtainBuffer(image.info.guest_address, image.info.guest_size, true);
-        if (offset > buffer->size_bytes || info.guest_size > buffer->size_bytes - offset) {
-            return false;
-        }
         boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
         for (u32 mip = 0; mip < image.info.resources.levels; ++mip) {
             const auto& mip_info = image.info.mips_layout[mip];
@@ -211,14 +232,18 @@ bool TextureCache::WriteBackForEviction(ImageId image_id) {
         if (image_copies.empty()) {
             return false;
         }
-        tile_manager.TileImage(image, image_copies, buffer, offset);
-        return buffer_cache.DownloadMemoryFromBuffer(buffer, image.info.guest_address,
-                                                     image.info.guest_size);
+        // Tiled straight into the staging buffer (the tiling shader writes it as a storage
+        // buffer), so guest buffers in the GPU aren't touched.
+        const auto download =
+            runtime.GetStagingPool().Request(info.guest_size, MemoryType::HostCached, 256, true);
+        tile_manager.TileImage(image, image_copies, download.buffer, download.offset);
+        QueueWriteBack(image_id, image, download, info.guest_size);
+        return true;
     }
     // The existing linear path copies only mip zero and one aspect. Do not
     // evict multi-mip or multi-aspect images through an incomplete writeback.
     if ((info.resources.levels != 1 || info.props.has_stencil || info.stencil_addr ||
-                 info.props.is_block || info.num_samples != 1)) {
+         info.props.is_block || info.num_samples != 1)) {
         return false;
     }
     const u64 download_size = u64{info.pitch} * info.size.height * info.size.depth *
@@ -227,7 +252,7 @@ bool TextureCache::WriteBackForEviction(ImageId image_id) {
         return false;
     }
     const auto download =
-        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, false);
+        runtime.GetStagingPool().Request(download_size, MemoryType::HostCached, 16, true);
     const vk::BufferImageCopy image_download = {
         .bufferOffset = download.offset,
         .bufferRowLength = image.info.pitch,
@@ -244,10 +269,59 @@ bool TextureCache::WriteBackForEviction(ImageId image_id) {
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
     runtime.DownloadImage(&image, download.buffer, std::span{&image_download, 1});
-    scheduler.Finish();
-    download.Invalidate();
-    return Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                     download.mapped, download_size);
+    QueueWriteBack(image_id, image, download, download_size);
+    return true;
+}
+
+void TextureCache::QueueWriteBack(ImageId image_id, const Image& image,
+                                  const Vulkan::StagingBufferRef& download, u64 size) {
+    pending_writebacks.push_back({
+        .image_id = image_id,
+        .image_uid = image.image_uid,
+        .last_use = image.last_use_gc_tick,
+        .tick = scheduler.CurrentTick(),
+        .address = image.info.guest_address,
+        .size = size,
+        .download = download,
+    });
+}
+
+// VRAM cleanup: finishes the write-backs whose copies the GPU has done. The image is freed only
+// if nothing used or changed it since its copy was recorded; otherwise the copy is dropped.
+void TextureCache::CompleteWriteBacks() {
+    if (pending_writebacks.empty()) {
+        return;
+    }
+    auto pending = std::move(pending_writebacks);
+    pending_writebacks.clear();
+    for (PendingWriteBack& writeback : pending) {
+        if (!scheduler.IsFree(writeback.tick)) {
+            pending_writebacks.push_back(writeback);
+            continue;
+        }
+        bool written = false;
+        if (slot_images.IsAllocated(writeback.image_id)) {
+            Image& image = slot_images[writeback.image_id];
+            if (image.image_uid == writeback.image_uid &&
+                image.last_use_gc_tick == writeback.last_use && image.SafeToDownload() &&
+                SafeToWriteBack(image)) {
+                writeback.download.Invalidate();
+                // Like a CPU write: guest buffers in the GPU holding this range upload it again.
+                buffer_cache.InvalidateMemory(writeback.address, writeback.size);
+                written = Core::Memory::Instance()->TryWriteBacking(
+                    std::bit_cast<u8*>(writeback.address), writeback.download.mapped,
+                    writeback.size);
+                if (written) {
+                    ++gc_written_back;
+                    ++gc_evicted;
+                    FreeImage(writeback.image_id);
+                } else {
+                    writeback_retry[writeback.image_id.index] = gc_tick + WRITEBACK_RETRY_TICKS;
+                }
+            }
+        }
+        runtime.GetStagingPool().FreeDeferred(writeback.download);
+    }
 }
 
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
@@ -1105,11 +1179,33 @@ void TextureCache::GarbageCollectImages() {
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
+    // VRAM cleanup: ages also in seconds (after bbport). gc_tick (one per submission, ~100 a
+    // second) at each of the last 64 seconds; an image goes once unused for GcIdleSeconds
+    // normally (the textures of an area left behind), GcPressureIdleSeconds over the pressure
+    // mark and 1 s over the critical one. The submission counts alone (16/80/160, a fraction
+    // of a second) evicted textures briefly off screen and uploaded them again.
+    constexpr u64 GcIdleSeconds = 20;
+    constexpr u64 GcPressureIdleSeconds = 5;
+    const u64 second = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count());
+    if (vram_reclaim && second != gc_second) {
+        if (gc_second == 0) {
+            gc_tick_at_second.fill(gc_tick);
+        }
+        gc_second = second;
+        gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+    }
+    const auto tick_seconds_ago = [&](u64 seconds) {
+        return gc_tick_at_second[(second - seconds) % gc_tick_at_second.size()];
+    };
     ++gc_runs;
     std::scoped_lock lock{mutex};
+    CompleteWriteBacks();
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;
+    u64 below_tick = 0;
     size_t num_deletions = 0;
     size_t scanned = 0;
     size_t deleted = 0;
@@ -1123,7 +1219,18 @@ void TextureCache::GarbageCollectImages() {
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
+        below_tick = gc_tick - ticks_to_destroy;
+        if (vram_reclaim) {
+            const u64 idle = aggresive ? 1 : pressured ? GcPressureIdleSeconds : GcIdleSeconds;
+            below_tick = std::min(below_tick, tick_seconds_ago(idle));
+        }
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+    };
+    // An image that cannot go in this mode moves to the back of the queue (after bbport):
+    // otherwise every pass scans the same oldest ones again (thousands a second).
+    const auto keep = [&](const Image& image) {
+        lru_cache.Touch(image.lru_id, gc_tick);
+        return false;
     };
     // VRAM cleanup off: the original collector. On: tiled images are written back too (so they
     // can be freed at all), and only images whose write-back completed are freed.
@@ -1162,26 +1269,37 @@ void TextureCache::GarbageCollectImages() {
                 // This writeback path only preserves the tiled pixel surface. Keep images with
                 // separate compression, depth/stencil, or multisample state resident.
                 ++skipped_surface;
-                return false;
+                return keep(image);
             }
             if (download && !pressured) {
                 ++skipped_pressure;
-                return false;
+                return keep(image);
             }
-            if (download && writebacks >= MAX_GC_WRITEBACKS) {
-                // Each write-back waits for the GPU: spread them over passes.
-                return false;
+            if (download && !SafeToWriteBack(image)) {
+                // Part of its memory may hold newer CPU or GPU buffer data: writing the image
+                // back would overwrite it (seen as game crashes while loading an area).
+                ++gc_skipped_written;
+                return keep(image);
             }
-            // Eviction requires completed writeback, rather than merely scheduling
-            // a copy whose eventual failure cannot be reported to this collector.
             if (download) {
-                // A failed write-back (after a wait for the GPU) is likely to fail again.
+                // Written back without waiting for the GPU: the copy is recorded now and the
+                // image freed by a later pass, once the copy is done (CompleteWriteBacks).
+                if (std::ranges::any_of(pending_writebacks, [&](const PendingWriteBack& pending) {
+                        return pending.image_id == image_id;
+                    })) {
+                    return keep(image);
+                }
+                if (writebacks >= MAX_GC_WRITEBACKS ||
+                    pending_writebacks.size() >= MAX_PENDING_WRITEBACKS) {
+                    return false;
+                }
+                // A failed write-back is likely to fail again.
                 const auto retry = writeback_retry.find(image_id.index);
                 if (retry != writeback_retry.end() && gc_tick < retry->second) {
                     return false;
                 }
                 ++writebacks;
-                if (!WriteBackForEviction(image_id)) {
+                if (!BeginWriteBack(image_id)) {
                     writeback_retry[image_id.index] = gc_tick + WRITEBACK_RETRY_TICKS;
                     ++failed_writebacks;
                     return false;
@@ -1189,7 +1307,7 @@ void TextureCache::GarbageCollectImages() {
                 if (retry != writeback_retry.end()) {
                     writeback_retry.erase(retry);
                 }
-                ++gc_written_back;
+                return keep(image);
             }
         }
         ++gc_evicted;
@@ -1213,7 +1331,7 @@ void TextureCache::GarbageCollectImages() {
     };
     const auto collect = [&] {
         if (vram_reclaim) {
-            lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, MAX_GC_IMAGE_SCANS, clean_up);
+            lru_cache.ForEachItemBelow(below_tick, MAX_GC_IMAGE_SCANS, clean_up);
         } else {
             lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
         }
@@ -1230,10 +1348,10 @@ void TextureCache::GarbageCollectImages() {
     }
     if (vram_reclaim && gc_tick % 300 == 0) {
         LOG_DEBUG(Render,
-                 "Image GC: usage={} MiB pressure={} MiB critical={} MiB scanned={} deleted={} "
-                 "retained_surface={} retained_until_pressure={} writeback_rejected={}",
-                 observed_usage >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20, scanned,
-                 deleted, skipped_surface, skipped_pressure, failed_writebacks);
+                  "Image GC: usage={} MiB pressure={} MiB critical={} MiB scanned={} deleted={} "
+                  "retained_surface={} retained_until_pressure={} writeback_rejected={}",
+                  observed_usage >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20, scanned,
+                  deleted, skipped_surface, skipped_pressure, failed_writebacks);
     }
 }
 
@@ -1338,6 +1456,9 @@ void TextureCache::RunGarbageCollector() {
 
 void TextureCache::TouchImage(const Image& image) {
     lru_cache.Touch(image.lru_id, gc_tick);
+    // VRAM cleanup: a write-back recorded before this use is out of date.
+    std::atomic_ref<u64>(const_cast<Image&>(image).last_use_gc_tick)
+        .store(gc_tick, std::memory_order_relaxed);
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

@@ -71,6 +71,8 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbFastLocksSetting = EmulatorSettings.IsBbFastLocks();
     bbFlipWhenReadySetting = EmulatorSettings.IsBbFlipWhenReady();
     bbVramReclaimSetting = EmulatorSettings.IsBbVramReclaim();
+    bbBufferEvictionSetting = EmulatorSettings.IsBbBufferEviction();
+    bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
 
     /////////// Input Tab
     motionControlsSetting = EmulatorSettings.IsMotionControlsEnabled();
@@ -138,6 +140,8 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbFastLocks(bbFastLocksSetting, isSpecific);
     EmulatorSettings.SetBbFlipWhenReady(bbFlipWhenReadySetting, isSpecific);
     EmulatorSettings.SetBbVramReclaim(bbVramReclaimSetting, isSpecific);
+    EmulatorSettings.SetBbBufferEviction(bbBufferEvictionSetting, isSpecific);
+    EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
 
     /////////// Input Tab
     EmulatorSettings.SetMotionControlsEnabled(motionControlsSetting, isSpecific);
@@ -755,12 +759,20 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                "Motion of moving objects for DLSS / FSR");
             AddSettingCheckbox("VRAM cleanup", bbVramReclaimSetting,
                                "Frees unused VRAM in long sessions (needs a restart)");
+            if (bbVramReclaimSetting) {
+                AddSettingCheckbox(
+                    "    Also free idle buffers (testing)", bbBufferEvictionSetting,
+                    "Buffer memory unused for 30 s near the limit (needs a restart)");
+            }
             AddSettingSection("Diagnostics", "For troubleshooting. Slower when on: leave off.",
                               false);
             AddSettingCheckbox("Diagnostics in the log", threadedRendererDiagnosticsSetting,
                                "Frame time, stutter, VRAM and readback reports");
             AddSettingCheckbox("GPU time per pass in the log", threadedRendererGpuProfileSetting,
                                "Which render passes take the GPU's time");
+            // Testing the VRAM cleanup: act as if the GPU had this much VRAM (0 = real amount).
+            AddSettingSliderInt("VRAM budget for testing (MB, 0 = real)", bbVramBudgetTestSetting,
+                                0, 24000);
 
             ImGui::EndTable();
         }

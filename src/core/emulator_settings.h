@@ -439,6 +439,10 @@ struct GPUSettings {
     // VRAM cleanup (applies at game start): frees idle textures when VRAM runs low.
     // Off: the emulator's original cache behaviour.
     Setting<bool> bb_vram_reclaim{true};
+    // With VRAM cleanup: also free guest buffer memory unused for 30 s (experimental, at start).
+    Setting<bool> bb_buffer_eviction{false};
+    // Testing: the VRAM budget the caches assume, in MiB (0 = the GPU's real budget; at start).
+    Setting<int> bb_vram_budget_test_mb{0};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -475,6 +479,9 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_fast_locks", &GPUSettings::bb_fast_locks),
             make_override<GPUSettings>("bb_flip_when_ready", &GPUSettings::bb_flip_when_ready),
             make_override<GPUSettings>("bb_vram_reclaim", &GPUSettings::bb_vram_reclaim),
+            make_override<GPUSettings>("bb_buffer_eviction", &GPUSettings::bb_buffer_eviction),
+            make_override<GPUSettings>("bb_vram_budget_test_mb",
+                                       &GPUSettings::bb_vram_budget_test_mb),
         };
     }
 };
@@ -487,7 +494,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, int
                                    userfaultfd, inline_fetch_shader, threaded_renderer,
                                    threaded_renderer_diagnostics, threaded_renderer_gpu_profile,
                                    bb_object_motion, bb_readback_queue, bb_streaming,
-                                   bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim)
+                                   bb_merged_copies, bb_fast_locks, bb_flip_when_ready,
+                                   bb_vram_reclaim, bb_buffer_eviction, bb_vram_budget_test_mb)
 
 // -------------------------------
 // Vulkan settings
@@ -765,6 +773,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbFastLocks, bb_fast_locks)
     SETTING_FORWARD_BOOL(m_gpu, BbFlipWhenReady, bb_flip_when_ready)
     SETTING_FORWARD_BOOL(m_gpu, BbVramReclaim, bb_vram_reclaim)
+    SETTING_FORWARD_BOOL(m_gpu, BbBufferEviction, bb_buffer_eviction)
+    SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

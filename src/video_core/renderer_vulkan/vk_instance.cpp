@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdlib>
+
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
@@ -885,6 +888,18 @@ void Instance::CollectToolingInfo() const {
         const std::string_view name = tool.name;
         LOG_INFO(Render_Vulkan, "Attached debugging tool: {}", name);
     }
+}
+
+u64 Instance::GetTotalMemoryBudget() const {
+    // Read once (at game start): the caches size themselves from it.
+    static const u64 override_budget = [] {
+        const char* value = std::getenv("SHADPS4_VRAM_BUDGET_MB");
+        const u64 mib =
+            value ? u64{std::strtoull(value, nullptr, 10)}
+                  : static_cast<u64>(std::max(0, EmulatorSettings.GetBbVramBudgetTestMb()));
+        return mib << 20;
+    }();
+    return override_budget ? override_budget : total_memory_budget;
 }
 
 u64 Instance::GetDeviceMemoryUsage() const {

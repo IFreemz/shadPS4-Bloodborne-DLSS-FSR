@@ -148,6 +148,8 @@ private:
     bool bbFastLocksSetting;
     bool bbFlipWhenReadySetting;
     bool bbVramReclaimSetting;
+    bool bbBufferEvictionSetting;
+    int bbVramBudgetTestSetting;
     bool rcasEnabledSetting;
     float rcasAttenuationSetting;
 

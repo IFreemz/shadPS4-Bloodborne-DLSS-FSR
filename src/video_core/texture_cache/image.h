@@ -166,6 +166,7 @@ public:
     u64 image_uid{};
     u64 lru_id{};
     u64 tick_accessed_last{};
+    u64 last_use_gc_tick{}; ///< VRAM cleanup: GC tick of the last use (atomic_ref access)
     u64 hash{};
 
     struct {

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -15,6 +16,7 @@
 #include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -365,7 +367,11 @@ private:
     bool DownloadImageMemory(ImageId image_id, bool sync = false);
 
     /// VRAM cleanup: synchronously writes an image back to guest memory before it is freed.
-    bool WriteBackForEviction(ImageId image_id);
+    bool BeginWriteBack(ImageId image_id);
+    void QueueWriteBack(ImageId image_id, const Image& image,
+                        const Vulkan::StagingBufferRef& download, u64 size);
+    void CompleteWriteBacks();
+    bool SafeToWriteBack(const Image& image);
 
     /// Thread function for copying downloaded images out to CPU memory.
     void DownloadedImagesThread(const std::stop_token& token);
@@ -430,6 +436,18 @@ private:
     u64 gc_tick = 0;
     /// VRAM cleanup: images whose write-back failed, and the tick they may be tried again.
     std::unordered_map<u32, u64> writeback_retry;
+    struct PendingWriteBack {
+        ImageId image_id;
+        u64 image_uid;
+        u64 last_use; ///< the image's last_use_gc_tick when the copy was recorded
+        u64 tick;     ///< scheduler tick that completes the copy
+        VAddr address;
+        u64 size;
+        Vulkan::StagingBufferRef download;
+    };
+    std::vector<PendingWriteBack> pending_writebacks;
+    std::array<u64, 64> gc_tick_at_second{}; ///< VRAM cleanup: gc_tick at each of the last 64 s
+    u64 gc_second = 0;
     u64 gc_evicted = 0, gc_written_back = 0, gc_skipped_stuck = 0, gc_skipped_written = 0;
     u64 gc_runs = 0;
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;

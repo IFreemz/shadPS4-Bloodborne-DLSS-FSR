@@ -210,8 +210,34 @@ private:
         }
     };
     ResidentRangeList resident_ranges;
-    std::unordered_map<VkDeviceMemory, u64> resident_last_use;
-    bool vram_reclaim{}; ///< VRAM cleanup setting, read at start
+    std::unordered_map<u64, u64> resident_chunk_use; ///< 2 MiB chunk -> second of last use
+    /// Buffer eviction: resident memory slabs, handed out and taken back block by block.
+    struct ResidentSlab {
+        u64 size_blocks{};
+        u64 live_blocks{};
+        std::map<u64, u64> free; ///< free runs: first block -> count
+    };
+    std::unordered_map<VkDeviceMemory, ResidentSlab> resident_slabs;
+    struct ResidentBlocks {
+        vk::DeviceMemory memory;
+        u64 start;
+        u64 count;
+    };
+    void MakeResidentPooled(const Buffer* arena, const IntervalList<>& bind_ranges,
+                            u64 resident_blocks);
+    ResidentBlocks TakeResidentBlocks(u64 wanted);
+    /// Returns the slab's size in blocks when nothing of it is bound any more (to be freed).
+    u64 ReturnResidentBlocks(vk::DeviceMemory memory, u64 start, u64 count);
+    void MarkResidentUse(VAddr device_addr, u64 size);
+    u64 cache_second{};
+    struct RetiredMemory {
+        vk::DeviceMemory memory;
+        u64 second;
+        u64 unbind_tick; ///< memory_semaphore tick of its last unbind
+    };
+    u64 last_unbind_tick{}; ///< memory_semaphore tick of the last unbind (buffer eviction)
+    std::vector<RetiredMemory> retired_memory; ///< evicted, freed a few seconds later
+    bool vram_reclaim{};                       ///< VRAM cleanup setting, read at start
     u64 cache_tick{};
     u64 last_resident_gc_tick{};
     u64 last_resident_diag_tick{};
@@ -245,6 +271,7 @@ private:
     std::chrono::steady_clock::time_point readback_report_time{};
     std::atomic<u64> resident_bytes{};
     static constexpr u64 ResidentSlabSize = 64ULL << 20;
+    static constexpr u64 EvictionSlabSize = 16ULL << 20;
     vk::DeviceMemory resident_slab{};
     u64 resident_slab_size{};
     u64 resident_slab_used{};
