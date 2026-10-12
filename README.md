@@ -192,9 +192,10 @@ They are meant for 1080p screens and low VRAM. The result is 1080p scaled to you
 ### HDR with RenoDX
 
 The [RenoDX](https://github.com/clshortfuse/renodx) HDR mod for Bloodborne (ReShade 6.8.0 or
-newer) works with this build, with every upscaler, patch type and frame generation. It is in
-**early access** for now: its authors share it on their Discord with their supporters. If you
-enjoy it, donate to the RenoDX devs, they deserve it.
+newer) works with this build, with every upscaler, patch type and frame generation. It's out of
+early access: get it free from the Bloodborne channel on the
+[RenoDX Discord](https://discord.gg/F6AUTeWJHM). If you enjoy it, donate to the RenoDX devs, they
+deserve it.
 
 Use 1.8.2 or newer. In 1.8.0 and 1.8.1, upscaling with a regular Resolution Patch capped
 highlights at about 200 nits; 1.7.0 and earlier didn't support RenoDX.
@@ -217,7 +218,9 @@ RenoDX authors.
 ### Other patches
 
 Keep *Better AA* and *Enable TAA* off: the upscaler replaces the game's anti-aliasing.
-*60FPS++ (no deltatime)* may crash while an area loads; use *60 FPS++*. Patches and mods that
+*60FPS++ (no deltatime)* may crash while an area loads; use *60 FPS++*. *Enable Screen Space
+Reflections* turns off object motion for the upscaler, so characters and weapons can smear; keep
+it off for the sharpest image. Patches and mods that
 players tested with this build are under [Tested setups](#tested-setups).
 
 ### Why the three "Disable" patches, and not Disable Motion Blur
