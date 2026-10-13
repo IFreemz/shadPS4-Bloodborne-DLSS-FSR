@@ -309,11 +309,14 @@ void Rasterizer::PrepareObjectMotion(const GraphicsPipeline* pipeline, bool is_i
         return;
     }
     // Every vertex stream: identical position buffers can go with different skinning data.
-    u64 geometry = 0;
+    std::array<AmdGpu::Buffer, 32> streams;
+    u32 num_streams = 0;
     for (const auto& attribute : fetch.attributes) {
-        const auto buffer = attribute.GetSharp(vs);
-        geometry = XXH3_64bits_withSeed(&buffer, sizeof(buffer), geometry);
+        if (num_streams < streams.size()) {
+            streams[num_streams++] = attribute.GetSharp(vs);
+        }
     }
+    const u64 geometry = XXH3_64bits(streams.data(), num_streams * sizeof(AmdGpu::Buffer));
     const u32 index_size =
         regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
     const VAddr index_address =

@@ -462,11 +462,21 @@ bool PipelineCache::RefreshGraphicsKey() {
             bc.color_dst_factor == AmdGpu::BlendControl::BlendFactor::DstColor;
     }
 
+    // Character motion: start from this vertex shader's last choice, so the stages are
+    // normally built once; they are rebuilt only when the choice turns out different.
+    const u64 motion_vs = motion_possible ? regs.vs_program.Address<u64>() : 0;
+    if (motion_possible) {
+        const auto it = motion_choices.find(motion_vs);
+        motion_select = it != motion_choices.end() && it->second;
+    }
+
     // Compile and bind shader stages
     if (!RefreshGraphicsStages()) {
+        motion_select = false;
         return false;
     }
     if (motion_possible) {
+        bool wanted = false;
         const auto* vs = infos[static_cast<u32>(Shader::SwStage::Vertex)];
         const auto* fs = infos[static_cast<u32>(Shader::SwStage::Fragment)];
         if (vs && fs && !(fs->mrt_mask & (1u << Shader::MotionVectors::Output))) {
@@ -477,14 +487,18 @@ bool PipelineCache::RefreshGraphicsKey() {
                 const auto buffer = resource.GetSharp(*vs);
                 if (buffer.Valid() && buffer.GetStride() == 16 &&
                     Motion::ClassifyBuffer(u32(buffer.GetSize())) != Motion::BufferRole::Other) {
-                    motion_select = true;
+                    wanted = true;
                     break;
                 }
             }
         }
-        if (motion_select && !RefreshGraphicsStages()) {
-            motion_select = false;
-            return false;
+        motion_choices[motion_vs] = wanted;
+        if (wanted != motion_select) {
+            motion_select = wanted;
+            if (!RefreshGraphicsStages()) {
+                motion_select = false;
+                return false;
+            }
         }
     }
 

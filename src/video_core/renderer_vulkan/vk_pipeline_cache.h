@@ -133,6 +133,9 @@ private:
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     bool motion_select{}; // the stages being built write character motion vectors
+    // Character motion choice per vertex shader (by code address), so a G-buffer draw builds
+    // its stages once instead of twice.
+    tsl::robin_map<u64, bool> motion_choices;
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
     Shader::Gcn::FetchShaderData* fetch_shader{};
