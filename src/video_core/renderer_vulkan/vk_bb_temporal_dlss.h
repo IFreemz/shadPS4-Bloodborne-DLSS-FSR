@@ -23,6 +23,7 @@ class Instance;
 class Runtime;
 class Scheduler;
 class BbVelocityMirror;
+class BbObjectMotion;
 
 // Temporal upscaling for Bloodborne with DLSS (shadps4_dlss.dll + nvngx_dlss.dll) or FSR 3.1
 // (amd_fidelityfx_vk.dll), active when either is present next to the executable. Scene
@@ -54,6 +55,9 @@ public:
     BbTemporalDlss();
     ~BbTemporalDlss();
     bool Requested() const;
+    // dlss.ini character_motion at startup: G-buffer pipelines get the motion attachment.
+    bool CharacterMotionRequested() const;
+    void SetObjectMotion(BbObjectMotion* object_motion);
 
     struct DrawInfo {
         u64 vs_hash;

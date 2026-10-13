@@ -220,12 +220,15 @@ struct PushData {
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 BufOffsetIndex = 4;
+    static constexpr u32 MotionParamIndex = BufOffsetIndex + 3;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
     std::array<u8, NUM_BUFFERS> buf_offsets;
+    /// Character motion vectors: device address of this draw's parameters (low, high).
+    std::array<u32, 2> motion_param;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());

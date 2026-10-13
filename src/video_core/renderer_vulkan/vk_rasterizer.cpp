@@ -31,6 +31,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 #include <vk_mem_alloc.h>
+#include <xxhash.h>
 
 namespace Vulkan {
 
@@ -58,6 +59,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+
+    // Before any pipeline is selected: G-buffer pipelines only get the motion attachment
+    // while this is enabled.
+    object_motion = std::make_unique<BbObjectMotion>(
+        instance, scheduler, temporal_dlss.Requested() && temporal_dlss.CharacterMotionRequested());
+    temporal_dlss.SetObjectMotion(object_motion.get());
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -285,6 +292,102 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
         }
     }
     return {vertex_offset, instance_offset};
+}
+
+// Character motion vectors (ported from bbport): history parameters for a skinned G-buffer draw.
+// Draws without a character-size skeleton (weapons, props, mostly static world pieces) only get
+// history while their bone palette changes.
+void Rasterizer::PrepareObjectMotion(const GraphicsPipeline* pipeline, bool is_indexed,
+                                     u32 index_offset, u32 vertex_offset, u32 instance_offset) {
+    if (!object_motion->Active()) {
+        return;
+    }
+    const auto& regs = Regs();
+    const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+    const auto& fetch = pipeline->GetFetchShader();
+    if (fetch.Empty()) {
+        return;
+    }
+    // Every vertex stream: identical position buffers can go with different skinning data.
+    u64 geometry = 0;
+    for (const auto& attribute : fetch.attributes) {
+        const auto buffer = attribute.GetSharp(vs);
+        geometry = XXH3_64bits_withSeed(&buffer, sizeof(buffer), geometry);
+    }
+    const u32 index_size =
+        regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+    const VAddr index_address =
+        is_indexed ? regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size : 0;
+    const u32 num_indices = regs.num_indices;
+    const u32 num_instances = regs.num_instances.NumInstances();
+
+    bool gated = true;
+    u64 palette = 0;
+    for (const auto& resource : vs.buffers) {
+        if (resource.IsSpecial()) {
+            continue;
+        }
+        const auto buffer = resource.GetSharp(vs);
+        const u32 size = u32(buffer.GetSize());
+        if (!buffer.Valid() || buffer.GetStride() != 16) {
+            continue;
+        }
+        const auto role = Motion::ClassifyBuffer(size);
+        if (role == Motion::BufferRole::Skeleton) {
+            gated = false;
+            break;
+        }
+        const VAddr address = buffer.base_address;
+        if (role == Motion::BufferRole::SmallSkeleton && memory->IsValidGpuMapping(address, 0) &&
+            memory->ClampRangeSize(address, size) == size) {
+            palette =
+                XXH3_64bits_withSeed(reinterpret_cast<const void*>(address), size, palette);
+        }
+    }
+    if (gated && !object_motion->Moving({.shader = vs.pgm_hash,
+                                         .geometry = geometry,
+                                         .indices = index_address,
+                                         .index_count = num_indices,
+                                         .instances = num_instances,
+                                         .first_instance = instance_offset},
+                                        palette)) {
+        return;
+    }
+    Motion::VertexRange range{vertex_offset, num_indices};
+    u64 topology = 0;
+    if (is_indexed) {
+        range = {};
+        const u64 bytes = u64(num_indices) * index_size;
+        if (!index_address || !memory->IsValidGpuMapping(index_address, 0) ||
+            memory->ClampRangeSize(index_address, bytes) != bytes) {
+            return;
+        }
+        const bool restart = (regs.enable_primitive_restart & 1) != 0;
+        const auto scanned = object_motion->IndexRange(
+            {index_address, num_indices, index_size, s32(vertex_offset), restart}, [&] {
+                const auto* data = reinterpret_cast<const void*>(index_address);
+                const auto scan_range =
+                    index_size == 2
+                        ? Motion::IndexedRange(std::span(static_cast<const u16*>(data), num_indices),
+                                               s32(vertex_offset), restart)
+                        : Motion::IndexedRange(std::span(static_cast<const u32*>(data), num_indices),
+                                               s32(vertex_offset), restart);
+                return Motion::IndexRangeCache::Result{scan_range, XXH3_64bits(data, bytes)};
+            });
+        range = scanned.range;
+        topology = scanned.topology;
+    }
+    const u64 param = object_motion->PrepareDraw({
+        .shader = vs.pgm_hash,
+        .geometry = geometry,
+        .indices = index_address,
+        .topology = topology,
+        .index_count = num_indices,
+        .instances = num_instances,
+        .first_instance = instance_offset,
+        .vertices = range,
+    });
+    push_data.motion_param = {u32(param), u32(param >> 32)};
 }
 
 void Rasterizer::EliminateFastClear() {
@@ -575,7 +678,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         return;
     }
     ProfileLap(Section::Dlss);
-    const auto state = BeginRendering(pipeline);
+    auto state = BeginRendering(pipeline);
+    if (pipeline->GetGraphicsKey().motion_vectors && object_motion->Enabled()) {
+        object_motion->Attach(state);
+    }
     ProfileLap(Section::BeginRendering);
 
     BindVertexBuffers(pipeline);
@@ -589,16 +695,19 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     }
     ProfileLap(Section::Barriers);
 
+    const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+    const auto& fetch_shader = pipeline->GetFetchShader();
+    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
+    if (pipeline->GetGraphicsKey().motion_vectors) {
+        PrepareObjectMotion(pipeline, is_indexed, index_offset, vertex_offset, instance_offset);
+    }
+
     pipeline->BindResources(set_writes, push_data);
     ProfileLap(Section::Descriptors);
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
     ProfileLap(Section::Dynamic);
-
-    const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
-    const auto& fetch_shader = pipeline->GetFetchShader();
-    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
     const auto pipeline_handle = pipeline->Handle();
     scheduler.Record([pipeline_handle](vk::CommandBuffer cmdbuf) {
@@ -688,7 +797,10 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         return;
     }
     TemporalDlssDraw(pipeline, true);
-    const auto state = BeginRendering(pipeline);
+    auto state = BeginRendering(pipeline);
+    if (pipeline->GetGraphicsKey().motion_vectors && object_motion->Enabled()) {
+        object_motion->Attach(state);
+    }
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -1164,6 +1276,10 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(Regs());
+    if (object_motion) {
+        const u64 no_motion = object_motion->NoParam();
+        push_data.motion_param = {u32(no_motion), u32(no_motion >> 32)};
+    }
     bind_stage_ordinal = 0;
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {

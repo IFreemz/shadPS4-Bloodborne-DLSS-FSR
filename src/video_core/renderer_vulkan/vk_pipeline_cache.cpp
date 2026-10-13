@@ -16,6 +16,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_bb_motion_history.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -162,6 +163,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             !instance.IsDepthClipControlSupported() &&
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
+        info.hw.vs.motion_vectors = motion_select;
         break;
     }
     case HwStage::Fragment: {
@@ -217,6 +219,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
               !regs.stage_enable.IsStageEnabled(static_cast<u32>(HwStage::Local))) ||
              lowers_user_clip_planes) &&
             profile.needs_clip_distance_emulation;
+        info.hw.fs.motion_vectors = motion_select;
         break;
     }
     case HwStage::Compute: {
@@ -419,6 +422,21 @@ bool PipelineCache::RefreshGraphicsKey() {
     const bool skip_cb_binding =
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
 
+    // Character motion vectors: only G-buffer draws (5+ targets, single-sampled depth) whose
+    // vertex shader has a bone palette get the extra attachment.
+    bool motion_possible = false;
+    if (Shader::MotionVectors::enabled && !skip_cb_binding) {
+        u32 bound = 0;
+        for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            bound += (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) ? 1 : 0;
+        }
+        motion_possible = bound >= 5 && !regs.color_buffers[Shader::MotionVectors::Output] &&
+                          regs.depth_buffer.DepthValid() &&
+                          regs.depth_buffer.NumSamples() == 1 && !regs.IsClipDisabled() &&
+                          regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs;
+    }
+    motion_select = false;
+
     // First pass to fill render target information needed by shader recompiler
     for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
         const auto& col_buf = regs.color_buffers[cb];
@@ -447,6 +465,27 @@ bool PipelineCache::RefreshGraphicsKey() {
     // Compile and bind shader stages
     if (!RefreshGraphicsStages()) {
         return false;
+    }
+    if (motion_possible) {
+        const auto* vs = infos[static_cast<u32>(Shader::SwStage::Vertex)];
+        const auto* fs = infos[static_cast<u32>(Shader::SwStage::Fragment)];
+        if (vs && fs && !(fs->mrt_mask & (1u << Shader::MotionVectors::Output))) {
+            for (const auto& resource : vs->buffers) {
+                if (resource.IsSpecial()) {
+                    continue;
+                }
+                const auto buffer = resource.GetSharp(*vs);
+                if (buffer.Valid() && buffer.GetStride() == 16 &&
+                    Motion::ClassifyBuffer(u32(buffer.GetSize())) != Motion::BufferRole::Other) {
+                    motion_select = true;
+                    break;
+                }
+            }
+        }
+        if (motion_select && !RefreshGraphicsStages()) {
+            motion_select = false;
+            return false;
+        }
     }
 
     // Second pass to mask out render targets not written by shader and fill remaining info
@@ -477,6 +516,23 @@ bool PipelineCache::RefreshGraphicsKey() {
         all_color_samples_same &= color_samples == prev_color_samples || prev_color_samples == 0;
         key.color_samples[cb] = color_samples;
         key.num_samples = std::max(key.num_samples, color_samples);
+    }
+
+    if (motion_select) {
+        constexpr u32 mv = Shader::MotionVectors::Output;
+        key.motion_vectors = 1;
+        key.mrt_mask |= 1u << mv;
+        key.num_color_attachments = mv + 1;
+        auto& color_buffer = key.color_buffers[mv];
+        color_buffer = {};
+        color_buffer.data_format = AmdGpu::DataFormat::Format32_32_32_32;
+        color_buffer.num_format = AmdGpu::NumberFormat::Float;
+        color_buffer.swizzle = AmdGpu::IdentityMapping;
+        key.blend_controls[mv] = {};
+        key.write_masks[mv] = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                              vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+        key.color_samples[mv] = 1;
+        motion_select = false;
     }
 
     // Force all color samples to match depth samples to avoid unsupported MSAA configuration

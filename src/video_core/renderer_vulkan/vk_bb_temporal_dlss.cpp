@@ -26,6 +26,7 @@
 #include "video_core/host_shaders/bb_hudless_dim_comp.h"
 #include "video_core/renderer_vulkan/vk_bb_resolution.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
+#include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_fsr4_addon.h"
@@ -302,6 +303,10 @@ sharpness=0.6
 # The game's motion blur: 0 = off (sharper in motion), 1 = on
 motion_blur=0
 
+# Exact motion for characters, cloth and enemies (less smearing): 1 = on, 0 = off.
+# Turning it on or off completely needs a restart.
+character_motion=1
+
 # Full-screen menus (inventory, pause) show the game's own image instead of the upscaled one,
 # so the scene does not shimmer behind them: 1 = on, 0 = off
 menu_fix=1
@@ -339,6 +344,7 @@ struct Tune {
     int quality = -1;      // -1: from scale
     int upscaler = 0;      // 0 automatic, 1 DLSS, 2 FSR 3.1, 3 FSR 4
     bool motion_blur = false;
+    bool character_motion = true; // skinned meshes' own motion vectors (vk_bb_object_motion)
     bool menu_fix = true;
     bool auto_exposure = true; // HDR input (decoupled UI): FSR computes the exposure
 };
@@ -459,6 +465,8 @@ struct BbTemporalDlss::Impl {
     std::unique_ptr<Fsr4Addon> fsr4;
     std::optional<Fsr4Addon::ContextDesc> fsr4_rejected_size;
     bool fsr_tried{}, fsr4_tried{}, camera_logged{};
+    BbObjectMotion* object_motion{};
+    u64 character_motion_frames{};
 
     Impl() {
         requested = BbTemporalDlssRequested();
@@ -536,6 +544,8 @@ struct BbTemporalDlss::Impl {
                 next.menu_fix = number != 0;
             else if (key == "motion_blur")
                 next.motion_blur = number != 0;
+            else if (key == "character_motion")
+                next.character_motion = number != 0;
             else if (key == "upscaler")
                 next.upscaler = value.starts_with("dlss")   ? 1
                                 : value.starts_with("fsr4") ? 3
@@ -551,6 +561,8 @@ struct BbTemporalDlss::Impl {
             }
         }
         tune = next;
+        if (object_motion)
+            object_motion->SetActive(tune.character_motion);
         FrameGen::SetEnabled(tune.frame_gen);
         FrameGen::SetCounterVisible(tune.fps_counter);
         FrameGen::SetMultiplier(tune.fg_multiplier);
@@ -568,7 +580,8 @@ struct BbTemporalDlss::Impl {
         const auto device = instance.GetDevice();
         using T = vk::DescriptorType;
         static constexpr std::array motion_types{T::eCombinedImageSampler, T::eCombinedImageSampler,
-                                                 T::eStorageImage, T::eStorageBuffer};
+                                                 T::eStorageImage, T::eStorageBuffer,
+                                                 T::eCombinedImageSampler};
         static constexpr std::array composite_types{
             T::eCombinedImageSampler, T::eCombinedImageSampler, T::eCombinedImageSampler,
             T::eCombinedImageSampler, T::eStorageImage,         T::eCombinedImageSampler,
@@ -636,6 +649,8 @@ struct BbTemporalDlss::Impl {
         r32_depth.reset();
         depth_fallback = false;
         mirror.ConsumeFrame(scheduler.CommandBuffer()); // start a fresh mirror every frame
+        if (object_motion)
+            object_motion->OnFrameStart();
         ++frame;
         AdvanceJitter();
     }
@@ -1292,13 +1307,23 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                     vk::AccessFlagBits2::eShaderWrite);
     const bool jittered = tune.jitter && jittered_draws > 0;
     const std::array<float, 2> applied = jittered ? jitter : std::array<float, 2>{};
+    // Character motion: the skinned meshes' own vectors, written with the G-buffer.
+    bool character_valid = false;
+    vk::ImageView character_view{};
+    if (object_motion && object_motion->Enabled())
+        character_view = object_motion->PrepareRead(command, in.width, in.height, character_valid);
+    if (character_valid)
+        ++character_motion_frames;
     {
         const std::array images{
             vk::DescriptorImageInfo{*nearest, *depth_view.image_view,
                                     vk::ImageLayout::eShaderReadOnlyOptimal},
             vk::DescriptorImageInfo{*nearest, use_mirror ? mirror_frame->view : *snapshot->view,
                                     vk::ImageLayout::eShaderReadOnlyOptimal},
-            vk::DescriptorImageInfo{{}, *motion->view, vk::ImageLayout::eGeneral}};
+            vk::DescriptorImageInfo{{}, *motion->view, vk::ImageLayout::eGeneral},
+            vk::DescriptorImageInfo{*nearest, character_view ? character_view : *snapshot->view,
+                                    character_view ? vk::ImageLayout::eGeneral
+                                                   : vk::ImageLayout::eShaderReadOnlyOptimal}};
         const vk::DescriptorBufferInfo buffer{coefficients->Handle(), 0, CoefficientBytes};
         const std::array writes{
             vk::WriteDescriptorSet{.dstBinding = 0,
@@ -1316,7 +1341,11 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
             vk::WriteDescriptorSet{.dstBinding = 3,
                                    .descriptorCount = 1,
                                    .descriptorType = vk::DescriptorType::eStorageBuffer,
-                                   .pBufferInfo = &buffer}};
+                                   .pBufferInfo = &buffer},
+            vk::WriteDescriptorSet{.dstBinding = 4,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                   .pImageInfo = &images[3]}};
         struct {
             float reproject[12];
             float proj[4], prev_proj[4];
@@ -1357,7 +1386,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         push.jitter[0] = applied[0];
         push.jitter[1] = applied[1];
         push.use_mirror = use_mirror ? 1u : 0u;
-        push.flags = (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u);
+        push.flags = (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u) |
+                     (character_valid ? 4u : 0u);
         command.bindPipeline(vk::PipelineBindPoint::eCompute, *motion_pass->pipeline);
         command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *motion_pass->layout, 0,
                                      writes);
@@ -1499,10 +1529,10 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                  "[DLSS-TEMPORAL] {} evaluations={} {}x{}->{}x{} preHUD={} "
                  "jitter=({:.3f},{:.3f}) "
                  "jitteredDraws={} (before display copy {}) objectMotion={} reset={} fallbacks={} "
-                 "sceneCameraFrames={}",
+                 "sceneCameraFrames={} characterMotion={} (frames with it {})",
                  BackendName(backend), evaluations, in.width, in.height, out.width, out.height,
                  pre_hud, applied[0], applied[1], jittered_draws, jittered_before_copy, use_mirror,
-                 reset, fallbacks, scene_camera_frames);
+                 reset, fallbacks, scene_camera_frames, character_valid, character_motion_frames);
     return true;
 }
 
@@ -1709,6 +1739,16 @@ BbTemporalDlss::~BbTemporalDlss() = default;
 
 bool BbTemporalDlss::Requested() const {
     return impl->requested;
+}
+
+bool BbTemporalDlss::CharacterMotionRequested() const {
+    return impl->requested && impl->tune.character_motion;
+}
+
+void BbTemporalDlss::SetObjectMotion(BbObjectMotion* object_motion) {
+    impl->object_motion = object_motion;
+    if (object_motion)
+        object_motion->SetActive(impl->tune.character_motion);
 }
 
 void BbTemporalDlss::ObserveTexture(const VideoCore::Image& image, VideoCore::ImageId id,

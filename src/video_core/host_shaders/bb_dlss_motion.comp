@@ -7,13 +7,17 @@ layout(binding=1) uniform sampler2D velocity_mirror;
 layout(binding=2, rg16f) uniform writeonly image2D motion;
 // [0, 1024): constants of producer 0xd3c8bb21. [1024, 1026): geometry velocity packing scale.
 layout(binding=3, std430) readonly buffer Coefficients { float c[]; };
+// Character motion from the G-buffer: rg = previous - current (render pixels, y down),
+// b = valid, a = depth the vector was written with.
+layout(binding=4) uniform sampler2D character_motion;
 layout(push_constant) uniform Push {
     vec4 reproject[3]; // previous view * inverse current view (3x4 rows, built in double)
     vec4 proj;         // current projection: x scale, y scale, z scale, z offset
     vec4 prev_proj;    // previous projection
     vec2 jitter;       // viewport offset of this frame's scene draws, render pixels (y down)
     uint use_mirror;   // object velocity covered pixels override camera motion
-    uint flags;        // 1: snap matrix rounding noise, 2: scene camera matrices valid
+    uint flags;        // 1: snap matrix rounding noise, 2: scene camera matrices valid,
+                       // 4: character motion written this frame
 } pc;
 shared mat4 previous_from_current;
 shared uint matrix_valid;
@@ -83,6 +87,15 @@ void main() {
         if (m.a > 0.5 && abs(sx) > 1e-6 && abs(sy) > 1e-6 && !isinf(sx) && !isinf(sy) &&
             !isnan(sx) && !isnan(sy))
             delta = (m.rg - 0.5) * vec2(-float(extent.x) / sx, float(extent.y) / sy);
+    }
+    if ((pc.flags & 4u) != 0) {
+        vec4 o = texelFetch(character_motion, pixel, 0);
+        // A later ordinary draw may have covered this pixel without writing the motion target;
+        // its depth then differs from the one stored with the vector.
+        float threshold = (pc.flags & 2u) != 0 ? max(2e-7, (pc.proj.z - raw_depth) * 0.01) : 1e-5;
+        if (o.b > 0.99 && abs(o.a - raw_depth) < threshold && !any(isnan(o.rg)) &&
+            !any(isinf(o.rg)))
+            delta = o.rg;
     }
     if (any(isnan(delta)) || any(isinf(delta)) || any(greaterThan(abs(delta), vec2(extent))))
         delta = vec2(0);

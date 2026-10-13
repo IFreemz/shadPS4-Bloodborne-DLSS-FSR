@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
+#include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -248,7 +249,10 @@ private:
     const Instance& instance;
     BbVelocityMirror velocity_mirror;
     BbTemporalDlss temporal_dlss;
+    std::unique_ptr<BbObjectMotion> object_motion; // character motion vectors (temporal DLSS)
     std::array<float, 2> draw_jitter{}; // viewport offset of the current draw (temporal DLSS)
+    void PrepareObjectMotion(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
+                             u32 vertex_offset, u32 instance_offset);
     void TemporalDlssDraw(const GraphicsPipeline* pipeline, bool indirect);
     void CopyInsteadOfDraw(const BbTemporalDlss::DrawReplacement& source);
     void ReplayDisplayCopy(const GraphicsPipeline* pipeline, const RenderState& state,

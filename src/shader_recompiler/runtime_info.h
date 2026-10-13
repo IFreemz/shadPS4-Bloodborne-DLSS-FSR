@@ -78,6 +78,18 @@ struct SwVertexRuntimeInfo {
     bool operator==(const SwVertexRuntimeInfo& other) const noexcept = default;
 };
 
+/// Character motion vectors for temporal upscaling (ported from bbport). Skinned G-buffer
+/// vertex shaders store each vertex's clip position and load the previous frame's, by buffer
+/// device address; the fragment shader writes the screen-space difference to an extra color
+/// attachment. The addresses come per draw through push data, so the SPIR-V does not depend
+/// on the session and can be cached.
+struct MotionVectors {
+    static constexpr u32 CurrentLocation = 30;  ///< varying: current clip position
+    static constexpr u32 PreviousLocation = 31; ///< varying: previous clip position, z = valid
+    static constexpr u32 Output = 7;            ///< color attachment index
+    static inline bool enabled = false;         ///< set at startup when the buffers exist
+};
+
 struct HwLocalRuntimeInfo {
     u32 ls_stride;
 
@@ -95,6 +107,7 @@ struct HwVertexRuntimeInfo {
     std::array<OutputMap, 3> outputs;
     bool emulate_depth_negative_one_to_one{};
     bool clip_disable{};
+    bool motion_vectors{}; ///< MotionVectors: store/load clip positions (fills padding)
     u32 user_clip_plane_mask{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;
@@ -210,6 +223,7 @@ struct HwFragmentRuntimeInfo {
     bool front_face_all_bits{false};
     bool dual_source_blending{false};
     bool clip_distance_emulation{false};
+    bool motion_vectors{false}; ///< MotionVectors: write the motion attachment
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -219,6 +233,7 @@ struct HwFragmentRuntimeInfo {
                front_face_all_bits == other.front_face_all_bits &&
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
+               motion_vectors == other.motion_vectors &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }
