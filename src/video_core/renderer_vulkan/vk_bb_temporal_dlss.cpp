@@ -89,6 +89,31 @@ void BbTemporalDlssReportProblem(std::string_view problem) {
 }
 
 namespace {
+// Inverse of an affine 3x4 row-major transform, in double precision.
+std::array<double, 12> InverseAffine(const std::array<double, 12>& m) {
+    const double a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9],
+                 i = m[10];
+    const double c0 = e * i - f * h, c1 = f * g - d * i, c2 = d * h - e * g;
+    const double det = a * c0 + b * c1 + c * c2;
+    if (det == 0.0 || !std::isfinite(det))
+        return m;
+    const double r = 1.0 / det;
+    std::array<double, 12> inv{};
+    inv[0] = c0 * r;
+    inv[1] = (c * h - b * i) * r;
+    inv[2] = (b * f - c * e) * r;
+    inv[4] = c1 * r;
+    inv[5] = (a * i - c * g) * r;
+    inv[6] = (c * d - a * f) * r;
+    inv[8] = c2 * r;
+    inv[9] = (b * g - a * h) * r;
+    inv[10] = (a * e - b * d) * r;
+    for (int row = 0; row < 3; ++row)
+        inv[row * 4 + 3] =
+            -(inv[row * 4 + 0] * m[3] + inv[row * 4 + 1] * m[7] + inv[row * 4 + 2] * m[11]);
+    return inv;
+}
+
 constexpr u64 DepthProducer = 0xd3c8bb21;  // samples R32 scene depth at slot 0
 constexpr u64 DisplayCopy = 0x38d65b32;    // UI target -> VideoOut, LUT at slot 1
 constexpr u64 OpaqueVelocity = 0x34bc187c; // packing scale at binding 0
@@ -302,6 +327,7 @@ struct Tune {
     bool fsr4_linear = true; // FSR 4 gets linear-light colour instead of sRGB-encoded
     bool camera_snap = true;
     bool scene_camera = true;
+    bool camera_majority = true; // the camera most scene draws use (see ObserveSceneConstants)
     float sharpness = 0.6f;
     bool swap = false;
     bool depth_inverted = false;
@@ -345,6 +371,12 @@ struct BbTemporalDlss::Impl {
         u64 uid;
     };
     std::optional<Tracked> scene_depth, r32_depth;
+    // Some areas (the Altar of Despair) switch the game's motion blur off, and with it the depth
+    // producer pass. The scene depth is then taken from another pass that samples the memory
+    // the producer last sampled; motion then comes from the scene camera alone.
+    VAddr producer_depth_address{};
+    bool depth_fallback{};        // this frame's scene depth came from another pass
+    bool depth_fallback_logged{}; // the switch to and from the fallback is logged once each
     struct Bound {
         VideoCore::ImageId id;
         VideoCore::ImageViewInfo view;
@@ -381,6 +413,15 @@ struct BbTemporalDlss::Impl {
         bool valid{};
     } camera, previous_camera;
     bool frame_has_camera{}, camera_this_frame{};
+    // Where two map sections are on screen (outside Oedon Chapel), the game sets up the camera
+    // once per section, each in that section's coordinates, and the first one of a frame isn't
+    // the one most draws use: its motion was off by several pixels (FSR smeared, DLSS lost
+    // detail). Each distinct camera of the frame is counted and the most used one is taken.
+    struct FrameCamera {
+        Camera camera;
+        u32 uses{};
+    };
+    std::vector<FrameCamera> frame_cameras;
     u64 scene_camera_frames{};
     std::unique_ptr<OwnedImage> snapshot, motion, upscaled;
     std::unique_ptr<OwnedImage> linear_color; // FSR 4 input
@@ -462,6 +503,8 @@ struct BbTemporalDlss::Impl {
                 next.sharpness = std::clamp(float(std::atof(value.c_str())), 0.f, 1.f);
             else if (key == "scene_camera")
                 next.scene_camera = number != 0;
+            else if (key == "camera_majority")
+                next.camera_majority = number != 0;
             else if (key == "camera_snap")
                 next.camera_snap = number != 0;
             else if (key == "debug_motion")
@@ -573,6 +616,7 @@ struct BbTemporalDlss::Impl {
         jittered_draws = jittered_before_copy = 0;
         producer_constants = producer_depths = velocity_draw_constants = 0;
         r32_depth.reset();
+        depth_fallback = false;
         mirror.ConsumeFrame(scheduler.CommandBuffer()); // start a fresh mirror every frame
         ++frame;
         AdvanceJitter();
@@ -786,7 +830,7 @@ struct BbTemporalDlss::Impl {
         };
         Mat view_to_prev_view{};
         const auto& a = previous_camera.view;
-        const auto& b = camera.inv_view;
+        const auto b = InverseAffine(camera.view); // see RunDlss: the game's is float32
         for (int r = 0; r < 3; ++r)
             for (int col = 0; col < 4; ++col) {
                 double value = a[r * 4 + 0] * b[0 * 4 + col] + a[r * 4 + 1] * b[1 * 4 + col] +
@@ -1036,8 +1080,21 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         depth->backing->image.image_ci.format != vk::Format::eR32Sfloat ||
         depth->backing->image.image_ci.samples != vk::SampleCountFlagBits::e1)
         return reject("scene depth not observed");
-    if (!camera_constants || !coefficients)
+    // Without the depth producer, motion comes from the scene camera alone (its constants
+    // feed only the motion-blur matrix the scene camera replaces).
+    const bool camera_only =
+        tune.scene_camera && frame_has_camera && camera.valid && previous_camera.valid;
+    if (!camera_constants && !camera_only)
         return reject("camera constants not observed");
+    if (!coefficients)
+        coefficients = std::make_unique<VideoCore::Buffer>(instance, 0, CoefficientBytes,
+                                                           VideoCore::MemoryType::DeviceLocal);
+    if (depth_fallback != depth_fallback_logged) {
+        depth_fallback_logged = depth_fallback;
+        LOG_INFO(Render_Vulkan, "[DLSS-TEMPORAL] {}",
+                 depth_fallback ? "Game motion blur off here: scene depth from another pass"
+                                : "Game motion blur back: depth from the motion blur pass");
+    }
 
     scheduler.EndRendering();
     EnsurePipelines(instance);
@@ -1248,12 +1305,25 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
             float jitter[2];
             u32 use_mirror, flags;
         } push{};
-        const bool scene_camera =
-            tune.scene_camera && frame_has_camera && camera.valid && previous_camera.valid;
+        if (tune.camera_majority && frame_has_camera && frame_cameras.size() > 1) {
+            const auto most = std::ranges::max_element(frame_cameras, {}, &FrameCamera::uses);
+            camera = most->camera;
+        }
+        // Crossing into another map section moves the coordinates by ~200 units in one frame:
+        // that frame takes the game's matrix instead.
+        const bool section_switch =
+            std::abs(camera.inv_view[3] - previous_camera.inv_view[3]) +
+                std::abs(camera.inv_view[7] - previous_camera.inv_view[7]) +
+                std::abs(camera.inv_view[11] - previous_camera.inv_view[11]) >
+            20.0;
+        const bool scene_camera = tune.scene_camera && frame_has_camera && camera.valid &&
+                                  previous_camera.valid && !section_switch;
         if (scene_camera) {
-            // previous view * current inverse view, both affine 3x4, in double precision.
+            // previous view * current inverse view, both affine 3x4, in double precision. The
+            // inverse is built here from the view: the game's own is float32 and off by a
+            // fraction of a pixel far from the map origin (the world shook after stopping).
             const auto& a = previous_camera.view;
-            const auto& b = camera.inv_view;
+            const auto b = InverseAffine(camera.view);
             for (int r = 0; r < 3; ++r)
                 for (int col = 0; col < 4; ++col) {
                     double value = a[r * 4 + 0] * b[0 * 4 + col] + a[r * 4 + 1] * b[1 * 4 + col] +
@@ -1628,9 +1698,16 @@ void BbTemporalDlss::ObserveTexture(const VideoCore::Image& image, VideoCore::Im
     if (!impl->requested || impl->failed || impl->stopped)
         return;
     if (hash == DepthProducer && slot == 0 && image.info.pixel_format == vk::Format::eR32Sfloat &&
-        ++impl->producer_depths)
+        ++impl->producer_depths) {
         impl->r32_depth = Impl::Tracked{id, image.image_uid};
-    else if (hash == DisplayCopy && slot == 0)
+        impl->producer_depth_address = image.info.guest_address;
+        impl->depth_fallback = false;
+    } else if (!impl->r32_depth && image.info.pixel_format == vk::Format::eR32Sfloat &&
+               image.info.guest_address != 0 &&
+               image.info.guest_address == impl->producer_depth_address) {
+        impl->r32_depth = Impl::Tracked{id, image.image_uid};
+        impl->depth_fallback = true;
+    } else if (hash == DisplayCopy && slot == 0)
         impl->copy_source = Impl::Bound{id, view};
     else if (hash == DisplayCopy && slot == 1)
         impl->copy_lut = Impl::Bound{id, view};
@@ -1642,21 +1719,33 @@ void BbTemporalDlss::ObserveTexture(const VideoCore::Image& image, VideoCore::Im
 
 void BbTemporalDlss::ObserveSceneConstants(const void* data, u64 size) {
     auto& s = *impl;
-    if (!s.requested || s.failed || s.stopped || s.frame_has_camera || !data ||
-        size < 192 * sizeof(float))
+    if (!s.requested || s.failed || s.stopped || !data || size < 192 * sizeof(float))
         return;
     const auto* f = static_cast<const float*>(data);
     if (f[0] != 3000.0f || std::abs(f[1] * f[0] - 1.0f) > 1e-3f || f[4] < 64.0f || f[5] < 64.0f)
         return;
-    // The first scene constants after an evaluation belong to the main camera of the next frame.
-    s.previous_camera = s.camera;
+    Impl::Camera seen;
     for (int i = 0; i < 12; ++i) {
-        s.camera.view[i] = f[8 + i];
-        s.camera.inv_view[i] = f[180 + i];
+        seen.view[i] = f[8 + i];
+        seen.inv_view[i] = f[180 + i];
     }
-    s.camera.proj = {f[52], f[57], f[62], f[63]};
-    s.camera.valid = f[52] != 0.0f && f[57] != 0.0f && std::isfinite(f[62]) && std::isfinite(f[63]);
-    s.frame_has_camera = true;
+    seen.proj = {f[52], f[57], f[62], f[63]};
+    seen.valid = f[52] != 0.0f && f[57] != 0.0f && std::isfinite(f[62]) && std::isfinite(f[63]);
+    if (!s.frame_has_camera) {
+        // The first scene constants after an evaluation belong to the main camera of the next
+        // frame.
+        s.previous_camera = s.camera;
+        s.camera = seen;
+        s.frame_has_camera = true;
+        s.frame_cameras.clear();
+    }
+    auto it = std::ranges::find_if(s.frame_cameras, [&](const Impl::FrameCamera& known) {
+        return known.camera.view == seen.view && known.camera.proj == seen.proj;
+    });
+    if (it != s.frame_cameras.end())
+        ++it->uses;
+    else if (s.frame_cameras.size() < 8)
+        s.frame_cameras.push_back({seen, 1});
 }
 
 void BbTemporalDlss::ObserveConstants(Runtime& runtime, const Instance& instance,
