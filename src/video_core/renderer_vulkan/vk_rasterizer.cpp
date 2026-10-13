@@ -327,6 +327,8 @@ void Rasterizer::TemporalDlssDraw(const GraphicsPipeline* pipeline, bool indirec
         .num_indices = regs.num_indices,
         .num_instances = regs.num_instances.NumInstances(),
         .indirect = indirect,
+        .depth_test = regs.depth_control.depth_enable != 0,
+        .depth_write = regs.depth_control.depth_write_enable != 0,
     };
     draw_jitter =
         temporal_dlss.OnDraw(instance, runtime, scheduler, texture_cache, velocity_mirror, info);

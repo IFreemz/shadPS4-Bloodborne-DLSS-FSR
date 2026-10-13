@@ -316,6 +316,9 @@ output=
 struct Tune {
     bool enabled = true;
     bool jitter = true;
+    // Test: also jitter single quads drawn with the scene depth that test and write it
+    // (billboards, cards, sprites); full-screen passes do neither.
+    bool jitter_small = false;
     float sign_x = 1.f, sign_y = 1.f;
     bool mirror = true;
     bool hud = true;
@@ -362,6 +365,10 @@ struct BbTemporalDlss::Impl {
     u32 jittered_before_copy{};
     bool camera_constants{}, velocity_constants{};
     u32 jittered_draws{};
+    // Scene-depth draws of one quad (4-6 indices) this frame: left unjittered, and those of them
+    // that test and write depth (jittered with jitter_small).
+    u32 small_draws{}, small_depth_draws{};
+    u64 small_report_frame{};
     u64 frame{};
     std::array<float, 2> jitter{};
     std::chrono::steady_clock::time_point last_frame{};
@@ -485,6 +492,8 @@ struct BbTemporalDlss::Impl {
                 next.enabled = number != 0;
             else if (key == "jitter")
                 next.jitter = number != 0;
+            else if (key == "jitter_small")
+                next.jitter_small = number != 0;
             else if (key == "jitter_sign_x") // multiplier sent to DLSS (sign and scale)
                 next.sign_x = std::clamp(float(std::atof(value.c_str())), -4.f, 4.f);
             else if (key == "jitter_sign_y")
@@ -612,6 +621,15 @@ struct BbTemporalDlss::Impl {
 
     // After each evaluation attempt: per-frame guide inputs restart and the jitter advances.
     void FrameBoundary(Scheduler& scheduler, BbVelocityMirror& mirror) {
+        if (frame - small_report_frame >= 600) {
+            small_report_frame = frame;
+            LOG_INFO(Render_Vulkan,
+                     "[DLSS-TEMPORAL] Jitter: {} draws jittered this frame; {} single-quad scene "
+                     "draws not jittered by the usual rule, {} of them testing and writing "
+                     "depth (jitter_small={})",
+                     jittered_draws, small_draws, small_depth_draws, tune.jitter_small);
+        }
+        small_draws = small_depth_draws = 0;
         camera_constants = velocity_constants = depth_learned = false;
         jittered_draws = jittered_before_copy = 0;
         producer_constants = producer_depths = velocity_draw_constants = 0;
@@ -1931,10 +1949,20 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
             return {};
         if (s.tune.enabled && s.tune.jitter && !s.menu && s.scene_depth &&
             draw.depth == s.scene_depth->id &&
-            cache.GetImage(draw.depth).image_uid == s.scene_depth->uid &&
-            (draw.indirect || draw.num_indices > 6 || draw.num_instances > 1)) {
-            ++s.jittered_draws;
-            return s.jitter;
+            cache.GetImage(draw.depth).image_uid == s.scene_depth->uid) {
+            const bool small = !draw.indirect && draw.num_indices <= 6 && draw.num_instances <= 1;
+            if (!small) {
+                ++s.jittered_draws;
+                return s.jitter;
+            }
+            ++s.small_draws;
+            if (draw.depth_test && draw.depth_write) {
+                ++s.small_depth_draws;
+                if (s.tune.jitter_small) {
+                    ++s.jittered_draws;
+                    return s.jitter;
+                }
+            }
         }
         return {};
     } catch (const std::exception& e) {
