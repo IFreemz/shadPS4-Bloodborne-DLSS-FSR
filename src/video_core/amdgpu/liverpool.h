@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <coroutine>
+#include <deque>
 #include <exception>
 #include <mutex>
 #include <semaphore>
@@ -29,6 +32,39 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
+
+struct PM4CmdWaitRegMem;
+
+/// Threaded renderer: which 32-word blocks of the register file were written since the draw
+/// recording thread's copy was last updated (see vk_draw_pipe.h).
+struct RegDirty {
+    static constexpr u32 BlockWords = 32;
+    static constexpr u32 NumBlocks = Regs::NumRegs / BlockWords;
+    static_assert(Regs::NumRegs % BlockWords == 0);
+
+    std::array<u64, (NumBlocks + 63) / 64> bits{};
+    /// The whole file was reset to its defaults (ClearState) before the marked writes.
+    bool reset{};
+
+    void Mark(u32 word, u32 count) noexcept {
+        if (count == 0) {
+            return;
+        }
+        const u32 first = word / BlockWords;
+        const u32 last = std::min((word + count - 1) / BlockWords, NumBlocks - 1);
+        for (u32 block = first; block <= last; ++block) {
+            bits[block / 64] |= 1ULL << (block % 64);
+        }
+    }
+    void Reset() noexcept {
+        bits = {};
+        reset = true;
+    }
+    void Clear() noexcept {
+        bits = {};
+        reset = false;
+    }
+};
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -62,6 +98,20 @@ struct Liverpool {
     Regs regs{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    RegDirty pipe_dirty{};
+
+    /// Marks a register field written outside the Set*Reg packets.
+    template <typename T>
+    void MarkRegWritten(const T& field) noexcept {
+        const auto word =
+            static_cast<u32>(reinterpret_cast<const u32*>(&field) - regs.reg_array.data());
+        pipe_dirty.Mark(word, static_cast<u32>((sizeof(T) + 3) / 4));
+    }
+
+    /// The submission queue the GPU command thread is processing (graphics or compute).
+    [[nodiscard]] s32 CurrentQueue() const noexcept {
+        return curr_qid;
+    }
 
 public:
     explicit Liverpool();
@@ -80,11 +130,13 @@ public:
 
     void WaitGpuIdle() noexcept {
         std::unique_lock lk{submit_mutex};
-        submit_cv.wait(lk, [this] { return num_submits == 0; });
+        submit_cv.wait(lk, [this] { return num_submits == 0 && work_retired; });
     }
 
+    /// Also the draw recorder has finished (work_retired): sceGnmSubmitDone does not block the
+    /// guest when this is true.
     bool IsGpuIdle() const {
-        return num_submits == 0;
+        return num_submits == 0 && work_retired;
     }
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
@@ -206,6 +258,18 @@ private:
     u32 num_mapped_queues{1u}; // GFX is always available
 
     VAddr indirect_args_addr{};
+
+    /// Threaded renderer: memory writes (fence labels, WriteData) handed to the draw recording
+    /// thread and not yet run. A WaitRegMem that one of them satisfies counts as met: that
+    /// thread runs everything in stream order anyway (after bbport).
+    struct PendingFence {
+        u64 packet;
+        VAddr address;
+        u32 value;
+    };
+    std::deque<PendingFence> pending_fences;
+    void NotePendingFence(u64 packet, VAddr address, u32 value);
+    bool MetByPendingFence(const PM4CmdWaitRegMem& wait);
     u32 num_counter_pairs{};
     u64 pixel_counter{};
 
@@ -232,6 +296,9 @@ private:
     const bool guest_markers_enabled;
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
+    /// Every decoded submission's queued draws and fences are done (set after the drain that
+    /// precedes GPU idle, cleared by a new submission). Under submit_mutex with num_submits.
+    std::atomic<bool> work_retired{true};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;

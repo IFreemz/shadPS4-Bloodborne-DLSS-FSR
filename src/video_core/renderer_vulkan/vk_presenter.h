@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <deque>
+
 #include <condition_variable>
 
 #include "core/libraries/videoout/buffer.h"
@@ -144,6 +146,7 @@ private:
     Swapchain swapchain;
     Runtime runtime;
     std::unique_ptr<Rasterizer> rasterizer;
+    std::deque<u64> recent_frame_ticks; ///< threaded renderer: frames the GPU may run behind
     VideoCore::TextureCache& texture_cache;
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;

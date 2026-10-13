@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
+#include "common/guest_stats.h"
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
@@ -428,16 +430,23 @@ struct SignalImpl : public PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
+        const auto start = std::chrono::steady_clock::now();
         impl.Protect(address, size, perms);
+        Common::GuestStats::protect_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 start)
+                .count(),
+            std::memory_order_relaxed);
+        Common::GuestStats::protect_calls.fetch_add(1, std::memory_order_relaxed);
+        Common::GuestStats::protect_pages.fetch_add(size >> 12, std::memory_order_relaxed);
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
-        const auto is_gpu_thread =
-            std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
+        const auto is_gpu_thread = rasterizer->IsGpuSideThread();
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            return rasterizer->OnWriteFault(addr, size, is_gpu_thread);
         } else {
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }

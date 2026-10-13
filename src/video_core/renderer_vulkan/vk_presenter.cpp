@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <SDL3/SDL_video.h>
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -50,6 +51,7 @@
 #include <imgui.h>
 #include <stb_image_write.h>
 #include <vk_mem_alloc.h>
+#include "common/frame_pacing.h"
 
 namespace Vulkan {
 
@@ -1106,6 +1108,27 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+
+    // Threaded renderer (after bbport's BB_FRAMES_AHEAD): the GPU command thread runs at most
+    // N guest frames ahead of the GPU (default 1 as in bbport; SHADPS4_BB_FRAMES_AHEAD, 0 =
+    // unbounded). Every GPU readback (the guest writing memory a shader wrote, about once a
+    // second in Bloodborne) waits for all queued GPU work: ~40 ms unbounded, ~25 ms with 2 (a
+    // visible stutter), about a frame with 1, which costs 2-3 FPS (bbport measured 2.5%).
+    static const u32 frames_ahead = [] {
+        const char* env = std::getenv("SHADPS4_BB_FRAMES_AHEAD");
+        return env ? static_cast<u32>(std::max(0, std::atoi(env))) : 1u;
+    }();
+    if (frames_ahead != 0 && rasterizer->ThreadedRendererActive()) {
+        recent_frame_ticks.push_back(frame->ready_tick);
+        if (recent_frame_ticks.size() > frames_ahead) {
+            const u64 tick = recent_frame_ticks.front();
+            recent_frame_ticks.pop_front();
+            draw_scheduler.Wait(tick);
+        }
+    } else {
+        recent_frame_ticks.clear();
+    }
+    rasterizer->OnGameFrame();
     return frame;
 }
 
@@ -1474,6 +1497,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             FrameGen::TimingScope timing{"queue_present"};
             presented = swapchain.Present();
             FrameGen::ReplayPresentStall(true);
+        }
+        if (is_game_frame && !is_reusing_frame) {
+            Common::FramePacing::Record(Common::FramePacing::Event::Present);
         }
         {
             FrameGen::TimingScope timing{"end_present"};

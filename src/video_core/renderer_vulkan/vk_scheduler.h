@@ -3,12 +3,22 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <condition_variable>
+#include <deque>
+#include <memory>
 #include <mutex>
+#include <new>
+#include <source_location>
+#include <string>
 #include <thread>
+#include <type_traits>
+#include <unordered_map>
 #include <queue>
 
 #include "common/interval_set.h"
+#include "common/polyfill_thread.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -345,6 +355,86 @@ struct DynamicState {
             dirty_state.feedback_loop_enabled = true;
         }
     }
+
+    /// Clears the dirty flags exactly as Commit() would, without recording: the commands are
+    /// recorded later from a copy taken before (threaded recording).
+    void MarkCommitted(const Instance& instance);
+};
+
+/// Threaded command recording (after bbport): Vulkan commands passed to Scheduler::Record()
+/// are stored as small closures in chunks and recorded into the command buffer by a worker
+/// thread, in order. The thread that issues them only decides what to record.
+class CommandRecorder {
+public:
+    CommandRecorder();
+    ~CommandRecorder();
+
+    CommandRecorder(const CommandRecorder&) = delete;
+    CommandRecorder& operator=(const CommandRecorder&) = delete;
+
+    template <typename Func>
+    void Push(Func&& func) {
+        using T = std::decay_t<Func>;
+        static_assert(alignof(T) <= EntryAlign, "recorded command is over-aligned");
+        constexpr u32 size =
+            static_cast<u32>((sizeof(Entry) + sizeof(T) + EntryAlign - 1) & ~(EntryAlign - 1));
+        static_assert(size <= ChunkCapacity, "recorded command is too large");
+        if (!current || current->used + size > ChunkCapacity) {
+            Kick(true);
+            current = AcquireChunk();
+        }
+        u8* at = current->data + current->used;
+        auto* entry = new (at) Entry{&RunEntry<T>, size};
+        new (entry + 1) T(std::forward<Func>(func));
+        current->used += size;
+    }
+
+    /// Hands the current chunk to the recording thread (when it holds enough, or `force`).
+    void Kick(bool force);
+    /// Waits until every pushed command is in the command buffer.
+    void Sync();
+    /// Nanoseconds the recording thread spent recording (statistics).
+    std::atomic<s64> busy_ns{0};
+    /// The command buffer the thread records into; only changed while synced.
+    void SetCommandBuffer(vk::CommandBuffer cmdbuf_) {
+        cmdbuf = cmdbuf_;
+    }
+
+private:
+    static constexpr size_t EntryAlign = 16;
+    static constexpr size_t ChunkCapacity = 64 * 1024;
+    static constexpr size_t KickBytes = 8 * 1024;
+    static constexpr u64 RingSize = 64;
+
+    struct alignas(EntryAlign) Entry {
+        void (*run)(void* payload, vk::CommandBuffer cmdbuf);
+        u32 size;
+    };
+    struct Chunk {
+        size_t used = 0;
+        alignas(EntryAlign) u8 data[ChunkCapacity];
+    };
+
+    template <typename T>
+    static void RunEntry(void* payload, vk::CommandBuffer cmdbuf) {
+        auto* func = static_cast<T*>(payload);
+        (*func)(cmdbuf);
+        func->~T();
+    }
+
+    Chunk* AcquireChunk();
+    void Run(std::stop_token stop);
+
+    vk::CommandBuffer cmdbuf{};
+    Chunk* current{};
+    std::vector<std::unique_ptr<Chunk>> chunks;
+    std::mutex free_mutex;
+    std::vector<Chunk*> free_chunks;
+    std::array<Chunk*, RingSize> ring{};
+    alignas(64) std::atomic<u64> head{0}; ///< chunks handed over (producer)
+    alignas(64) std::atomic<u64> tail{0}; ///< chunks recorded (recording thread)
+    std::atomic<bool> sleeping{false};
+    std::jthread thread;
 };
 
 using SessionFunc = Common::UniqueFunction<void>;
@@ -364,16 +454,17 @@ public:
     void Flush();
 
     /// Sends the current execution context to the GPU and waits for it to complete.
-    void Finish();
+    void Finish(std::source_location where = std::source_location::current());
 
     /// Waits for the given tick to trigger on the GPU.
-    void Wait(u64 tick);
+    void Wait(u64 tick, std::source_location where = std::source_location::current());
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
+    static void RecordBeginRendering(vk::CommandBuffer cmdbuf, const RenderState& state);
 
     /// Ends current rendering scope.
     void EndRendering();
@@ -399,14 +490,85 @@ public:
         return render_state;
     }
 
+    /// Whether a render pass with exactly this state is open.
+    [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
+        return is_rendering && render_state == state;
+    }
+
     /// Returns the current pipeline dynamic state tracking.
     DynamicState& GetDynamicState() {
         return dynamic_state;
     }
 
-    /// Returns the current command buffer.
-    vk::CommandBuffer CommandBuffer() const {
+    /// Returns the current command buffer for recording on the calling thread. With threaded
+    /// recording this first waits until every command passed to Record() is recorded, then
+    /// records directly (Record() included) until the next KickRecording() or submission.
+    vk::CommandBuffer CommandBuffer(
+        std::source_location where = std::source_location::current()) const {
+        if (recorder && !direct_mode) {
+            NoteSync(where);
+            recorder->Sync();
+            direct_mode = true;
+        }
         return sessions.back().primary;
+    }
+
+    /// Statistics: where recording had to wait for the recording thread (per call site), and
+    /// how many commands went through Record() deferred or direct. Resets the counters.
+    std::string TakeRecordingStats();
+
+    /// Records `func(vk::CommandBuffer)` in order with the other commands. The closure must
+    /// own everything it uses (capture by value): it may run later on the recording thread.
+    template <typename Func>
+    void Record(Func&& func) {
+        if (capture) {
+            // Captured for a later replay (velocity mirror batches), not recorded now.
+            capture->emplace_back(std::decay_t<Func>(std::forward<Func>(func)));
+            return;
+        }
+        if (!recorder || direct_mode) {
+            if (recorder) {
+                direct_records.fetch_add(1, std::memory_order_relaxed);
+            }
+            func(sessions.back().primary);
+            return;
+        }
+        deferred_records.fetch_add(1, std::memory_order_relaxed);
+        recorder->Push(std::forward<Func>(func));
+    }
+
+    /// While set, Record() appends to `out` instead of recording (see BbVelocityMirror).
+    void BeginCapture(std::vector<Common::UniqueFunction<void, vk::CommandBuffer>>* out) {
+        capture = out;
+    }
+    void EndCapture() {
+        capture = nullptr;
+    }
+
+    /// Runs after a render pass ends (EndRendering), not recursively: the velocity mirror
+    /// records its deferred draws there.
+    void SetPassEndHook(Common::UniqueFunction<void> hook) {
+        pass_end_hook = std::move(hook);
+    }
+
+    /// Starts threaded recording on this scheduler (Bloodborne threaded renderer).
+    void EnableThreadedRecording();
+
+    /// GPU time measurement (threaded renderer): each submission's execution time and the GPU
+    /// idle time between submissions, from timestamps. Returns {busy ns, idle ns, submissions}
+    /// since the last call.
+    std::array<u64, 3> TakeGpuTiming();
+    /// Timestamps for TakeGpuTiming only while diagnostics are on.
+    void SetGpuTiming(bool enabled) {
+        gpu_timing = enabled;
+    }
+
+    /// Lets Record() defer again; call where nobody holds a CommandBuffer().
+    void KickRecording() {
+        if (recorder) {
+            recorder->Kick(false);
+            direct_mode = false;
+        }
     }
 
     /// Returns the current command buffer tick.
@@ -481,6 +643,33 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+    std::unique_ptr<CommandRecorder> recorder;
+    std::vector<Common::UniqueFunction<void, vk::CommandBuffer>>* capture{};
+    Common::UniqueFunction<void> pass_end_hook;
+    bool in_pass_end_hook = false;
+    // GPU timing (see TakeGpuTiming): a timestamp pair per submission.
+    static constexpr u32 TimerPairs = 512;
+    vk::UniqueQueryPool timer_pool;
+    double timer_period_ns = 1.0;
+    u32 timer_slot = 0;
+    bool timer_open = false;
+    bool gpu_timing = false;
+    struct PendingTiming {
+        u64 tick;
+        u32 slot;
+    };
+    std::deque<PendingTiming> pending_timings;
+    u64 timer_last_end = 0;
+    std::atomic<u64> gpu_busy_ns{0};
+    std::atomic<u64> gpu_idle_ns{0};
+    std::atomic<u64> gpu_submits{0};
+    void CollectGpuTiming();
+    mutable bool direct_mode = true;
+    void NoteSync(const std::source_location& where) const;
+    mutable std::mutex sync_stats_mutex;
+    mutable std::unordered_map<u64, std::pair<std::string, u64>> sync_sites;
+    mutable std::atomic<u64> deferred_records{0};
+    mutable std::atomic<u64> direct_records{0};
 };
 
 } // namespace Vulkan

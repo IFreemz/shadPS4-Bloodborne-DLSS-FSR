@@ -3,6 +3,7 @@
 
 #include <ranges>
 
+#include "common/guest_stats.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -343,6 +344,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        Common::GuestStats::pipelines_compiled.fetch_add(1, std::memory_order_relaxed);
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
@@ -372,6 +374,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        Common::GuestStats::pipelines_compiled.fetch_add(1, std::memory_order_relaxed);
 
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,

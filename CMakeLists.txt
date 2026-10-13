@@ -833,6 +833,11 @@ set(COMMON src/common/logging/classes.cpp
            src/common/string_util.h
            src/common/thread.cpp
            src/common/thread.h
+           src/common/guest_stats.h
+           src/common/bb_tuning.h
+           src/common/frame_pacing.h
+           src/common/copy_pool.cpp
+           src/common/copy_pool.h
            src/common/types.h
            src/common/uint128.h
            src/common/unique_function.h
@@ -1162,6 +1167,9 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_presenter.cpp
                src/video_core/renderer_vulkan/vk_presenter.h
                src/video_core/renderer_vulkan/vk_rasterizer.cpp
+               src/video_core/renderer_vulkan/vk_draw_pipe.h
+               src/video_core/renderer_vulkan/vk_gpu_profiler.cpp
+               src/video_core/renderer_vulkan/vk_gpu_profiler.h
                src/video_core/renderer_vulkan/vk_rasterizer.h
                src/video_core/renderer_vulkan/vk_resource_pool.cpp
                src/video_core/renderer_vulkan/vk_resource_pool.h
@@ -1340,6 +1348,10 @@ if (BB_STREAMLINE_DIR AND WIN32)
     target_compile_definitions(shadps4 PRIVATE SHADPS4_BB_FRAME_GEN)
     target_include_directories(shadps4 PRIVATE "${BB_STREAMLINE_DIR}/include")
     target_link_libraries(shadps4 PRIVATE wintrust crypt32 dxgi)
+endif()
+if (WIN32)
+    # Guest mutexes wait with WaitOnAddress (src/core/libraries/kernel/sync/mutex.cpp).
+    target_link_libraries(shadps4 PRIVATE synchronization)
 endif()
 target_include_directories(shadps4 PRIVATE "${SHADNET_PROTO_OUT}")
 

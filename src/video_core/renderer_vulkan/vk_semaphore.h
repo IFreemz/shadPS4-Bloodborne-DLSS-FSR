@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <source_location>
 #include <thread>
 #include <queue>
 #include "common/types.h"
@@ -44,7 +45,7 @@ public:
     void Refresh();
 
     /// Waits for a tick to be hit on the GPU
-    void Wait(u64 tick);
+    void Wait(u64 tick, std::source_location where = std::source_location::current());
 
 protected:
     const Instance& instance;

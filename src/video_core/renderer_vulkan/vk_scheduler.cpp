@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -36,7 +38,12 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     EndRendering();
     is_rendering = true;
     render_state = new_state;
+    Record([render_state = render_state](vk::CommandBuffer cmdbuf) {
+        RecordBeginRendering(cmdbuf, render_state);
+    });
+}
 
+void Scheduler::RecordBeginRendering(vk::CommandBuffer cmdbuf, const RenderState& render_state) {
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
         const auto& cb = render_state.color_attachments[i];
@@ -81,7 +88,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    CommandBuffer().beginRendering(rendering_info);
+    cmdbuf.beginRendering(rendering_info);
 }
 
 void Scheduler::EndRendering() {
@@ -89,10 +96,185 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    CommandBuffer().endRendering();
+    Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+    if (pass_end_hook && !in_pass_end_hook) {
+        in_pass_end_hook = true;
+        pass_end_hook();
+        in_pass_end_hook = false;
+    }
+}
+
+void Scheduler::NoteSync(const std::source_location& where) const {
+    const u64 key = (u64(where.line()) << 32) ^ std::hash<std::string_view>{}(where.file_name());
+    std::scoped_lock lk{sync_stats_mutex};
+    auto [it, is_new] = sync_sites.try_emplace(key);
+    if (is_new) {
+        std::string_view file{where.file_name()};
+        if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+            file = file.substr(slash + 1);
+        }
+        it->second.first = fmt::format("{}:{}", file, where.line());
+    }
+    ++it->second.second;
+}
+
+std::string Scheduler::TakeRecordingStats() {
+    std::vector<std::pair<std::string, u64>> sites;
+    {
+        std::scoped_lock lk{sync_stats_mutex};
+        for (auto& [key, site] : sync_sites) {
+            sites.push_back(site);
+        }
+        sync_sites.clear();
+    }
+    std::ranges::sort(sites, [](const auto& a, const auto& b) { return a.second > b.second; });
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const double seconds = std::chrono::duration<double>(now - last).count();
+    last = now;
+    const s64 busy = recorder ? recorder->busy_ns.exchange(0, std::memory_order_relaxed) : 0;
+    std::string out =
+        fmt::format("recording thread busy {:.1f}%; ", seconds > 0 ? busy / seconds / 1e7 : 0.0);
+    out += fmt::format("{} deferred, {} direct;",
+                       deferred_records.exchange(0, std::memory_order_relaxed),
+                       direct_records.exchange(0, std::memory_order_relaxed));
+    for (size_t i = 0; i < std::min<size_t>(sites.size(), 6); ++i) {
+        out += fmt::format(" {} x{}", sites[i].first, sites[i].second);
+    }
+    return out;
+}
+
+void Scheduler::EnableThreadedRecording() {
+    {
+        const auto props = instance.GetPhysicalDevice().getProperties();
+        if (props.limits.timestampComputeAndGraphics) {
+            timer_period_ns = props.limits.timestampPeriod;
+            auto [result, pool] =
+                instance.GetDevice().createQueryPoolUnique(vk::QueryPoolCreateInfo{
+                    .queryType = vk::QueryType::eTimestamp,
+                    .queryCount = TimerPairs * 2,
+                });
+            if (result == vk::Result::eSuccess) {
+                timer_pool = std::move(pool);
+            }
+        }
+    }
+    if (!recorder) {
+        recorder = std::make_unique<CommandRecorder>();
+        recorder->SetCommandBuffer(sessions.back().primary);
+        direct_mode = true;
+    }
+}
+
+CommandRecorder::CommandRecorder() {
+    thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+}
+
+CommandRecorder::~CommandRecorder() {
+    Sync();
+    // Hand over an empty slot as the exit signal. head.wait() only returns once the value
+    // changes, so the thread must be woken by a real new entry, not just a notify.
+    const u64 at = head.load(std::memory_order_relaxed);
+    ring[at % RingSize] = nullptr;
+    head.store(at + 1, std::memory_order_seq_cst);
+    head.notify_all();
+    thread.join();
+}
+
+CommandRecorder::Chunk* CommandRecorder::AcquireChunk() {
+    {
+        std::scoped_lock lk{free_mutex};
+        if (!free_chunks.empty()) {
+            Chunk* chunk = free_chunks.back();
+            free_chunks.pop_back();
+            return chunk;
+        }
+    }
+    return chunks.emplace_back(std::make_unique<Chunk>()).get();
+}
+
+void CommandRecorder::Kick(bool force) {
+    if (!current || current->used == 0 || (!force && current->used < KickBytes)) {
+        return;
+    }
+    const u64 at = head.load(std::memory_order_relaxed);
+    for (u32 spins = 0; at - tail.load(std::memory_order_acquire) >= RingSize; ++spins) {
+        if (spins < 4096) {
+            std::this_thread::yield();
+        } else {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+    ring[at % RingSize] = current;
+    current = nullptr;
+    head.store(at + 1, std::memory_order_seq_cst);
+    if (sleeping.load(std::memory_order_seq_cst)) {
+        head.notify_one();
+    }
+}
+
+void CommandRecorder::Sync() {
+    Kick(true);
+    const u64 target = head.load(std::memory_order_relaxed);
+    for (u32 spins = 0; tail.load(std::memory_order_acquire) < target; ++spins) {
+        if (spins >= 1024) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+void CommandRecorder::Run(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadPS4:GpuCmdRecorder");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    u64 at = 0;
+    while (true) {
+        u64 available = head.load(std::memory_order_acquire);
+        if (available == at) {
+            // Spin briefly (commands follow each other while a frame is recorded), then sleep.
+            const auto spin_until =
+                std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+            for (u32 spins = 1; available == at; ++spins) {
+                if (stop.stop_requested()) {
+                    return;
+                }
+                if ((spins & 255) == 0 && std::chrono::steady_clock::now() >= spin_until) {
+                    sleeping.store(true, std::memory_order_seq_cst);
+                    if (head.load(std::memory_order_seq_cst) == at && !stop.stop_requested()) {
+                        head.wait(at, std::memory_order_seq_cst);
+                    }
+                    sleeping.store(false, std::memory_order_relaxed);
+                }
+                available = head.load(std::memory_order_acquire);
+            }
+        }
+        Chunk* chunk = ring[at % RingSize];
+        if (!chunk) {
+            return; // shutdown
+        }
+        const auto start = std::chrono::steady_clock::now();
+        for (size_t offset = 0; offset < chunk->used;) {
+            auto* entry = reinterpret_cast<Entry*>(chunk->data + offset);
+            entry->run(entry + 1, cmdbuf);
+            offset += entry->size;
+        }
+        busy_ns.fetch_add((std::chrono::steady_clock::now() - start).count(),
+                          std::memory_order_relaxed);
+        chunk->used = 0;
+        {
+            std::scoped_lock lk{free_mutex};
+            free_chunks.push_back(chunk);
+        }
+        ++at;
+        tail.store(at, std::memory_order_release);
+    }
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
+    // The command pool is shared with the recording thread's command buffer.
+    if (recorder && !direct_mode) {
+        recorder->Sync();
+        direct_mode = true;
+    }
     auto& upload_cmdbuf = sessions.back().upload;
     if (upload_cmdbuf) {
         return upload_cmdbuf;
@@ -115,21 +297,21 @@ void Scheduler::Flush() {
     Flush(info);
 }
 
-void Scheduler::Finish() {
+void Scheduler::Finish(std::source_location where) {
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
-    Wait(presubmit_tick);
+    Wait(presubmit_tick, where);
 }
 
-void Scheduler::Wait(u64 tick) {
+void Scheduler::Wait(u64 tick, std::source_location where) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
         Flush(info);
     }
-    work_semaphore.Wait(tick);
+    work_semaphore.Wait(tick, where);
 }
 
 void Scheduler::PopPendingOperations() {
@@ -142,6 +324,10 @@ void Scheduler::PopPendingOperations() {
 }
 
 void Scheduler::BeginSession() {
+    if (recorder) {
+        recorder->Sync();
+        direct_mode = true;
+    }
     EndSession();
 
     auto& session = sessions.emplace_back();
@@ -151,6 +337,15 @@ void Scheduler::BeginSession() {
     };
     session.primary = command_pool.Commit();
     Check(session.primary.begin(begin_info));
+    if (timer_pool && gpu_timing && !timer_open) {
+        session.primary.resetQueryPool(*timer_pool, timer_slot * 2, 2);
+        session.primary.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *timer_pool,
+                                       timer_slot * 2);
+        timer_open = true;
+    }
+    if (recorder) {
+        recorder->SetCommandBuffer(session.primary);
+    }
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -184,6 +379,10 @@ void Scheduler::EndSession() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    if (recorder) {
+        recorder->Sync();
+        direct_mode = true;
+    }
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();
 
@@ -197,6 +396,22 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     if (on_submit) {
         on_submit(info);
+    }
+
+    if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
+        // Until the next submission's first timestamp: mostly the GPU waiting for it.
+        profiler->Mark(0x5B317ull, [] { return std::string{"(between submissions: GPU idle)"}; });
+    }
+    if (timer_pool && timer_open && !sessions.empty()) {
+        EndRendering();
+        sessions.back().primary.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe,
+                                               *timer_pool, timer_slot * 2 + 1);
+        if (pending_timings.size() >= TimerPairs - 1) {
+            pending_timings.pop_front(); // never read: its slot is about to be reused
+        }
+        pending_timings.push_back({signal_value, timer_slot});
+        timer_slot = (timer_slot + 1) % TimerPairs;
+        timer_open = false;
     }
 
     EndSession();
@@ -243,10 +458,39 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     work_semaphore.Refresh();
+    CollectGpuTiming();
     BeginSession();
 
     // Apply pending operations
     PopPendingOperations();
+}
+
+void Scheduler::CollectGpuTiming() {
+    while (!pending_timings.empty() && work_semaphore.IsFree(pending_timings.front().tick)) {
+        const auto [tick, slot] = pending_timings.front();
+        pending_timings.pop_front();
+        std::array<u64, 2> stamps{};
+        const auto result = instance.GetDevice().getQueryPoolResults(
+            *timer_pool, slot * 2, 2, sizeof(stamps), stamps.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        if (result != vk::Result::eSuccess || stamps[1] < stamps[0]) {
+            continue;
+        }
+        gpu_busy_ns.fetch_add(static_cast<u64>((stamps[1] - stamps[0]) * timer_period_ns),
+                              std::memory_order_relaxed);
+        if (timer_last_end != 0 && stamps[0] > timer_last_end) {
+            gpu_idle_ns.fetch_add(static_cast<u64>((stamps[0] - timer_last_end) * timer_period_ns),
+                                  std::memory_order_relaxed);
+        }
+        timer_last_end = stamps[1];
+        gpu_submits.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+std::array<u64, 3> Scheduler::TakeGpuTiming() {
+    return {gpu_busy_ns.exchange(0, std::memory_order_relaxed),
+            gpu_idle_ns.exchange(0, std::memory_order_relaxed),
+            gpu_submits.exchange(0, std::memory_order_relaxed)};
 }
 
 void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
@@ -272,6 +516,36 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
         }
 
         op.callback();
+    }
+}
+
+void DynamicState::MarkCommitted(const Instance& instance) {
+    auto& d = dirty_state;
+    d.viewports = d.scissors = false;
+    d.depth_test_enabled = d.depth_write_enabled = false;
+    if (depth_test_enabled) {
+        d.depth_compare_op = false;
+    }
+    d.depth_bounds_test_enabled = false;
+    if (depth_bounds_test_enabled) {
+        d.depth_bounds = false;
+    }
+    d.depth_bias_enabled = false;
+    if (depth_bias_enabled) {
+        d.depth_bias = false;
+    }
+    d.stencil_test_enabled = false;
+    if (stencil_test_enabled) {
+        d.stencil_front_ops = d.stencil_back_ops = false;
+        d.stencil_front_reference = d.stencil_back_reference = false;
+        d.stencil_front_write_mask = d.stencil_back_write_mask = false;
+        d.stencil_front_compare_mask = d.stencil_back_compare_mask = false;
+    }
+    d.primitive_restart_enable = d.rasterizer_discard_enable = false;
+    d.cull_mode = d.front_face = false;
+    d.blend_constants = d.color_write_masks = d.line_width = false;
+    if (instance.IsAttachmentFeedbackLoopLayoutSupported()) {
+        d.feedback_loop_enabled = false;
     }
 }
 

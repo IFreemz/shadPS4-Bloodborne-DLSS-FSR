@@ -139,6 +139,9 @@ public:
     ImageFlagBits flags = ImageFlagBits::Dirty;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+    /// Threaded renderer: GC tick + 1 at which UpdateImage last found this image clean, fully
+    /// tracked and touched; 0 once anything changes that. Only accessed through atomic_ref.
+    u64 clean_tick = 0;
     ImageId depth_id{};
     u64 depth_uid{};
 

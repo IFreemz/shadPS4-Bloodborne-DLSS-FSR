@@ -120,6 +120,29 @@ void DataBase::Open() {
     opened = true;
 }
 
+void DataBase::Clear() {
+    if (!opened) {
+        return;
+    }
+    std::error_code ec;
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        mz_zip_reader_end(&zip_ar);
+        std::filesystem::remove(cache_path, ec);
+        mz_zip_zero_struct(&zip_ar);
+        mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
+        ar_is_read_only = false;
+        LOG_WARNING(Render, "Pipeline cache archive cleared: it is rebuilt for this build");
+        return;
+    }
+    u64 removed = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(cache_path, ec)) {
+        if (entry.is_regular_file(ec) && std::filesystem::remove(entry.path(), ec)) {
+            ++removed;
+        }
+    }
+    LOG_WARNING(Render, "Pipeline cache cleared ({} files): it is rebuilt for this build", removed);
+}
+
 void DataBase::Close() {
     if (!IsOpened()) {
         return;

@@ -51,6 +51,10 @@ private:
                      SettingsCategory category);
 
     void AddSettingCheckbox(std::string name, bool& value);
+    /// A checkbox with a short grey hint beside it (seen without hovering, also on a pad).
+    void AddSettingCheckbox(std::string name, bool& value, const char* hint);
+    /// A section heading row: a coloured title, and a short note beside it.
+    void AddSettingSection(const char* title, const char* note, bool experimental);
     void AddSettingSliderInt(std::string name, int& value, int min, int max);
     void AddSettingSliderFloat(std::string name, float& value, int min, int max, int precision);
     void AddSettingCombo(std::string name, int& value, std::vector<std::string> options);
@@ -134,6 +138,15 @@ private:
     int windowHeightSetting;
     bool hdrAllowedSetting;
     bool fsrEnabledSetting;
+    bool threadedRendererSetting;
+    bool threadedRendererDiagnosticsSetting;
+    bool threadedRendererGpuProfileSetting;
+    bool bbObjectMotionSetting;
+    bool bbReadbackQueueSetting;
+    bool bbStreamingSetting;
+    bool bbMergedCopiesSetting;
+    bool bbFastLocksSetting;
+    bool bbFlipWhenReadySetting;
     bool rcasEnabledSetting;
     float rcasAttenuationSetting;
 

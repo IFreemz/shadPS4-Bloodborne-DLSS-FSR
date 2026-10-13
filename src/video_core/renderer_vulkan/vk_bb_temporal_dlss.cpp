@@ -30,6 +30,7 @@
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_fsr4_addon.h"
 #include "video_core/renderer_vulkan/vk_fsr_upscaler.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_hdr_mod.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -1050,6 +1051,9 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                                    VideoCore::TextureCache& cache, BbVelocityMirror& mirror,
                                    VideoCore::Image& source, bool pre_hud,
                                    std::optional<vk::Extent2D> upscale_to) {
+    if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(&scheduler)) {
+        profiler->Mark(0xD155ull, [] { return std::string{"DLSS (temporal upscale and passes)"}; });
+    }
     const bool hdr = upscale_to.has_value();
     auto* ngx = instance.GetDlssNgx();
     const vk::Extent2D in{source.info.size.width, source.info.size.height};

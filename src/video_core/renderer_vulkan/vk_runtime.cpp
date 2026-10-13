@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <boost/container/small_vector.hpp>
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -120,8 +121,12 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
         FlushBarriers();
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.copyBuffer(src->Handle(), dst->Handle(), copies);
+    // In order through the recording thread (uploads run a few thousand times a second; a
+    // direct command buffer here made the draw recorder wait for the recording thread).
+    scheduler.Record(
+        [src_handle = src->Handle(), dst_handle = dst->Handle(),
+         regions = boost::container::small_vector<vk::BufferCopy, 4>(copies.begin(), copies.end())](
+            vk::CommandBuffer cmdbuf) { cmdbuf.copyBuffer(src_handle, dst_handle, regions); });
 
     for (const auto& copy : copies) {
         AccessBuffer(src, copy.srcOffset, copy.size, vk::PipelineStageFlagBits2::eCopy,
@@ -736,8 +741,18 @@ void Runtime::FlushBarriers() {
     }
 
     scheduler.EndRendering();
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.pipelineBarrier2(dep_info);
+    scheduler.Record([memory_barrier = memory_barrier,
+                      has_memory = dep_info.memoryBarrierCount != 0,
+                      barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 8>(
+                          image_barriers.begin(), image_barriers.end())](vk::CommandBuffer cmdbuf) {
+        const vk::DependencyInfo dep{
+            .memoryBarrierCount = has_memory ? 1U : 0U,
+            .pMemoryBarriers = has_memory ? &memory_barrier : nullptr,
+            .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+            .pImageMemoryBarriers = barriers.empty() ? nullptr : barriers.data(),
+        };
+        cmdbuf.pipelineBarrier2(dep);
+    });
 
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;

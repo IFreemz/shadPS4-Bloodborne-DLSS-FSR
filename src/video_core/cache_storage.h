@@ -32,6 +32,8 @@ public:
         return opened;
     }
     void FinishPreload();
+    /// Deletes every cached blob (an incompatible cache is rebuilt instead of ignored).
+    void Clear();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);

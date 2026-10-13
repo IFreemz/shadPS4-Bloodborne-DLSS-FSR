@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <limits>
+#include "common/guest_stats.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
@@ -44,7 +46,7 @@ void Semaphore::Refresh() {
                                              std::memory_order_relaxed));
 }
 
-void Semaphore::Wait(u64 tick) {
+void Semaphore::Wait(u64 tick, std::source_location where) {
     // No need to wait if the GPU is ahead of the tick
     if (IsFree(tick)) {
         return;
@@ -62,9 +64,23 @@ void Semaphore::Wait(u64 tick) {
         .pValues = &tick,
     };
 
+    Common::GuestStats::CmdStateScope state{Common::GuestStats::CmdState::GpuWait};
+    const auto start = std::chrono::steady_clock::now();
     while (instance.GetDevice().waitSemaphores(&wait_info, WAIT_TIMEOUT) != vk::Result::eSuccess) {
     }
     Refresh();
+    // Hitch report: who waited for the GPU, and the longest wait.
+    namespace GS = Common::GuestStats;
+    const u64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+    GS::gpu_wait_ns.fetch_add(ns, std::memory_order_relaxed);
+    GS::gpu_waits.fetch_add(1, std::memory_order_relaxed);
+    if (ns > GS::slowest_wait_ns.load(std::memory_order_relaxed)) {
+        GS::slowest_wait_ns.store(ns, std::memory_order_relaxed);
+        GS::slowest_wait_file.store(where.file_name(), std::memory_order_relaxed);
+        GS::slowest_wait_line.store(where.line(), std::memory_order_relaxed);
+    }
 }
 
 } // namespace Vulkan

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstring>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -142,17 +144,67 @@ struct Info : InfoPersistent {
         : InfoPersistent(stage_, l_stage_, params.hash), pgm_base{params.Base()},
           user_data{params.user_data} {}
 
+    /// Threaded renderer: the draw recording thread runs a draw after the GPU command thread has
+    /// moved on, and the pipeline cache refreshes user_data/flattened_ud_buf/pgm_base of the
+    /// shared Info for every draw. The recording thread installs copies taken when the draw was
+    /// queued; on any other thread (or with none installed) the members are used directly.
+    struct UdSnapshot {
+        const Info* info;
+        const u32* user_data;
+        u32 user_data_size;
+        const u32* flat;
+        u32 flat_size;
+        VAddr pgm_base;
+    };
+    static constexpr u32 MaxUdSnapshots = 8;
+    static inline thread_local std::array<UdSnapshot, MaxUdSnapshots> ud_snapshots{};
+    static inline thread_local u32 num_ud_snapshots = 0;
+
+    [[nodiscard]] const UdSnapshot* Snapshot() const noexcept {
+        for (u32 i = 0; i < num_ud_snapshots; ++i) {
+            if (ud_snapshots[i].info == this) {
+                return &ud_snapshots[i];
+            }
+        }
+        return nullptr;
+    }
+    [[nodiscard]] std::span<const u32> UserData() const noexcept {
+        if (num_ud_snapshots != 0) [[unlikely]] {
+            if (const auto* s = Snapshot()) {
+                return {s->user_data, s->user_data_size};
+            }
+        }
+        return user_data;
+    }
+    [[nodiscard]] std::span<const u32> FlatUserData() const noexcept {
+        if (num_ud_snapshots != 0) [[unlikely]] {
+            if (const auto* s = Snapshot()) {
+                return {s->flat, s->flat_size};
+            }
+        }
+        return flattened_ud_buf;
+    }
+    [[nodiscard]] VAddr ProgramBase() const noexcept {
+        if (num_ud_snapshots != 0) [[unlikely]] {
+            if (const auto* s = Snapshot()) {
+                return s->pgm_base;
+            }
+        }
+        return pgm_base;
+    }
+
     template <typename T>
     inline T ReadUdSharp(u32 sharp_idx) const noexcept {
-        return *reinterpret_cast<const T*>(&flattened_ud_buf[sharp_idx]);
+        return *reinterpret_cast<const T*>(&FlatUserData()[sharp_idx]);
     }
 
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
         T data;
-        const u32* base = user_data.data();
+        const auto ud = UserData();
+        const u32* base = ud.data();
         if (ptr_index != IR::NumScalarRegs) {
-            std::memcpy(&base, &user_data[ptr_index], sizeof(base));
+            std::memcpy(&base, &ud[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));

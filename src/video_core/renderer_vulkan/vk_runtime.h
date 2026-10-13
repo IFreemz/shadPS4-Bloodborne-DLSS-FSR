@@ -28,6 +28,10 @@ public:
         return instance;
     }
 
+    Scheduler& GetScheduler() {
+        return scheduler;
+    }
+
     StagingBufferPool& GetStagingPool() {
         return staging_pool;
     }
