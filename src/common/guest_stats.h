@@ -47,6 +47,9 @@ inline std::atomic<u64> staging_allocation_bytes{0};
 inline std::atomic<u64> staging_allocation_ns{0};
 /// Time spent making buffer memory resident (allocation and page table updates).
 inline std::atomic<u64> resident_ns{0};
+/// Background texture copies: started, and time spent waiting for them (submission, fences).
+inline std::atomic<u64> async_copies{0};
+inline std::atomic<u64> async_copy_wait_ns{0};
 /// Diagnostics setting is on (the rasterizer sets it): extra bookkeeping for the reports.
 inline std::atomic<bool> diagnostics{false};
 /// Files the game opened (streaming).

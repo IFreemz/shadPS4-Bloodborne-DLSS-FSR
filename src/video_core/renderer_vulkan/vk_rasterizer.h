@@ -205,7 +205,8 @@ private:
         std::array<u64, static_cast<size_t>(Common::GuestStats::CmdState::Count) * 2> states{};
         u64 mutex_waits{}, sleeps{}, sleep_ns{}, uploads{}, upload_bytes{}, upload_ns{},
             image_copy_ns{}, buffer_bytes{}, buffer_ns{}, resident_ns{}, staging_count{},
-            staging_bytes{}, staging_ns{}, file_opens{}, resident_bytes{}, diag_ns{};
+            staging_bytes{}, staging_ns{}, async_copies{}, async_wait_ns{}, file_opens{},
+            resident_bytes{}, diag_ns{};
         std::array<u64, 4> housekeeping{};
     };
     HitchSnapshot hitch_last{};

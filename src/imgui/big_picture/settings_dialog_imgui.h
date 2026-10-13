@@ -149,6 +149,7 @@ private:
     bool bbFlipWhenReadySetting;
     bool bbVramReclaimSetting;
     bool bbBufferEvictionSetting;
+    bool bbBackgroundTextureCopiesSetting;
     int bbVramBudgetTestSetting;
     bool rcasEnabledSetting;
     float rcasAttenuationSetting;

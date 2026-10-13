@@ -34,6 +34,9 @@ namespace VideoCore {
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+// Background texture copies (test setting): smaller copies are done in place.
+static constexpr u64 BackgroundCopyMin = 16_KB;
+static constexpr u64 BackgroundCopyPiece = 1_MB;
 // Buffer eviction: experimental, the "Also free idle buffers" setting (with VRAM cleanup) or
 // SHADPS4_BUFFER_EVICTION=1.
 // It crashed with the threaded renderer when it evicted memory unused for 300 frames; this
@@ -499,6 +502,23 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
     const auto start = std::chrono::steady_clock::now();
+    if (staging.size >= BackgroundCopyMin && EmulatorSettings.IsBbBackgroundTextureCopies()) {
+        // Streaming a new area uploads ~1000 textures, ~200 KiB each, in a frame: copied one by
+        // one they held up the draw recorder for tens of ms. On the copy threads, in pieces of up
+        // to 1 MiB; waited for before the submission that reads the staging memory
+        // (Scheduler::SubmitExecution) and before the guest sees a fence (Rasterizer::OnFence).
+        for (u64 offset = 0; offset < staging.size; offset += BackgroundCopyPiece) {
+            const u64 length = std::min(BackgroundCopyPiece, staging.size - offset);
+            Common::GuestStats::async_copies.fetch_add(1, std::memory_order_relaxed);
+            Common::CopyPool::Async([memory = memory, source = device_addr + offset,
+                                     destination = staging.mapped + offset, length,
+                                     buffer = staging.buffer, flush = staging.offset + offset] {
+                memory->CopySparseMemory(source, destination, length);
+                buffer->Flush(flush, length);
+            });
+        }
+        return {staging.buffer, staging.offset};
+    }
     if (Common::BbTuning::Streaming()) {
         // Streaming a new area copies 100+ MiB of textures in a frame: large ones in parallel.
         Common::CopyPool::SplitCopy(staging.size, [&](u64 offset, u64 length) {

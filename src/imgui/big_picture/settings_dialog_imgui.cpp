@@ -72,6 +72,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbFlipWhenReadySetting = EmulatorSettings.IsBbFlipWhenReady();
     bbVramReclaimSetting = EmulatorSettings.IsBbVramReclaim();
     bbBufferEvictionSetting = EmulatorSettings.IsBbBufferEviction();
+    bbBackgroundTextureCopiesSetting = EmulatorSettings.IsBbBackgroundTextureCopies();
     bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
 
     /////////// Input Tab
@@ -141,6 +142,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbFlipWhenReady(bbFlipWhenReadySetting, isSpecific);
     EmulatorSettings.SetBbVramReclaim(bbVramReclaimSetting, isSpecific);
     EmulatorSettings.SetBbBufferEviction(bbBufferEvictionSetting, isSpecific);
+    EmulatorSettings.SetBbBackgroundTextureCopies(bbBackgroundTextureCopiesSetting, isSpecific);
     EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
 
     /////////// Input Tab
@@ -764,6 +766,9 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                     "    Also free idle buffers (testing)", bbBufferEvictionSetting,
                     "Buffer memory unused for 30 s near the limit (needs a restart)");
             }
+            AddSettingCheckbox(
+                "Background texture copies (testing)", bbBackgroundTextureCopiesSetting,
+                "Copies textures for the GPU on other threads while drawing goes on");
             AddSettingSection("Diagnostics", "For troubleshooting. Slower when on: leave off.",
                               false);
             AddSettingCheckbox("Diagnostics in the log", threadedRendererDiagnosticsSetting,

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -65,6 +66,43 @@ public:
         idle_cv.wait(lock, [this] { return active == 0; });
     }
 
+    void Async(std::function<void()> task) {
+        if (threads.empty()) {
+            task();
+            return;
+        }
+        async_pending.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::scoped_lock lock{mutex};
+            async_queue.push_back(std::move(task));
+        }
+        cv.notify_one();
+    }
+
+    bool WaitAsync() {
+        if (async_pending.load(std::memory_order_acquire) == 0) {
+            return false;
+        }
+        while (async_pending.load(std::memory_order_acquire) != 0) {
+            // Helps with queued tasks instead of only waiting.
+            std::function<void()> task;
+            {
+                std::scoped_lock lock{mutex};
+                if (!async_queue.empty()) {
+                    task = std::move(async_queue.front());
+                    async_queue.pop_front();
+                }
+            }
+            if (task) {
+                task();
+                async_pending.fetch_sub(1, std::memory_order_release);
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        return true;
+    }
+
 private:
     void Work(const std::function<void(std::size_t)>& task, std::size_t count) {
         while (true) {
@@ -81,28 +119,40 @@ private:
         Common::SetCurrentThreadName("shadPS4:CopyPool");
         u64 seen = 0;
         while (true) {
-            const std::function<void(std::size_t)>* task;
-            std::size_t count;
+            const std::function<void(std::size_t)>* task = nullptr;
+            std::size_t count = 0;
+            std::function<void()> async_task;
             {
                 std::unique_lock lock{mutex};
-                cv.wait(lock, [&] { return stopping || generation != seen; });
+                cv.wait(lock,
+                        [&] { return stopping || generation != seen || !async_queue.empty(); });
                 if (stopping || stop.stop_requested()) {
                     return;
                 }
-                seen = generation;
-                if (job_task == nullptr) {
-                    continue;
+                if (generation != seen) {
+                    // Parallel jobs first: their caller is waiting for them.
+                    seen = generation;
+                    if (job_task != nullptr) {
+                        task = job_task;
+                        count = job_count;
+                        ++active;
+                    }
+                } else {
+                    async_task = std::move(async_queue.front());
+                    async_queue.pop_front();
                 }
-                task = job_task;
-                count = job_count;
-                ++active;
             }
-            Work(*task, count);
-            {
-                std::scoped_lock lock{mutex};
-                --active;
+            if (task) {
+                Work(*task, count);
+                {
+                    std::scoped_lock lock{mutex};
+                    --active;
+                }
+                idle_cv.notify_all();
+            } else if (async_task) {
+                async_task();
+                async_pending.fetch_sub(1, std::memory_order_release);
             }
-            idle_cv.notify_all();
         }
     }
 
@@ -118,6 +168,8 @@ private:
     bool stopping = false;
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> done{0};
+    std::deque<std::function<void()>> async_queue;
+    std::atomic<u64> async_pending{0};
 };
 
 Pool& GetPool() {
@@ -141,6 +193,14 @@ void SplitCopy(u64 size, const std::function<void(u64, u64)>& copy) {
         const u64 offset = i * ChunkSize;
         copy(offset, std::min(ChunkSize, size - offset));
     });
+}
+
+void Async(std::function<void()> task) {
+    GetPool().Async(std::move(task));
+}
+
+bool WaitAsync() {
+    return GetPool().WaitAsync();
 }
 
 } // namespace Common::CopyPool

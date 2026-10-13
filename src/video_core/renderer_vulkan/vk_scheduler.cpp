@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include "common/assert.h"
+#include "common/copy_pool.h"
 #include "common/debug.h"
+#include "common/guest_stats.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
@@ -382,6 +385,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     if (recorder) {
         recorder->Sync();
         direct_mode = true;
+    }
+    {
+        // Background texture copies this submission reads (all recorded by now) must be done.
+        const auto start = std::chrono::steady_clock::now();
+        if (Common::CopyPool::WaitAsync()) {
+            Common::GuestStats::async_copy_wait_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count(),
+                std::memory_order_relaxed);
+        }
     }
     std::scoped_lock lk{submit_mutex};
     const u64 signal_value = work_semaphore.NextTick();

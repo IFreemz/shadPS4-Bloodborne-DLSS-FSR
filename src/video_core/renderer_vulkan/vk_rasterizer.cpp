@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string_view>
 #include "common/bb_tuning.h"
+#include "common/copy_pool.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/guest_stats.h"
@@ -1031,6 +1032,8 @@ void Rasterizer::ReportHitch() {
         .staging_count = GS::staging_allocations.load(std::memory_order_relaxed),
         .staging_bytes = GS::staging_allocation_bytes.load(std::memory_order_relaxed),
         .staging_ns = GS::staging_allocation_ns.load(std::memory_order_relaxed),
+        .async_copies = GS::async_copies.load(std::memory_order_relaxed),
+        .async_wait_ns = GS::async_copy_wait_ns.load(std::memory_order_relaxed),
         .file_opens = GS::file_opens.load(std::memory_order_relaxed),
         .resident_bytes = buffer_cache.ResidentBytes(),
         .diag_ns = diag_log_ns.load(std::memory_order_relaxed),
@@ -1087,7 +1090,8 @@ void Rasterizer::ReportHitch() {
             "{:.1f} ms, {} packets | GPU waits {} ({:.1f} ms, longest {:.1f} ms at {}:{}) | {} "
             "pipelines compiled | {} texture uploads ({:.1f} MiB, {:.1f} ms, copying {:.1f} ms) | "
             "buffer uploads {:.1f} MiB, {:.1f} ms | {} buffer ranges made resident ({:.1f} MiB, "
-            "{:.1f} ms) | {} staging allocations ({:.1f} MiB, {:.1f} ms) | page protection {} "
+            "{:.1f} ms) | {} staging allocations ({:.1f} MiB, {:.1f} ms) | {} background "
+            "texture copies, waited {:.1f} ms | page protection {} "
             "calls {:.1f} ms, {} write faults | "
             "game: {} files opened, {} mutex waits, {} sleeps ({:.1f} ms) | end of submissions: "
             "buffer tick {:.1f}, downloads {:.1f}, GC {:.1f}, runtime tick {:.1f} ms | "
@@ -1108,6 +1112,8 @@ void Rasterizer::ReportHitch() {
             delta(now.staging_count, last.staging_count),
             delta(now.staging_bytes, last.staging_bytes) / 1048576.0,
             ms_of(delta(now.staging_ns, last.staging_ns)),
+            delta(now.async_copies, last.async_copies),
+            ms_of(delta(now.async_wait_ns, last.async_wait_ns)),
             delta(now.protect_calls, last.protect_calls),
             ms_of(delta(now.protect_ns, last.protect_ns)), delta(now.faults, last.faults),
             delta(now.file_opens, last.file_opens), delta(now.mutex_waits, last.mutex_waits),
@@ -1126,6 +1132,17 @@ void Rasterizer::ReportHitch() {
 
 void Rasterizer::OnFence() {
     DrainDrawPipe();
+    // The guest may reuse memory once it sees the fence: background copies reading it go first.
+    {
+        const auto start = std::chrono::steady_clock::now();
+        if (Common::CopyPool::WaitAsync()) {
+            Common::GuestStats::async_copy_wait_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count(),
+                std::memory_order_relaxed);
+        }
+    }
     texture_cache.ProcessDownloadImages();
 }
 
@@ -2334,6 +2351,8 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    // Background texture copies may still read this memory.
+    Common::CopyPool::WaitAsync();
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
     {

@@ -28,4 +28,14 @@ void ParallelFor(std::size_t count, const std::function<void(std::size_t)>& task
 /// least ParallelThreshold.
 void SplitCopy(u64 size, const std::function<void(u64, u64)>& copy);
 
+/// Background copies (after bbport's deferred copies): `task` starts on a pool thread now and
+/// the caller carries on. Whoever needs the result calls WaitAsync() first: before a GPU
+/// submission reads the staging memory, and before the guest can learn the GPU is past it.
+/// Tasks run in no particular order.
+void Async(std::function<void()> task);
+
+/// Waits until every task passed to Async() so far has finished, running queued ones itself.
+/// Returns whether there was anything to wait for.
+bool WaitAsync();
+
 } // namespace Common::CopyPool
