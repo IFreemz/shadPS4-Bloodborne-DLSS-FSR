@@ -5,7 +5,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # shadPS4 Bloodborne DLSS & FSR
 
-> **New: [1.9.0-pre.1 (experimental)](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.9.0-pre.1).** It has @eFMann's threaded renderer and frame pacing work, for smoother and faster Bloodborne. Please try it and tell us in the [issues](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues) how it runs on your setup. The stable version is [1.8.5](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.8.5).
+> **New: [1.9.0-pre.2 (experimental)](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.9.0-pre.2).** It has @eFMann's threaded renderer and frame pacing work, for smoother and faster Bloodborne, and @Cainhurst27 (u/EnglishDave_)'s VRAM cleanup against VRAM filling up in long sessions. Its settings are in game under **F3 → Graphics → Bloodborne - Experimental**, all on by default. Please try it and tell us in the [issues](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues) how it runs on your setup. The stable version is [1.8.5](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.8.5).
 
 Temporal upscaling for Bloodborne on [shadPS4](https://github.com/shadps4-emu/shadPS4): NVIDIA
 DLSS on GeForce RTX cards, AMD FSR 3.1 on everything else, plus frame generation (DLSS on RTX 40
@@ -192,9 +192,10 @@ They are meant for 1080p screens and low VRAM. The result is 1080p scaled to you
 ### HDR with RenoDX
 
 The [RenoDX](https://github.com/clshortfuse/renodx) HDR mod for Bloodborne (ReShade 6.8.0 or
-newer) works with this build, with every upscaler, patch type and frame generation. It is in
-**early access** for now: its authors share it on their Discord with their supporters. If you
-enjoy it, donate to the RenoDX devs, they deserve it.
+newer) works with this build, with every upscaler, patch type and frame generation. It's out of
+early access: get it free from the Bloodborne channel on the
+[RenoDX Discord](https://discord.gg/F6AUTeWJHM). If you enjoy it, donate to the RenoDX devs, they
+deserve it.
 
 Use 1.8.2 or newer. In 1.8.0 and 1.8.1, upscaling with a regular Resolution Patch capped
 highlights at about 200 nits; 1.7.0 and earlier didn't support RenoDX.
@@ -217,7 +218,9 @@ RenoDX authors.
 ### Other patches
 
 Keep *Better AA* and *Enable TAA* off: the upscaler replaces the game's anti-aliasing.
-*60FPS++ (no deltatime)* may crash while an area loads; use *60 FPS++*. Patches and mods that
+*60FPS++ (no deltatime)* may crash while an area loads; use *60 FPS++*. *Enable Screen Space
+Reflections* turns off object motion for the upscaler, so characters and weapons can smear; keep
+it off for the sharpest image. Patches and mods that
 players tested with this build are under [Tested setups](#tested-setups).
 
 ### Why the three "Disable" patches, and not Disable Motion Blur
@@ -329,6 +332,10 @@ F1 shows why upscaling isn't running.
   `hotkey_toggle_dlss = f1`; you can bind another key there.
 - **G-SYNC / FreeSync flicker**: uneven frame pacing in emulation, not DLSS. Use an FPS patch
   matching your vblank (60 FPS++ with 60) rather than *Uncap FPS++*.
+- **No sound effects in menus**: if Windows uses *Dolby Atmos for Home Theater* (or another
+  spatial sound format) for your audio device, turn it off in Windows' sound settings. Thanks to
+  @DarthBane768 for tracking this down
+  ([#15](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues/15)).
 
 ## FAQ
 
