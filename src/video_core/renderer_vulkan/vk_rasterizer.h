@@ -261,11 +261,18 @@ private:
         VAddr index_address;
         u32 vertex_offset, instance_offset;
         u32 index_size, num_indices, num_instances;
+        u64 topology;      ///< hash of the index list
+        Motion::VertexRange range; ///< vertices the draw references
         bool gated;        ///< no character-size skeleton: history only while bones move
-        bool valid;        ///< false: no vertex streams, no motion for this draw
+        bool valid;        ///< false: no motion for this draw (still, or no usable indices)
     };
     MotionPrep ComputeMotionPrep(const GraphicsPipeline* pipeline, bool is_indexed,
-                                 u32 index_offset) const;
+                                 u32 index_offset);
+    // Character motion state of whichever thread prepares draws (stage A when threaded): the
+    // last bone palette per small-skeleton draw, and the index ranges.
+    tsl::robin_map<u64, u64> motion_gate;
+    Motion::IndexRangeCache motion_index_ranges;
+    u64 motion_preps{};
     MotionPrep packet_motion_storage{};
     const MotionPrep* packet_motion{}; ///< stage B: the current packet's, if prepared
     void TemporalDlssDraw(const GraphicsPipeline* pipeline, bool indirect);

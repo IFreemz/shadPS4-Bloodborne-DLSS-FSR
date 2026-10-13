@@ -295,7 +295,7 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
 }
 
 Rasterizer::MotionPrep Rasterizer::ComputeMotionPrep(const GraphicsPipeline* pipeline,
-                                                     bool is_indexed, u32 index_offset) const {
+                                                     bool is_indexed, u32 index_offset) {
     MotionPrep prep{};
     const auto& regs = Regs();
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -341,76 +341,82 @@ Rasterizer::MotionPrep Rasterizer::ComputeMotionPrep(const GraphicsPipeline* pip
                 XXH3_64bits_withSeed(reinterpret_cast<const void*>(address), size, prep.palette);
         }
     }
+    // Small skeletons (weapons, props, mostly static world pieces) only get history while
+    // their bone palette differs from the last time this draw was seen.
+    if (prep.gated) {
+        const std::array<u64, 6> identity{vs.pgm_hash,       prep.geometry,
+                                          prep.index_address, prep.num_indices,
+                                          prep.num_instances, prep.instance_offset};
+        const u64 key = XXH3_64bits(identity.data(), sizeof(identity));
+        if (motion_gate.size() > 65536) {
+            motion_gate.clear();
+        }
+        auto [it, inserted] = motion_gate.try_emplace(key, prep.palette);
+        const bool moving = !inserted && it->second != prep.palette;
+        it.value() = prep.palette;
+        if (!moving) {
+            return prep; // valid = false: camera motion is right for it
+        }
+    }
+    // A pseudo-frame for the index range cache (about a frame of skinned draws).
+    const u64 frame = ++motion_preps >> 10;
+    if ((motion_preps & ((u64(1) << 10) - 1)) == 0 &&
+        frame % Motion::IndexRangeCache::Unused == 0) {
+        motion_index_ranges.Trim(frame);
+    }
+    prep.range = {prep.vertex_offset, prep.num_indices};
+    if (is_indexed) {
+        prep.range = {};
+        const u32 count = prep.num_indices;
+        const u32 index_size = prep.index_size;
+        const VAddr index_address = prep.index_address;
+        const u64 bytes = u64(count) * index_size;
+        if (!index_address || !memory->IsValidGpuMapping(index_address, 0) ||
+            memory->ClampRangeSize(index_address, bytes) != bytes) {
+            return prep;
+        }
+        const bool restart = (regs.enable_primitive_restart & 1) != 0;
+        const s32 base = s32(prep.vertex_offset);
+        const auto scanned = motion_index_ranges.Get(
+            {index_address, count, index_size, base, restart}, frame, [&] {
+                const auto* data = reinterpret_cast<const void*>(index_address);
+                const auto scan_range =
+                    index_size == 2
+                        ? Motion::IndexedRange(std::span(static_cast<const u16*>(data), count),
+                                               base, restart)
+                        : Motion::IndexedRange(std::span(static_cast<const u32*>(data), count),
+                                               base, restart);
+                return Motion::IndexRangeCache::Result{scan_range, XXH3_64bits(data, bytes)};
+            });
+        prep.range = scanned.range;
+        prep.topology = scanned.topology;
+    }
     prep.valid = true;
     return prep;
 }
 
 // Character motion vectors (ported from bbport): history parameters for a skinned G-buffer draw.
-// Draws without a character-size skeleton (weapons, props, mostly static world pieces) only get
-// history while their bone palette changes.
+// The inputs come from ComputeMotionPrep (on stage A with the threaded renderer); only the
+// per-frame history bookkeeping is done here.
 void Rasterizer::PrepareObjectMotion(const GraphicsPipeline* pipeline, bool is_indexed,
                                      u32 index_offset, u32, u32) {
     if (!object_motion->Active()) {
         return;
     }
-    const auto& regs = Regs();
-    const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
     const MotionPrep prep =
         packet_motion ? *packet_motion : ComputeMotionPrep(pipeline, is_indexed, index_offset);
     if (!prep.valid) {
         return;
     }
-    const u64 geometry = prep.geometry;
-    const u64 palette = prep.palette;
-    const bool gated = prep.gated;
-    const VAddr index_address = prep.index_address;
-    const u32 index_size = prep.index_size;
-    const u32 num_indices = prep.num_indices;
-    const u32 num_instances = prep.num_instances;
-    const u32 vertex_offset = prep.vertex_offset;
-    const u32 instance_offset = prep.instance_offset;
-    if (gated && !object_motion->Moving({.shader = vs.pgm_hash,
-                                         .geometry = geometry,
-                                         .indices = index_address,
-                                         .index_count = num_indices,
-                                         .instances = num_instances,
-                                         .first_instance = instance_offset},
-                                        palette)) {
-        return;
-    }
-    Motion::VertexRange range{vertex_offset, num_indices};
-    u64 topology = 0;
-    if (is_indexed) {
-        range = {};
-        const u64 bytes = u64(num_indices) * index_size;
-        if (!index_address || !memory->IsValidGpuMapping(index_address, 0) ||
-            memory->ClampRangeSize(index_address, bytes) != bytes) {
-            return;
-        }
-        const bool restart = (regs.enable_primitive_restart & 1) != 0;
-        const auto scanned = object_motion->IndexRange(
-            {index_address, num_indices, index_size, s32(vertex_offset), restart}, [&] {
-                const auto* data = reinterpret_cast<const void*>(index_address);
-                const auto scan_range =
-                    index_size == 2
-                        ? Motion::IndexedRange(std::span(static_cast<const u16*>(data), num_indices),
-                                               s32(vertex_offset), restart)
-                        : Motion::IndexedRange(std::span(static_cast<const u32*>(data), num_indices),
-                                               s32(vertex_offset), restart);
-                return Motion::IndexRangeCache::Result{scan_range, XXH3_64bits(data, bytes)};
-            });
-        range = scanned.range;
-        topology = scanned.topology;
-    }
     const u64 param = object_motion->PrepareDraw({
-        .shader = vs.pgm_hash,
-        .geometry = geometry,
-        .indices = index_address,
-        .topology = topology,
-        .index_count = num_indices,
-        .instances = num_instances,
-        .first_instance = instance_offset,
-        .vertices = range,
+        .shader = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
+        .geometry = prep.geometry,
+        .indices = prep.index_address,
+        .topology = prep.topology,
+        .index_count = prep.num_indices,
+        .instances = prep.num_instances,
+        .first_instance = prep.instance_offset,
+        .vertices = prep.range,
     });
     push_data.motion_param = {u32(param), u32(param >> 32)};
 }
