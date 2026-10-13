@@ -55,6 +55,13 @@ public:
         });
     }
 
+    /// Mark region as modified by an explicit GPU writeback operation.
+    void MarkRegionAsGpuModified(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages<true>(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->template ChangeRegionState<StateOp::None, StateOp::Set>(offset, size);
+        });
+    }
+
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         if (readbacks_mode == GpuReadbacksMode::Disabled) {

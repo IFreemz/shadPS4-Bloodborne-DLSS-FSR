@@ -4,6 +4,7 @@
 #pragma once
 
 #include <deque>
+#include <unordered_map>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -89,6 +90,9 @@ public:
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
 
+    /// Writes a GPU-produced buffer range back to emulated memory.
+    bool DownloadMemoryFromBuffer(const Buffer* arena, VAddr device_addr, u64 size);
+
     /// Return true when a region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
 
@@ -119,7 +123,9 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    void GarbageCollectResidentMemory();
+
+    bool DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -158,7 +164,32 @@ private:
             return {{a, b}, memory, offset + (a - start)};
         }
     };
-    IntervalList<Backing> resident_ranges;
+    class ResidentRangeList : public IntervalList<Backing> {
+    public:
+        void Remove(u64 start, u64 end) {
+            auto [first, last] = OverlapRun(start, end);
+            if (first == last) {
+                return;
+            }
+            Backing remaining[2];
+            size_t count = 0;
+            if (first->start < start) {
+                remaining[count++] = first->SubRange(first->start, start);
+            }
+            const auto previous = std::prev(last);
+            if (previous->end > end) {
+                remaining[count++] = previous->SubRange(end, previous->end);
+            }
+            const auto index = std::distance(intervals.begin(), first);
+            Splice(first, last, remaining, count);
+            Coalesce(index, count);
+        }
+    };
+    ResidentRangeList resident_ranges;
+    std::unordered_map<VkDeviceMemory, u64> resident_last_use;
+    u64 cache_tick{};
+    u64 last_resident_gc_tick{};
+    u64 last_resident_diag_tick{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};

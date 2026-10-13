@@ -194,10 +194,11 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
             memcpy(backing, data, copy_size);
             size -= copy_size;
+            data = static_cast<const u8*>(data) + copy_size;
         }
     }
 
-    return true;
+    return size == 0;
 }
 
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
