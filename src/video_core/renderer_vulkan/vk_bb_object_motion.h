@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_bb_motion_history.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -38,10 +39,10 @@ public:
     // Runtime switch (dlss.ini character_motion). Off: draws get no history and the upscaler
     // ignores the image; the pipelines keep the attachment until restart.
     void SetActive(bool value) {
-        active = value;
+        active.store(value, std::memory_order_relaxed);
     }
     bool Active() const {
-        return enabled && active;
+        return enabled && active.load(std::memory_order_relaxed);
     }
 
     // Device address of the all-zero parameters: no stores, no loads.
@@ -82,7 +83,8 @@ private:
 
     const Instance& instance;
     Scheduler& scheduler;
-    bool enabled{}, active{true};
+    bool enabled{};
+    std::atomic<bool> active{true}; // read by the threaded renderer's decoding thread
     vk::Buffer params_buffer{}, positions_buffer{};
     VmaAllocation params_allocation{}, positions_allocation{};
     u32* params_mapped{};

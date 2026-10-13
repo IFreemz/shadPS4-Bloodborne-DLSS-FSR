@@ -292,7 +292,7 @@ vk::ImageView BbObjectMotion::PrepareRead(vk::CommandBuffer cmd, u32 width, u32 
     if (!target) {
         target = &GetTarget(1, 1);
     }
-    valid = active && target->written && target->width == width && target->height == height;
+    valid = Active() && target->written && target->width == width && target->height == height;
     const vk::ImageMemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,

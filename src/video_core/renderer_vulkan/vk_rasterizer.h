@@ -253,6 +253,21 @@ private:
     std::array<float, 2> draw_jitter{}; // viewport offset of the current draw (temporal DLSS)
     void PrepareObjectMotion(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
                              u32 vertex_offset, u32 instance_offset);
+    /// Character motion inputs of a skinned draw that need no history: worked out on stage A
+    /// with the threaded renderer, so the draw recorder only does the bookkeeping.
+    struct MotionPrep {
+        u64 geometry;      ///< hash of the vertex stream V#s
+        u64 palette;       ///< hash of small bone palettes (gated draws)
+        VAddr index_address;
+        u32 vertex_offset, instance_offset;
+        u32 index_size, num_indices, num_instances;
+        bool gated;        ///< no character-size skeleton: history only while bones move
+        bool valid;        ///< false: no vertex streams, no motion for this draw
+    };
+    MotionPrep ComputeMotionPrep(const GraphicsPipeline* pipeline, bool is_indexed,
+                                 u32 index_offset) const;
+    MotionPrep packet_motion_storage{};
+    const MotionPrep* packet_motion{}; ///< stage B: the current packet's, if prepared
     void TemporalDlssDraw(const GraphicsPipeline* pipeline, bool indirect);
     void CopyInsteadOfDraw(const BbTemporalDlss::DrawReplacement& source);
     void ReplayDisplayCopy(const GraphicsPipeline* pipeline, const RenderState& state,

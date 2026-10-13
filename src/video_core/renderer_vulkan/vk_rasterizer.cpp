@@ -294,19 +294,14 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
     return {vertex_offset, instance_offset};
 }
 
-// Character motion vectors (ported from bbport): history parameters for a skinned G-buffer draw.
-// Draws without a character-size skeleton (weapons, props, mostly static world pieces) only get
-// history while their bone palette changes.
-void Rasterizer::PrepareObjectMotion(const GraphicsPipeline* pipeline, bool is_indexed,
-                                     u32 index_offset, u32 vertex_offset, u32 instance_offset) {
-    if (!object_motion->Active()) {
-        return;
-    }
+Rasterizer::MotionPrep Rasterizer::ComputeMotionPrep(const GraphicsPipeline* pipeline,
+                                                     bool is_indexed, u32 index_offset) const {
+    MotionPrep prep{};
     const auto& regs = Regs();
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch = pipeline->GetFetchShader();
     if (fetch.Empty()) {
-        return;
+        return prep;
     }
     // Every vertex stream: identical position buffers can go with different skinning data.
     std::array<AmdGpu::Buffer, 32> streams;
@@ -316,16 +311,15 @@ void Rasterizer::PrepareObjectMotion(const GraphicsPipeline* pipeline, bool is_i
             streams[num_streams++] = attribute.GetSharp(vs);
         }
     }
-    const u64 geometry = XXH3_64bits(streams.data(), num_streams * sizeof(AmdGpu::Buffer));
-    const u32 index_size =
-        regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
-    const VAddr index_address =
-        is_indexed ? regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size : 0;
-    const u32 num_indices = regs.num_indices;
-    const u32 num_instances = regs.num_instances.NumInstances();
-
-    bool gated = true;
-    u64 palette = 0;
+    prep.geometry = XXH3_64bits(streams.data(), num_streams * sizeof(AmdGpu::Buffer));
+    std::tie(prep.vertex_offset, prep.instance_offset) = GetDrawOffsets(regs, vs, fetch);
+    prep.index_size = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+    prep.index_address = is_indexed ? regs.index_base_address.Address<VAddr>() +
+                                          u64(index_offset) * prep.index_size
+                                    : 0;
+    prep.num_indices = regs.num_indices;
+    prep.num_instances = regs.num_instances.NumInstances();
+    prep.gated = true;
     for (const auto& resource : vs.buffers) {
         if (resource.IsSpecial()) {
             continue;
@@ -337,16 +331,44 @@ void Rasterizer::PrepareObjectMotion(const GraphicsPipeline* pipeline, bool is_i
         }
         const auto role = Motion::ClassifyBuffer(size);
         if (role == Motion::BufferRole::Skeleton) {
-            gated = false;
+            prep.gated = false;
             break;
         }
         const VAddr address = buffer.base_address;
         if (role == Motion::BufferRole::SmallSkeleton && memory->IsValidGpuMapping(address, 0) &&
             memory->ClampRangeSize(address, size) == size) {
-            palette =
-                XXH3_64bits_withSeed(reinterpret_cast<const void*>(address), size, palette);
+            prep.palette =
+                XXH3_64bits_withSeed(reinterpret_cast<const void*>(address), size, prep.palette);
         }
     }
+    prep.valid = true;
+    return prep;
+}
+
+// Character motion vectors (ported from bbport): history parameters for a skinned G-buffer draw.
+// Draws without a character-size skeleton (weapons, props, mostly static world pieces) only get
+// history while their bone palette changes.
+void Rasterizer::PrepareObjectMotion(const GraphicsPipeline* pipeline, bool is_indexed,
+                                     u32 index_offset, u32, u32) {
+    if (!object_motion->Active()) {
+        return;
+    }
+    const auto& regs = Regs();
+    const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+    const MotionPrep prep =
+        packet_motion ? *packet_motion : ComputeMotionPrep(pipeline, is_indexed, index_offset);
+    if (!prep.valid) {
+        return;
+    }
+    const u64 geometry = prep.geometry;
+    const u64 palette = prep.palette;
+    const bool gated = prep.gated;
+    const VAddr index_address = prep.index_address;
+    const u32 index_size = prep.index_size;
+    const u32 num_indices = prep.num_indices;
+    const u32 num_instances = prep.num_instances;
+    const u32 vertex_offset = prep.vertex_offset;
+    const u32 instance_offset = prep.instance_offset;
     if (gated && !object_motion->Moving({.shader = vs.pgm_hash,
                                          .geometry = geometry,
                                          .indices = index_address,
@@ -2849,6 +2871,7 @@ struct PacketHeader {
     bool vertex_prepared;
     u8 num_vertex_inputs;
     u8 num_vertex_ranges;
+    bool motion_prepared;
 };
 
 /// Bytes of a prepared vertex input section with `count` streams and `ranges` ranges.
@@ -2947,6 +2970,15 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
         PrepareVertexInputs(static_cast<const GraphicsPipeline*>(pipeline));
     const u32 num_vertex = vertex_prepared ? static_cast<u32>(vtx_attributes.size()) : 0;
     const u32 num_vertex_ranges = vertex_prepared ? static_cast<u32>(vtx_ranges.size()) : 0;
+    // Character motion inputs of a skinned draw, off the draw recorder.
+    const bool motion_prepared =
+        kind == PacketKind::Draw && object_motion && object_motion->Active() &&
+        static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().motion_vectors;
+    MotionPrep motion_prep{};
+    if (motion_prepared) {
+        motion_prep = ComputeMotionPrep(static_cast<const GraphicsPipeline*>(pipeline),
+                                        is_indexed, index_offset);
+    }
     // Storage buffers this draw writes: later prefetches must not read them early.
     {
         const u64 packet_no = draw_pipe->packets + 1;
@@ -2996,7 +3028,8 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
     const u32 size = sizeof(PacketHeader) + AlignPacket(num_blocks * sizeof(u16)) +
                      num_blocks * BlockBytes + stage_bytes +
                      num_prefetch * static_cast<u32>(sizeof(PrefetchedBuffer)) +
-                     (vertex_prepared ? VertexSectionSize(num_vertex, num_vertex_ranges) : 0);
+                     (vertex_prepared ? VertexSectionSize(num_vertex, num_vertex_ranges) : 0) +
+                     (motion_prepared ? AlignPacket(sizeof(MotionPrep)) : 0);
     u8* const out = draw_pipe->Begin(size);
     u8* at = out;
 
@@ -3022,6 +3055,7 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
         .vertex_prepared = vertex_prepared,
         .num_vertex_inputs = static_cast<u8>(num_vertex),
         .num_vertex_ranges = static_cast<u8>(num_vertex_ranges),
+        .motion_prepared = motion_prepared,
     };
     if (kind == PacketKind::Dispatch || kind == PacketKind::DispatchIndirect) {
         header.cs = liverpool->GetCsRegs();
@@ -3065,6 +3099,10 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
         at += AlignPacket(num_vertex);
         static_assert(sizeof(PreparedRange) == 16);
         put(vtx_ranges.data(), num_vertex_ranges * sizeof(PreparedRange));
+    }
+    if (motion_prepared) {
+        std::memcpy(at, &motion_prep, sizeof(MotionPrep));
+        at += AlignPacket(sizeof(MotionPrep));
     }
     ASSERT(static_cast<u32>(at - out) == size);
     draw_pipe->Commit(size);
@@ -3249,6 +3287,12 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         in += vertex.num_ranges * sizeof(PreparedRange);
         self.packet_vertex = &vertex;
     }
+    self.packet_motion = nullptr;
+    if (header.motion_prepared) {
+        std::memcpy(&self.packet_motion_storage, in, sizeof(MotionPrep));
+        self.packet_motion = &self.packet_motion_storage;
+        in += AlignPacket(sizeof(MotionPrep));
+    }
     ASSERT(static_cast<u32>(in - data) == size);
     Shader::Info::num_ud_snapshots = header.num_stages;
 
@@ -3304,6 +3348,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     self.packet_prefetch = nullptr;
     self.packet_num_prefetch = 0;
     self.packet_vertex = nullptr;
+    self.packet_motion = nullptr;
 }
 
 void Rasterizer::LogDrawPipeStats() {
