@@ -123,18 +123,12 @@ static void EmitVertexMotion(EmitContext& ctx) {
     ctx.OpBranchConditional(do_store, store_label, store_merge);
     ctx.AddLabel(store_label);
     {
-        // Indexed draws may run the same vertex more than once; atomic component stores avoid
-        // write/write races (all those invocations produce the same clip position).
+        // One 16-byte store. Indexed draws may run the same vertex more than once, but every
+        // such invocation writes the same clip position, so the overlap is harmless (and much
+        // cheaper than bbport's four atomics per vertex).
         const Id target = ctx.OpIAdd(ctx.U64, store_address, slot_offset);
-        const Id scalar_ptr = ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, u32_type);
-        const Id scope = ctx.ConstU32(static_cast<u32>(spv::Scope::Device));
-        for (u32 i = 0; i < 4; ++i) {
-            const Id ptr = ctx.OpConvertUToPtr(
-                scalar_ptr, ctx.OpIAdd(ctx.U64, target, ctx.Constant(ctx.U64, u64(i * 4))));
-            const Id bits =
-                ctx.OpBitcast(u32_type, ctx.OpCompositeExtract(ctx.F32[1], position, i));
-            ctx.OpAtomicExchange(u32_type, ptr, scope, ctx.u32_zero_value, bits);
-        }
+        ctx.OpStore(ctx.OpConvertUToPtr(f32x4_ptr, target), position,
+                    spv::MemoryAccessMask::Aligned, 16u);
     }
     ctx.OpBranch(store_merge);
     ctx.AddLabel(store_merge);

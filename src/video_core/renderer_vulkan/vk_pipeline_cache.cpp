@@ -163,7 +163,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             !instance.IsDepthClipControlSupported() &&
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
-        info.hw.vs.motion_vectors = motion_select;
+        info.hw.vs.motion_vectors = motion_select ? Shader::MotionVectors::VertexVersion : 0;
         break;
     }
     case HwStage::Fragment: {

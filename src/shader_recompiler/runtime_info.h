@@ -84,6 +84,7 @@ struct SwVertexRuntimeInfo {
 /// attachment. The addresses come per draw through push data, so the SPIR-V does not depend
 /// on the session and can be cached.
 struct MotionVectors {
+    static constexpr u8 VertexVersion = 2;      ///< bump when the vertex motion code changes
     static constexpr u32 CurrentLocation = 30;  ///< varying: current clip position
     static constexpr u32 PreviousLocation = 31; ///< varying: previous clip position, z = valid
     static constexpr u32 Output = 7;            ///< color attachment index
@@ -107,7 +108,9 @@ struct HwVertexRuntimeInfo {
     std::array<OutputMap, 3> outputs;
     bool emulate_depth_negative_one_to_one{};
     bool clip_disable{};
-    bool motion_vectors{}; ///< MotionVectors: store/load clip positions (fills padding)
+    /// MotionVectors: store/load clip positions; 0 = off, else the code version, so shaders
+    /// cached with older motion code are not reused (fills padding).
+    u8 motion_vectors{};
     u32 user_clip_plane_mask{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;

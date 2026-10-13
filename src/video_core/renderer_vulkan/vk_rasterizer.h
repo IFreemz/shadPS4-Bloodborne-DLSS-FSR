@@ -505,6 +505,7 @@ private:
         Vertex,
         Barriers,
         Descriptors,
+        Motion,
         Dynamic,
         Record,
         Reset,
@@ -513,7 +514,7 @@ private:
     static constexpr std::array<const char*, static_cast<size_t>(Section::Count)> SectionNames{
         "packet",  "pending ops",   "render targets", "buffers",  "textures",
         "dlss",    "begin pass",    "vertex/index",   "barriers", "descriptors",
-        "dynamic", "record+mirror", "reset"};
+        "character motion", "dynamic", "record+mirror", "reset"};
     bool profile_draw{};
     u32 profile_counter{};
     std::chrono::steady_clock::time_point profile_last{};

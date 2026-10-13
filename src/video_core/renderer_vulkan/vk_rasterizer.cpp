@@ -698,6 +698,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     if (pipeline->GetGraphicsKey().motion_vectors) {
         PrepareObjectMotion(pipeline, is_indexed, index_offset, vertex_offset, instance_offset);
     }
+    ProfileLap(Section::Motion);
 
     pipeline->BindResources(set_writes, push_data);
     ProfileLap(Section::Descriptors);
