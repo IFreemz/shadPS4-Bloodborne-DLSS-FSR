@@ -547,9 +547,15 @@ private:
         Pending,
         Targets,
         Buffers,
+        TexSetHit,
+        TexLookup,
+        TexView,
+        TexLayout,
         Textures,
+        Samplers,
         Dlss,
         BeginRendering,
+        VertexBuffers,
         Vertex,
         Barriers,
         Descriptors,
@@ -560,9 +566,26 @@ private:
         Count,
     };
     static constexpr std::array<const char*, static_cast<size_t>(Section::Count)> SectionNames{
-        "packet",  "pending ops",   "render targets", "buffers",  "textures",
-        "dlss",    "begin pass",    "vertex/index",   "barriers", "descriptors",
-        "character motion", "dynamic", "record+mirror", "reset"};
+        "packet",
+        "pending ops",
+        "render targets",
+        "buffers",
+        "tex: set memo hit",
+        "tex: image lookup",
+        "tex: update+view",
+        "tex: layout+usage",
+        "tex: descriptor writes",
+        "samplers",
+        "dlss",
+        "begin pass",
+        "vertex buffers",
+        "index buffer",
+        "barriers",
+        "descriptors",
+        "character motion",
+        "dynamic",
+        "record+mirror",
+        "reset"};
     bool profile_draw{};
     u32 profile_counter{};
     std::chrono::steady_clock::time_point profile_last{};

@@ -714,6 +714,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     ProfileLap(Section::BeginRendering);
 
     BindVertexBuffers(pipeline);
+    ProfileLap(Section::VertexBuffers);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
     }
@@ -1962,7 +1963,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 set_write.descriptorType = vk::DescriptorType::eSampledImage;
                 set_write.pImageInfo = &image_infos[first_image_idx + i];
             }
+            ProfileLap(Section::TexSetHit);
             BindSamplers(stage, binding);
+            ProfileLap(Section::Samplers);
             return;
         }
     }
@@ -2078,6 +2081,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         image_descriptor_array_sizes.push_back(num_bindings);
     }
 
+    ProfileLap(Section::TexLookup);
     // Second pass to re-bind images that were updated after binding
     u32 resource_slot = 0;
     for (auto& [image_id, desc] : image_bindings) {
@@ -2098,6 +2102,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(image_id, desc);
             const auto binding = image.binding;
+            ProfileLap(Section::TexView);
 
             // The image is either bound as storage in a separate descriptor or bound as render
             // target in feedback loop. Depth images are excluded because they can't be bound as
@@ -2145,6 +2150,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 set_ok = !is_storage && !binding.force_general && !binding.is_target &&
                          texture_cache.IsClean(image_id);
             }
+            ProfileLap(Section::TexLayout);
         }
     }
     if (set_slot) {
@@ -2176,7 +2182,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         image_binding_idx += array_size;
         binding.unified += array_size;
     }
+    ProfileLap(Section::Textures);
     BindSamplers(stage, binding);
+    ProfileLap(Section::Samplers);
 }
 
 void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
