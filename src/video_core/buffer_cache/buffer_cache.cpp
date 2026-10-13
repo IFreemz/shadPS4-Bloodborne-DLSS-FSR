@@ -495,6 +495,24 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     return {arena, arena->Offset(device_addr)};
 }
 
+std::pair<const Buffer*, u64> BufferCache::ObtainGeometryBuffer(VAddr device_addr, u32 size) {
+    static constexpr u32 CopyBelow = 1_KB;
+    if (size < CopyBelow || size > STREAM_THRESHOLD || !Common::BbTuning::Threaded() ||
+        IsRegionCpuModified(device_addr, size)) {
+        // Small or changed data is copied as before (no upload inside a render pass).
+        return ObtainBuffer(device_addr, size, false);
+    }
+    const u64 first_block = device_addr >> block_shift;
+    const u64 last_block = (device_addr + size - 1) >> block_shift;
+    const auto* arena = GetArena(first_block, last_block);
+    EnsureResident(arena, first_block, last_block);
+    if (vram_reclaim) {
+        MarkResidentUse(device_addr, size);
+    }
+    SynchronizeMemory(arena, device_addr, size, false, false);
+    return {arena, arena->Offset(device_addr)};
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
     if (IsRegionGpuModified(device_addr, size)) {
         return ObtainBuffer(device_addr, size, false);

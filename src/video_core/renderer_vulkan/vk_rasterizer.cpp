@@ -1401,7 +1401,8 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         std::array<std::pair<const VideoCore::Buffer*, u64>, MaxVertexBufferCount> obtained{};
         for (u32 i = 0; i < prepared->num_ranges; ++i) {
             const auto& range = prepared->ranges[i];
-            const auto [buffer, offset] = buffer_cache.ObtainBuffer(range.base, range.size, false);
+            const auto [buffer, offset] =
+                buffer_cache.ObtainGeometryBuffer(range.base, u32(range.size));
             obtained[i] = {buffer, offset};
             needs_barrier |= runtime.IsBufferAccessed(buffer, offset, range.size);
         }
@@ -1488,7 +1489,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
         std::tie(range.buffer, range.offset) =
-            buffer_cache.ObtainBuffer(range.base_address, size, false);
+            buffer_cache.ObtainGeometryBuffer(range.base_address, u32(size));
         needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
     }
 
@@ -1537,7 +1538,7 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
     const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
+        buffer_cache.ObtainGeometryBuffer(index_address, index_buffer_size);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
     last_index = {buffer->Handle(), offset, index_type};
     RecordIndexBinding();
@@ -1908,16 +1909,19 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                    set.generation == generation &&
                    std::equal(sharps.begin(), sharps.begin() + set_count, set.sharps.begin());
         if (hit) {
-            // Every image still has the backing its view belongs to and needs no update.
+            // Every image still has the backing its view belongs to.
             for (u32 i = 0; i < set_count && hit; ++i) {
                 const auto& entry = set.entries[i];
                 if (!entry.id) {
                     continue;
                 }
+                // What FindTexture does first: returns at once for an image already found
+                // clean this GC tick, else refreshes it (as the full path would here).
+                texture_cache.UpdateImage(entry.id);
                 const auto& image = texture_cache.GetImage(entry.id);
                 hit = image.backing == entry.backing && !image.binding.needs_rebind &&
                       !image.binding.is_target && !image.binding.force_general &&
-                      texture_cache.IsClean(entry.id);
+                      set.generation == texture_cache.RegistryGeneration();
             }
         }
         if (!hit) {
@@ -2147,8 +2151,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (set_ok && slot < resolved.size()) {
                 resolved[slot] = {image_id, *image_view.image_view, image.backing,
                                   desc.view_info};
-                set_ok = !is_storage && !binding.force_general && !binding.is_target &&
-                         texture_cache.IsClean(image_id);
+                set_ok = !is_storage && !binding.force_general && !binding.is_target;
             }
             ProfileLap(Section::TexLayout);
         }

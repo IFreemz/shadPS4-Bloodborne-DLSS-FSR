@@ -106,6 +106,11 @@ public:
                                                              bool is_written,
                                                              bool is_texel_buffer = false);
 
+    /// Vertex and index data: like ObtainBuffer(read-only), but with the threaded renderer a
+    /// clean range of 1 KiB or more is used where it is in the arena instead of being copied
+    /// into the stream buffer for every draw (static meshes keep their geometry).
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainGeometryBuffer(VAddr device_addr, u32 size);
+
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
 
