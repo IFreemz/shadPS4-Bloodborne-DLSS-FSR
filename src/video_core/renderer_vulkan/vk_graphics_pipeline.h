@@ -47,7 +47,8 @@ struct GraphicsPipelineKey {
         AmdGpu::DepthBuffer::ZFormat z_format : 2;
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
         u32 depth_clamp_enable : 1;
-        u32 motion_vectors : 1; // character motion vectors at color attachment 7
+        u32 motion_vectors : 1; // the shaders write character motion vectors
+        u32 motion_slot : 1;    // color attachment 7 is the motion image (G-buffer passes)
     };
     struct {
         AmdGpu::PrimitiveType prim_type : 5;

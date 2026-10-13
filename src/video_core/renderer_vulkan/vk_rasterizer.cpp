@@ -678,10 +678,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         return;
     }
     ProfileLap(Section::Dlss);
-    auto state = BeginRendering(pipeline);
-    if (pipeline->GetGraphicsKey().motion_vectors && object_motion->Enabled()) {
-        object_motion->Attach(state);
-    }
+    const auto state = BeginRendering(pipeline);
     ProfileLap(Section::BeginRendering);
 
     BindVertexBuffers(pipeline);
@@ -797,10 +794,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
         return;
     }
     TemporalDlssDraw(pipeline, true);
-    auto state = BeginRendering(pipeline);
-    if (pipeline->GetGraphicsKey().motion_vectors && object_motion->Enabled()) {
-        object_motion->Attach(state);
-    }
+    const auto state = BeginRendering(pipeline);
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -2304,6 +2298,10 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
 
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
+    }
+    // Character motion image (part of the remembered state, so the pass stays open).
+    if (key.motion_slot && object_motion->Enabled()) {
+        object_motion->Attach(state);
     }
 
     return state;

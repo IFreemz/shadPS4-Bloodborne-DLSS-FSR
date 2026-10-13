@@ -518,9 +518,12 @@ bool PipelineCache::RefreshGraphicsKey() {
         key.num_samples = std::max(key.num_samples, color_samples);
     }
 
-    if (motion_select) {
+    // Every G-buffer pipeline gets the motion attachment (written only by skinned draws), so
+    // the pass is not restarted each time the game switches between skinned and static draws.
+    if (motion_possible && !(key.mrt_mask & (1u << Shader::MotionVectors::Output))) {
         constexpr u32 mv = Shader::MotionVectors::Output;
-        key.motion_vectors = 1;
+        key.motion_vectors = motion_select ? 1 : 0;
+        key.motion_slot = 1;
         key.mrt_mask |= 1u << mv;
         key.num_color_attachments = mv + 1;
         auto& color_buffer = key.color_buffers[mv];
@@ -529,11 +532,14 @@ bool PipelineCache::RefreshGraphicsKey() {
         color_buffer.num_format = AmdGpu::NumberFormat::Float;
         color_buffer.swizzle = AmdGpu::IdentityMapping;
         key.blend_controls[mv] = {};
-        key.write_masks[mv] = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-                              vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+        key.write_masks[mv] = motion_select
+                                  ? vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                                        vk::ColorComponentFlagBits::eB |
+                                        vk::ColorComponentFlagBits::eA
+                                  : vk::ColorComponentFlags{};
         key.color_samples[mv] = 1;
-        motion_select = false;
     }
+    motion_select = false;
 
     // Force all color samples to match depth samples to avoid unsupported MSAA configuration
     if (color_samples != 0) {
