@@ -52,6 +52,8 @@ static constexpr u64 RESIDENT_BUFFER_IDLE_SECONDS = 30;
 static constexpr u64 RESIDENT_CHUNK_SHIFT = 21;
 static constexpr u64 RESIDENT_BUFFER_REPORT_TICKS = 3000;
 static constexpr u64 RESIDENT_BUFFER_FREE_DELAY_SECONDS = 3;
+// A sparse bind or unbind slower than this is reported (it holds up the graphics queue).
+static constexpr double SLOW_SPARSE_CALL_MS = 5.0;
 static constexpr u64 RESIDENT_BUFFER_GC_COOLDOWN = 120;
 static constexpr u64 RESIDENT_BUFFER_GC_TARGET = 256_MB;
 // Less than this idle isn't worth a pass: each one waits for the GPU.
@@ -821,6 +823,7 @@ void BufferCache::GarbageCollectResidentMemory() {
         return;
     }
     last_resident_gc_tick = cache_tick;
+    const auto pass_start = std::chrono::steady_clock::now();
 
     // Pieces of resident memory, at most one 2 MiB chunk of guest memory each. The memory itself
     // is shared by many ranges (slabs), so it is unbound piece by piece and freed once nothing
@@ -942,12 +945,17 @@ void BufferCache::GarbageCollectResidentMemory() {
         .pSignalSemaphores = &signal_sema,
     };
     vk::Result result;
+    // Timed: on some drivers (bbport saw NVIDIA on Linux take 10 s and more) this call is slow.
+    const auto unbind_start = std::chrono::steady_clock::now();
     {
         // The graphics queue is shared with the presenter (and frame generation): queue
         // operations must be serialized like every other submission.
         std::scoped_lock submit_lock{Vulkan::Scheduler::submit_mutex};
         result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     }
+    const double unbind_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - unbind_start)
+            .count();
     ASSERT_MSG(result == vk::Result::eSuccess, "Failed to unbind sparse guest memory: {}",
                vk::to_string(result));
     last_unbind_tick = signal_tick;
@@ -972,14 +980,24 @@ void BufferCache::GarbageCollectResidentMemory() {
         pool_blocks += slab.size_blocks;
         pool_free_blocks += slab.size_blocks - slab.live_blocks;
     }
+    const double pass_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pass_start)
+            .count();
     LOG_INFO(Render,
              "Evicted {} MiB of guest buffers unused for {}+ s ({} pieces), freed {} MiB ({} "
              "allocations) | VRAM {} of {} MiB | kept: {} MiB used recently, {} MiB GPU-written "
-             "| buffer memory {} MiB in {} allocations, {} MiB of it free for reuse",
+             "| buffer memory {} MiB in {} allocations, {} MiB of it free for reuse | unbind call "
+             "{:.2f} ms ({} ranges), whole pass {:.2f} ms",
              evict_size >> 20, RESIDENT_BUFFER_IDLE_SECONDS, evict.size(), freed_bytes >> 20,
              freed_allocations, usage >> 20, budget >> 20, recent_bytes >> 20,
              gpu_written_bytes >> 20, (pool_blocks << block_shift) >> 20, resident_slabs.size(),
-             (pool_free_blocks << block_shift) >> 20);
+             (pool_free_blocks << block_shift) >> 20, unbind_ms, evict.size(), pass_ms);
+    if (unbind_ms >= SLOW_SPARSE_CALL_MS) {
+        LOG_WARNING(Render,
+                    "Buffer eviction: the driver took {:.1f} ms to unbind {} ranges. If this "
+                    "repeats, turn off \"Also free idle buffers\" and report it with this log",
+                    unbind_ms, evict.size());
+    }
 }
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
@@ -1128,8 +1146,25 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     };
 
     info.AddWait(signal_sema, signal_tick);
+    const auto bind_start = std::chrono::steady_clock::now();
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    if (vram_reclaim) {
+        // Buffer eviction makes binding more frequent (evicted ranges come back): report slow
+        // driver calls, at most once a second.
+        const auto now = std::chrono::steady_clock::now();
+        const double bind_ms = std::chrono::duration<double, std::milli>(now - bind_start).count();
+        if (bind_ms >= SLOW_SPARSE_CALL_MS &&
+            now - last_slow_bind_report >= std::chrono::seconds{1}) {
+            last_slow_bind_report = now;
+            size_t ranges = 0;
+            for (const auto& binds : pending_binds) {
+                ranges += binds.binds.size();
+            }
+            LOG_WARNING(Render, "Sparse bind of {} ranges took {:.1f} ms in the driver", ranges,
+                        bind_ms);
+        }
+    }
 
     pending_binds.clear();
 }

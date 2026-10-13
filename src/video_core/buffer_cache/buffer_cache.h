@@ -236,6 +236,7 @@ private:
         u64 unbind_tick; ///< memory_semaphore tick of its last unbind
     };
     u64 last_unbind_tick{}; ///< memory_semaphore tick of the last unbind (buffer eviction)
+    std::chrono::steady_clock::time_point last_slow_bind_report{};
     std::vector<RetiredMemory> retired_memory; ///< evicted, freed a few seconds later
     bool vram_reclaim{};                       ///< VRAM cleanup setting, read at start
     u64 cache_tick{};
