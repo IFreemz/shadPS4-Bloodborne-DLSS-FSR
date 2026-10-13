@@ -232,6 +232,7 @@ private:
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    void BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
@@ -407,6 +408,31 @@ private:
     };
     static constexpr u32 TextureMemoSize = 4096;
     std::unique_ptr<std::array<TextureMemoEntry, TextureMemoSize>> texture_memo;
+    // Texture set memo (after bbport): a stage's resolved sampled textures (image after the
+    // depth redirect, view, backing, view info) remembered by its T#s. A hit only redoes the
+    // per-draw effects (found tick, binding flags, layout transition, usage) and writes the
+    // descriptors: no image lookup, view search or image update per texture.
+    struct TextureSetEntry {
+        VideoCore::ImageId id{}; ///< null: null descriptor
+        vk::ImageView view{};
+        const void* backing{};
+        VideoCore::ImageViewInfo view_info{};
+    };
+    struct TextureSet {
+        static constexpr u32 MaxImages = 16; ///< larger sets are not remembered
+        u64 key{};
+        const Shader::Info* stage{};
+        u64 generation{~0ull};
+        u32 count{};
+        std::array<std::array<u64, 4>, MaxImages> sharps{};
+        std::array<TextureSetEntry, MaxImages> entries{};
+    };
+    static constexpr u32 TextureSetCount = 4096;
+    std::unique_ptr<std::array<TextureSet, TextureSetCount>> texture_sets;
+    std::atomic<u64> texture_set_hits{};
+    std::atomic<u64> texture_set_misses{};
+    u64 pipe_stats_set_hits{};
+    u64 pipe_stats_set_misses{};
     struct TargetLookupMemo {
         std::array<u32, 32> key{};
         u32 key_words{};

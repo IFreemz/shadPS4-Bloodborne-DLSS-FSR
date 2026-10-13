@@ -144,6 +144,14 @@ public:
         }
     }
 
+    /// UpdateImage would return at once: the image was found clean, fully tracked and touched
+    /// in this GC tick (threaded renderer memos reuse what it resolved).
+    [[nodiscard]] bool IsClean(ImageId image_id) {
+        Image& image = slot_images[image_id];
+        return std::atomic_ref<u64>(image.clean_tick).load(std::memory_order_acquire) ==
+               std::atomic_ref<u64>(gc_tick).load(std::memory_order_acquire) + 1;
+    }
+
     /// The image needs UpdateImage's full path again (called with the lock held).
     static void ClearCleanTick(Image& image) {
         std::atomic_ref<u64>(image.clean_tick).store(0, std::memory_order_release);

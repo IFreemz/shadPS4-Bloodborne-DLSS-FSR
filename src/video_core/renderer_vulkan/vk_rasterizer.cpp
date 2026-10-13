@@ -81,6 +81,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         pipe_enabled = EmulatorSettings.IsThreadedRenderer();
         target_memo_enabled = pipe_enabled.load();
         texture_memo = std::make_unique<std::array<TextureMemoEntry, TextureMemoSize>>();
+        texture_sets = std::make_unique<std::array<TextureSet, TextureSetCount>>();
         scheduler.EnableThreadedRecording();
         sampler_memo = std::make_unique<std::array<SamplerMemoEntry, SamplerMemoSize>>();
         const_ring = std::make_unique<VideoCore::Buffer>(
@@ -1884,6 +1885,90 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         image->binding.is_bound = 1u;
     };
 
+    // Texture set memo: the whole stage's sampled textures as resolved last time.
+    TextureSet* set_slot = nullptr;
+    const u32 set_count = static_cast<u32>(stage.images.size());
+    if (memo_on && texture_sets && set_count != 0 && set_count <= TextureSet::MaxImages &&
+        std::ranges::none_of(stage.images, [](const Shader::ImageResource& image) {
+            return image.is_written ||
+                   image.mip_fallback_mode != Shader::MipStorageFallbackMode::None;
+        })) {
+        std::array<std::array<u64, 4>, TextureSet::MaxImages> sharps;
+        for (u32 i = 0; i < set_count; ++i) {
+            const auto tsharp = stage.images[i].GetSharp(stage);
+            std::memcpy(sharps[i].data(), &tsharp, sizeof(sharps[i]));
+        }
+        const u64 key = XXH3_64bits_withSeed(sharps.data(), set_count * sizeof(sharps[0]),
+                                             reinterpret_cast<u64>(&stage)) |
+                        1;
+        auto& set = (*texture_sets)[key % TextureSetCount];
+        set_slot = &set;
+        bool hit = set.key == key && set.stage == &stage && set.count == set_count &&
+                   set.generation == generation &&
+                   std::equal(sharps.begin(), sharps.begin() + set_count, set.sharps.begin());
+        if (hit) {
+            // Every image still has the backing its view belongs to and needs no update.
+            for (u32 i = 0; i < set_count && hit; ++i) {
+                const auto& entry = set.entries[i];
+                if (!entry.id) {
+                    continue;
+                }
+                const auto& image = texture_cache.GetImage(entry.id);
+                hit = image.backing == entry.backing && !image.binding.needs_rebind &&
+                      !image.binding.is_target && !image.binding.force_general &&
+                      texture_cache.IsClean(entry.id);
+            }
+        }
+        if (!hit) {
+            texture_set_misses.fetch_add(1, std::memory_order_relaxed);
+            set.key = key;
+            set.stage = &stage;
+            set.count = 0;
+            set.generation = ~0ull;
+            std::copy_n(sharps.begin(), set_count, set.sharps.begin());
+        } else {
+            texture_set_hits.fetch_add(1, std::memory_order_relaxed);
+            for (u32 i = 0; i < set_count; ++i) {
+                const auto& entry = set.entries[i];
+                if (!entry.id) {
+                    image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                             vk::ImageLayout::eGeneral);
+                } else {
+                    texture_cache.TouchFoundImage(entry.id);
+                    auto& image = texture_cache.GetImage(entry.id);
+                    image.binding.is_bound = 1u;
+                    bound_images.emplace_back(entry.id);
+                    const auto new_layout = image.info.props.is_depth
+                                                ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                                : vk::ImageLayout::eShaderReadOnlyOptimal;
+                    needs_barrier |= runtime.Transit(&image, new_layout,
+                                                     vk::PipelineStageFlagBits2::eAllCommands,
+                                                     vk::AccessFlagBits2::eShaderRead,
+                                                     entry.view_info.range);
+                    image.usage.texture = 1u;
+                    temporal_dlss.ObserveTexture(image, entry.id, entry.view_info, stage.pgm_hash,
+                                                 i);
+                    if (i == 0 && first_texture_infos.size() < first_texture_infos.capacity()) {
+                        first_texture_infos.emplace_back(stage.pgm_hash, u32(image_infos.size()));
+                    }
+                    image_infos.emplace_back(VK_NULL_HANDLE, entry.view,
+                                             image.backing->state.layout);
+                }
+                auto& set_write = set_writes[set_write_index++];
+                set_write.dstSet = VK_NULL_HANDLE;
+                set_write.dstBinding = binding.unified++;
+                set_write.dstArrayElement = 0;
+                set_write.descriptorCount = 1;
+                set_write.descriptorType = vk::DescriptorType::eSampledImage;
+                set_write.pImageInfo = &image_infos[first_image_idx + i];
+            }
+            BindSamplers(stage, binding);
+            return;
+        }
+    }
+    std::array<TextureSetEntry, TextureSet::MaxImages> resolved{};
+    bool set_ok = set_slot != nullptr;
+
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
@@ -2005,6 +2090,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
                 image_id = texture_cache.FindImage(desc);
+                set_ok = false;
             }
 
             bound_images.emplace_back(image_id);
@@ -2053,6 +2139,22 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
+            if (set_ok && slot < resolved.size()) {
+                resolved[slot] = {image_id, *image_view.image_view, image.backing,
+                                  desc.view_info};
+                set_ok = !is_storage && !binding.force_general && !binding.is_target &&
+                         texture_cache.IsClean(image_id);
+            }
+        }
+    }
+    if (set_slot) {
+        if (set_ok && image_bindings.size() == set_count) {
+            // Remembered: the same T#s resolve the same way while no image is (un)registered.
+            set_slot->generation = texture_cache.RegistryGeneration();
+            set_slot->count = set_count;
+            std::copy_n(resolved.begin(), set_count, set_slot->entries.begin());
+        } else {
+            set_slot->key = 0;
         }
     }
 
@@ -2074,7 +2176,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         image_binding_idx += array_size;
         binding.unified += array_size;
     }
+    BindSamplers(stage, binding);
+}
 
+void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
@@ -3399,6 +3504,15 @@ void Rasterizer::LogDrawPipeStats() {
                  image_lookups / seconds);
     }
     pipe_stats_image_hits = image_hits;
+    const u64 set_hits = texture_set_hits.load(std::memory_order_relaxed);
+    const u64 set_misses = texture_set_misses.load(std::memory_order_relaxed);
+    const u64 set_lookups = (set_hits - pipe_stats_set_hits) + (set_misses - pipe_stats_set_misses);
+    if (set_lookups != 0) {
+        LOG_INFO(Render_Vulkan, "  texture set memo: {:.0f}% of {:.0f} stage texture sets/s reused",
+                 100.0 * (set_hits - pipe_stats_set_hits) / set_lookups, set_lookups / seconds);
+    }
+    pipe_stats_set_hits = set_hits;
+    pipe_stats_set_misses = set_misses;
     pipe_stats_image_misses = image_misses;
     {
         const u64 prefetches = ring_prefetches.load(std::memory_order_relaxed);
