@@ -416,6 +416,32 @@ void DlssLayer::Draw() {
     SameLine();
     TextDisabled("(steady menu backgrounds)");
 
+    bool object_motion = settings.Get("object_motion", "1") != "0";
+    if (Checkbox("Object motion vectors", &object_motion))
+        settings.Set("object_motion", object_motion ? "1" : "0");
+    if (IsItemHovered())
+        SetTooltip("Motion of moving objects (doors, elevators, enemies) for the upscaler. Off: "
+                   "only the camera's motion\nis used. Turn it off to check whether ghosting "
+                   "comes from it.");
+    SameLine();
+    TextDisabled("(less ghosting on moving objects)");
+
+    const bool renodx = Vulkan::RenoDxLoaded();
+    bool character_motion = !renodx && settings.Get("character_motion", "1") != "0";
+    BeginDisabled(renodx);
+    if (Checkbox("Character motion vectors", &character_motion))
+        settings.Set("character_motion", character_motion ? "1" : "0");
+    EndDisabled();
+    if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        SetTooltip(renodx ? "Off while RenoDX is loaded: RenoDX finds the shaders it replaces by "
+                            "their exact code,\nand the motion code would hide the character "
+                            "shaders from it."
+                          : "Per-vertex motion of animated characters, cloth and weapons for the "
+                            "upscaler. Off: they get\nthe object or camera motion instead. Turn "
+                            "it off to check whether ghosting comes from it.");
+    SameLine();
+    TextDisabled(renodx ? "(off with RenoDX)" : "(sharper moving characters)");
+
     SeparatorText("Resolution");
     TextWrapped("The game's render resolution is upscaled to your shadPS4 window size. The "
                 "render resolution comes from the Resolution Patch you enable for Bloodborne "

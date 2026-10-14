@@ -21,6 +21,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "video_core/renderer_vulkan/vk_hdr_mod.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -63,9 +64,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     memory->SetRasterizer(this);
 
     // Before any pipeline is selected: G-buffer pipelines only get the motion attachment
-    // while this is enabled.
+    // while this is enabled. Not under RenoDX: it replaces shaders by their exact code, and
+    // the motion code would hide the character shaders from it.
     object_motion = std::make_unique<BbObjectMotion>(
-        instance, scheduler, temporal_dlss.Requested() && temporal_dlss.CharacterMotionRequested());
+        instance, scheduler,
+        temporal_dlss.Requested() && temporal_dlss.CharacterMotionRequested() && !RenoDxLoaded());
     temporal_dlss.SetObjectMotion(object_motion.get());
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
