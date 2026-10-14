@@ -1712,8 +1712,22 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Image copy must be valid
     VideoCore::Image& image0 = texture_cache.GetImage(image0_id);
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
+    // Bloodborne copies its depth buffer (with the stencil after it) into an R32F texture: the
+    // copy is larger than the images. The depth part is an image copy when no image lives in
+    // the rest of the destination (nothing samples the copied stencil bytes as a texture).
+    bool size_ok = image0.info.guest_size == buf0.GetSize();
+    if (!size_ok && image0.info.guest_size < buf0.GetSize()) {
+        const AmdGpu::Buffer& dst_buf = desc0.is_written ? buf0 : buf1;
+        const VAddr tail = dst_buf.base_address + image0.info.guest_size;
+        const u64 tail_size = buf0.GetSize() - image0.info.guest_size;
+        bool tail_used = false;
+        texture_cache.ForEachImageInRegion(tail, tail_size, [&](VideoCore::ImageId, auto&) {
+            tail_used = true;
+        });
+        size_ok = !tail_used;
+    }
     if (image0.info.guest_size != image1.info.guest_size ||
-        image0.info.pitch != image1.info.pitch || image0.info.guest_size != buf0.GetSize() ||
+        image0.info.pitch != image1.info.pitch || !size_ok ||
         image0.info.num_bits != image1.info.num_bits) {
         if (diag) {
             NoteHleReject("copy", hash,
