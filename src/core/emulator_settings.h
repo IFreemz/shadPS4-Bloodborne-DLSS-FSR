@@ -439,8 +439,8 @@ struct GPUSettings {
     // VRAM cleanup (applies at game start): frees idle textures when VRAM runs low.
     // Off: the emulator's original cache behaviour.
     Setting<bool> bb_vram_reclaim{true};
-    // With VRAM cleanup: also free guest buffer memory unused for 30 s (experimental, at start).
-    Setting<bool> bb_buffer_eviction{false};
+    // With VRAM cleanup: also free guest buffer memory unused for 30 s (applies at start).
+    Setting<bool> bb_buffer_eviction{true};
     // Testing: the VRAM budget the caches assume, in MiB (0 = the GPU's real budget; at start).
     Setting<int> bb_vram_budget_test_mb{0};
     // Testing: textures copied from guest memory on background threads; the copies are waited

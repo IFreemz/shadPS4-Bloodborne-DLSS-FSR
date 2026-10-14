@@ -767,7 +767,7 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                "Frees unused VRAM in long sessions (needs a restart)");
             if (bbVramReclaimSetting) {
                 AddSettingCheckbox(
-                    "    Also free idle buffers (testing)", bbBufferEvictionSetting,
+                    "    Also free idle buffers", bbBufferEvictionSetting,
                     "Buffer memory unused for 30 s near the limit (needs a restart)");
             }
             AddSettingCheckbox(

@@ -37,7 +37,7 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 // Background texture copies (test setting): smaller copies are done in place.
 static constexpr u64 BackgroundCopyMin = 16_KB;
 static constexpr u64 BackgroundCopyPiece = 1_MB;
-// Buffer eviction: experimental, the "Also free idle buffers" setting (with VRAM cleanup) or
+// Buffer eviction: the "Also free idle buffers" setting (on by default, with VRAM cleanup) or
 // SHADPS4_BUFFER_EVICTION=1.
 // It crashed with the threaded renderer when it evicted memory unused for 300 frames; this
 // version only takes guest memory unused for RESIDENT_BUFFER_IDLE_SECONDS that holds no
@@ -94,7 +94,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       memory_semaphore{instance} {
     vram_reclaim = EvictIdleBuffers() && EmulatorSettings.IsBbVramReclaim();
     if (vram_reclaim) {
-        LOG_INFO(Render, "Buffer eviction on (experimental)");
+        LOG_INFO(Render, "Buffer eviction on");
     }
     const auto families = instance.GetBufferQueueFamilies();
     const vk::BufferCreateInfo probe_ci = {
