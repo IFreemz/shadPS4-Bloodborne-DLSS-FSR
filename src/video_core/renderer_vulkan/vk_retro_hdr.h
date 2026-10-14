@@ -32,6 +32,8 @@ struct Session {
 bool Start(void* native_window, bool scrgb_supported);
 const Session& GetSession();
 std::string_view Describe(State state);
+// A dlss.ini value as a float; `fallback` unless the whole value is a finite number.
+float ParseFloat(std::string_view value, float fallback);
 
 constexpr u32 ModeNone = 0;
 constexpr u32 ModeOff = 1;
