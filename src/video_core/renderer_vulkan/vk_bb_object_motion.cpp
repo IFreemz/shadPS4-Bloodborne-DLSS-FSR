@@ -104,10 +104,10 @@ void BbObjectMotion::OnFrameStart() {
         LOG_INFO(Render_Vulkan,
                  "[DLSS-TEMPORAL] Character motion: {} draws, {} stored, {} with history, {} "
                  "unmatched, {} over capacity, {} invalid, {} still; last frame {}/{} vertices; "
-                 "index ranges {} reused, {} scanned",
+                 "index ranges {} reused, {} scanned; {} instanced (camera motion)",
                  s.draws, s.stored, s.loaded, s.unmatched, s.exhausted, s.invalid, s.still,
                  history.Used(), PositionsPerFrame, index_ranges.stats.hits,
-                 index_ranges.stats.scans);
+                 index_ranges.stats.scans, s.instanced);
         history.stats = {};
         index_ranges.stats = {};
     }

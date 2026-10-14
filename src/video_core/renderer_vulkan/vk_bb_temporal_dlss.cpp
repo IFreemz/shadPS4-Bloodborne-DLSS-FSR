@@ -22,6 +22,7 @@
 #include "video_core/host_shaders/bb_dlss_composite_hdr_comp.h"
 #include "video_core/host_shaders/bb_dlss_linearize_comp.h"
 #include "video_core/host_shaders/bb_dlss_motion_comp.h"
+#include "video_core/host_shaders/bb_dlss_motion_debug_comp.h"
 #include "video_core/host_shaders/bb_dlss_sharpen_hdr_comp.h"
 #include "video_core/host_shaders/bb_hudless_dim_comp.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
@@ -454,7 +455,7 @@ struct BbTemporalDlss::Impl {
     u32 producer_constants{}, producer_depths{}, velocity_draw_constants{};
     std::unordered_map<VAddr, std::unique_ptr<OwnedImage>> outputs;
     std::unique_ptr<ComputePass> motion_pass, composite_pass, composite_hdr_pass, linearize_pass,
-        sharpen_pass, hudless_dim_pass;
+        sharpen_pass, hudless_dim_pass, motion_debug_pass;
     vk::UniqueSampler nearest, linear;
     Backend backend{};
     // Menus cover most of the screen; while one is open the scene is not jittered and the game's
@@ -596,6 +597,10 @@ struct BbTemporalDlss::Impl {
             std::make_unique<ComputePass>(device, linearize_types, BB_DLSS_LINEARIZE_COMP, 4);
         sharpen_pass =
             std::make_unique<ComputePass>(device, linearize_types, BB_DLSS_SHARPEN_HDR_COMP, 4);
+        static constexpr std::array motion_debug_types{T::eCombinedImageSampler,
+                                                       T::eCombinedImageSampler, T::eStorageImage};
+        motion_debug_pass =
+            std::make_unique<ComputePass>(device, motion_debug_types, BB_DLSS_MOTION_DEBUG_COMP, 4);
         static constexpr std::array hudless_dim_types{T::eCombinedImageSampler,
                                                       T::eCombinedImageSampler, T::eStorageImage,
                                                       T::eStorageBuffer};
@@ -1466,6 +1471,43 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         LOG_ERROR(Render_Vulkan, "[DLSS-TEMPORAL] Evaluation failed; stock rendering");
         return false;
     }
+    if (upscale_to && tune.debug_motion) {
+        // The composite (and its motion view) does not run when the upscaled image replaces
+        // the game's own upscale: draw the motion view over the upscaled image instead.
+        motion->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+        upscaled->Transit(command, vk::ImageLayout::eGeneral,
+                          vk::PipelineStageFlagBits2::eComputeShader,
+                          vk::AccessFlagBits2::eShaderWrite);
+        const std::array images{
+            vk::DescriptorImageInfo{*nearest, *motion->view,
+                                    vk::ImageLayout::eShaderReadOnlyOptimal},
+            vk::DescriptorImageInfo{*nearest, character_view ? character_view : *motion->view,
+                                    character_view ? vk::ImageLayout::eGeneral
+                                                   : vk::ImageLayout::eShaderReadOnlyOptimal},
+            vk::DescriptorImageInfo{{}, *upscaled->view, vk::ImageLayout::eGeneral}};
+        const std::array writes{
+            vk::WriteDescriptorSet{.dstBinding = 0,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                   .pImageInfo = &images[0]},
+            vk::WriteDescriptorSet{.dstBinding = 1,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                   .pImageInfo = &images[1]},
+            vk::WriteDescriptorSet{.dstBinding = 2,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eStorageImage,
+                                   .pImageInfo = &images[2]}};
+        const u32 debug_character = character_valid ? 1u : 0u;
+        command.bindPipeline(vk::PipelineBindPoint::eCompute, *motion_debug_pass->pipeline);
+        command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *motion_debug_pass->layout, 0,
+                                     writes);
+        command.pushConstants(*motion_debug_pass->layout, vk::ShaderStageFlagBits::eCompute, 0,
+                              sizeof(debug_character), &debug_character);
+        command.dispatch((out.width + 7) / 8, (out.height + 7) / 8, 1);
+    }
     if (upscale_to && tune.sharpness > 0 && sharpened) {
         // Sharpened into its own image: the upscaler keeps the unsharpened one as history.
         upscaled->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -2123,6 +2165,7 @@ void BbTemporalDlss::Shutdown(const Instance& instance, Scheduler& scheduler) {
     s.composite_hdr_pass.reset();
     s.linearize_pass.reset();
     s.sharpen_pass.reset();
+    s.motion_debug_pass.reset();
     s.hudless_dim_pass.reset();
     LOG_INFO(Render_Vulkan, "[DLSS-TEMPORAL] Teardown: evaluations={} composites={} fallbacks={}",
              s.evaluations, s.composites, s.fallbacks);

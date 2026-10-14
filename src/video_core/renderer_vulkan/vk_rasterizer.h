@@ -271,7 +271,13 @@ private:
                                  u32 index_offset);
     // Character motion state of whichever thread prepares draws (stage A when threaded): the
     // last bone palette per small-skeleton draw, and the index ranges.
-    tsl::robin_map<u64, u64> motion_gate;
+    struct MotionGate {
+        u64 palette;
+        u64 frame; ///< submission (game frame) it was last seen in
+    };
+    tsl::robin_map<u64, MotionGate> motion_gate;
+    tsl::robin_map<u64, u32> motion_gate_counts; ///< draws per identity this frame
+    u64 motion_gate_frame{};
     Motion::IndexRangeCache motion_index_ranges;
     u64 motion_preps{};
     MotionPrep packet_motion_storage{};

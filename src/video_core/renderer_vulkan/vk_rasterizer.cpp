@@ -351,12 +351,23 @@ Rasterizer::MotionPrep Rasterizer::ComputeMotionPrep(const GraphicsPipeline* pip
                                           prep.index_address, prep.num_indices,
                                           prep.num_instances, prep.instance_offset};
         const u64 key = XXH3_64bits(identity.data(), sizeof(identity));
-        if (motion_gate.size() > 65536) {
+        if (motion_gate.size() > 262144) {
             motion_gate.clear();
         }
-        auto [it, inserted] = motion_gate.try_emplace(key, prep.palette);
-        const bool moving = !inserted && it->second != prep.palette;
-        it.value() = prep.palette;
+        // Identical pieces (fence sections, gravestones) share the identity. As in bbport,
+        // the k-th copy this frame is compared with the k-th copy last frame; otherwise each
+        // copy is compared with another copy, looks moving and loads that copy's positions.
+        const u64 frame = stat_frames;
+        if (frame != motion_gate_frame) {
+            motion_gate_counts.clear();
+            motion_gate_frame = frame;
+        }
+        const u32 occurrence = motion_gate_counts[key]++;
+        const u64 gate_key = XXH3_64bits_withSeed(&occurrence, sizeof(occurrence), key);
+        auto [it, inserted] = motion_gate.try_emplace(gate_key, MotionGate{prep.palette, frame});
+        auto& gate = it.value();
+        const bool moving = !inserted && gate.palette != prep.palette && gate.frame + 1 == frame;
+        gate = {prep.palette, frame};
         if (!moving) {
             return prep; // valid = false: camera motion is right for it
         }

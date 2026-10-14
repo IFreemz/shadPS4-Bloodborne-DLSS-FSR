@@ -235,6 +235,7 @@ public:
     };
     struct Stats {
         uint64_t draws{}, stored{}, loaded{}, unmatched{}, exhausted{}, invalid{}, still{};
+        uint64_t instanced{};
     } stats;
 
     // A small skeleton (weapon, prop; most are static world pieces) only needs history
@@ -275,6 +276,13 @@ public:
         if (!count || uint64_t(draw.vertices.first) + draw.vertices.count - 1 > INT32_MAX ||
             uint64_t(draw.first_instance) + draw.instances > UINT32_MAX) {
             ++stats.invalid;
+            return {};
+        }
+        // Instanced draws (rows of lamp posts, railing pieces): the game culls the instance
+        // list, so instance k this frame is often another copy than instance k last frame and
+        // would load that copy's positions. Camera motion is right for them; nothing stored.
+        if (draw.instances > 1) {
+            ++stats.instanced;
             return {};
         }
         const auto* prev = previous.find(key);
