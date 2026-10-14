@@ -1182,6 +1182,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_hdr_mod.h
                src/video_core/renderer_vulkan/vk_hdr_meter.cpp
                src/video_core/renderer_vulkan/vk_hdr_meter.h
+               src/video_core/renderer_vulkan/vk_retro_hdr.cpp
+               src/video_core/renderer_vulkan/vk_retro_hdr.h
                src/video_core/renderer_vulkan/vk_fsr_upscaler.cpp
                src/video_core/renderer_vulkan/vk_fsr4_addon.cpp
                src/video_core/renderer_vulkan/vk_fsr4_addon.h
