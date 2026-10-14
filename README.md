@@ -5,20 +5,20 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # shadPS4 Bloodborne DLSS & FSR
 
-> **New: [1.9.0-pre.3 (experimental)](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.9.0-pre.3).** It has @eFMann's threaded renderer and frame pacing work, for smoother and faster Bloodborne, and VRAM cleanup against VRAM filling up in long sessions (started by @Cainhurst27 (u/EnglishDave_), now with @eFMann's second round). Its settings are in game under **F3 → Graphics → Bloodborne - Experimental**, all on by default. Please try it and tell us in the [issues](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues) how it runs on your setup. The stable version is [1.8.6](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.8.6), which fixes upscaling in Ebrietas' room and outside Oedon Chapel.
+> **New: [2.0.0](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.0) is built on shadPS4 0.20.0.** Same DLSS / FSR / frame generation as 1.8.6, on the new shadPS4 base. The next experimental (2.1.0-pre.1, continuing 1.9.0-pre) is coming very soon, with @eFMann's threaded renderer and frame pacing work and the VRAM cleanup by @Cainhurst27 (u/EnglishDave_) and @eFMann, moved onto 0.20.0. Until then, [1.9.0-pre.3](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.9.0-pre.3) is the latest experimental.
 
 Temporal upscaling for Bloodborne on [shadPS4](https://github.com/shadps4-emu/shadPS4): NVIDIA
 DLSS on GeForce RTX cards, AMD FSR 3.1 on everything else, plus frame generation (DLSS on RTX 40
 and 50 series, up to 4x on RTX 50; FSR on every other GPU).
 
-This is a modified shadPS4 0.19.0. The game renders at the resolution set by its resolution patch
+This is a modified shadPS4 0.20.0. The game renders at the resolution set by its resolution patch
 (say 2560x1440) and is upscaled to your window (say 3840x2160). It is real temporal upscaling: the
 scene is jittered and the upscaler gets depth plus camera and character motion, so it rebuilds
 detail instead of sharpening a stretched image. The HUD is drawn on top afterwards and stays
 crisp.
 
 DLSS looks better, especially from low render resolutions; FSR 3.1 runs on any GPU. Without the
-upscaler DLLs the build behaves exactly like shadPS4 0.19.0.
+upscaler DLLs the build behaves exactly like shadPS4 0.20.0.
 
 | 1280x720, DLSS off | 1280x720 upscaled to 3840x2160 with DLSS |
 |---|---|
@@ -354,7 +354,7 @@ camera matrices live and which passes write motion data.
 
 **Linux or Steam Deck?** No, Windows only for now.
 
-**Is this an official shadPS4 release?** No, it is a separate build based on shadPS4 0.19.0.
+**Is this an official shadPS4 release?** No, it is a separate build based on shadPS4 0.20.0.
 Please report problems here, not to the shadPS4 team.
 
 ## How it works
