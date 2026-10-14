@@ -133,6 +133,14 @@ public:
         return vk12_features.shaderInt8;
     }
 
+    bool IsMaintenance5Supported() const {
+        return maintenance_5;
+    }
+
+    bool IsMaintenance6Supported() const {
+        return maintenance_6;
+    }
+
     /// Returns true if VK_KHR_maintenance8 is supported
     bool IsMaintenance8Supported() const {
         return maintenance_8;
@@ -555,6 +563,7 @@ private:
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
     bool maintenance_5{};
+    bool maintenance_6{};
     bool maintenance_8{};
     bool full_screen_exclusive{};
     bool attachment_feedback_loop{};

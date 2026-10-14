@@ -34,8 +34,14 @@ int SettingsWindow::GetComboIndex(std::string selection, std::vector<std::string
 }
 
 void SettingsWindow::LoadSettings(std::string profile) {
+    // Global-only settings
+    EmulatorSettings.Load();
+    scanDepthSetting = EmulatorSettings.GetBigPictureFolderDepth();
+
     const bool isSpecific = currentProfile != "Global";
-    isSpecific ? EmulatorSettings.Load(profile) : EmulatorSettings.Load();
+    if (isSpecific) {
+        EmulatorSettings.Load(profile);
+    }
 
     /////////// General Tab
     int languageIndex = EmulatorSettings.GetConsoleLanguage();
@@ -45,7 +51,6 @@ void SettingsWindow::LoadSettings(std::string profile) {
             language = key;
         }
     }
-
     consoleLanguageSetting = GetComboIndex(language, languageOptions);
     volumeSetting = EmulatorSettings.GetVolumeSlider();
     showSplashSetting = EmulatorSettings.IsShowSplash();
@@ -520,8 +525,10 @@ void SettingsWindow::DrawProfileSelector() {
             }
 
             ImGui::TableNextColumn();
-            std::string profileLabel =
-                i == 0 ? "Global" : profileIcons[i].serial + " - " + profileIcons[i].title;
+            std::string profileLabel = i == 0
+                                           ? "Global"
+                                           : profileIcons[i].serial + " - " +
+                                                 profileIcons[i].title + "##" + std::to_string(i);
             if (ImGui::Button(profileLabel.c_str(),
                               ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
 
@@ -601,6 +608,29 @@ void SettingsWindow::DrawGameFolderManager() {
         ImGui::SetNextWindowPos(viewport->Pos);
         ImGui::SetNextWindowSize(viewport->Size);
     }
+
+    float buttonWidth = ImGui::GetItemRectSize().x;
+    ImGui::PushItemWidth(buttonWidth);
+    if (ImGui::SliderInt("Folder Scan Depth", &scanDepthSetting, 0, 5)) {
+        std::string profile;
+        const bool isGlobal = currentProfile == "Global";
+        if (!isGlobal) {
+            profile = currentProfile.substr(0, 9);
+            EmulatorSettings.Load();
+        }
+
+        EmulatorSettings.SetBigPictureFolderDepth(scanDepthSetting);
+        EmulatorSettings.Save();
+
+        if (!isGlobal) {
+            EmulatorSettings.Load(profile);
+        }
+
+        if (!isGameRunning) {
+            GetProfileInfo();
+        }
+    }
+    ImGui::PopItemWidth();
 
     if (ImGuiFileDialog::Instance()->Display("OpenFolder", child_flags | ImGuiWindowFlags_NoMove)) {
         if (ImGuiFileDialog::Instance()->IsOk()) {
