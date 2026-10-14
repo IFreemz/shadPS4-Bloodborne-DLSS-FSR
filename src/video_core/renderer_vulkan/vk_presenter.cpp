@@ -28,6 +28,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_retro_hdr.h"
 #include "video_core/texture_cache/image.h"
 
 #include <algorithm>
@@ -1018,6 +1019,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_settings.srgb_input =
         dlss_output.has_value() ||
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    // The HUD-less frame below goes through the same settings, so frame generation sees one look.
+    const auto retro_hdr = RetroHdr::Poll();
+    pp_settings.retro_mode = retro_hdr.mode;
+    pp_settings.retro_brightness = retro_hdr.brightness;
+    pp_settings.retro_sdr_white = retro_hdr.sdr_white;
     pp_pass.Render(cmdbuf, image_view, source_size, *frame, pp_settings);
 
     // FSR frame generation: the same frame without the game's HUD, through the same pass.
