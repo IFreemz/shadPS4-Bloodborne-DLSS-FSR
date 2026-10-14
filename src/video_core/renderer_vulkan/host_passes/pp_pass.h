@@ -18,6 +18,9 @@ public:
         float gamma = 1.0f;
         u32 hdr = 0;
         u32 srgb_input = 0;
+        u32 retro_mode = 0;
+        float retro_brightness = 1.0f;
+        float retro_sdr_white = 1.0f;
     };
 
     void Create(vk::Device device, vk::Format surface_format);
