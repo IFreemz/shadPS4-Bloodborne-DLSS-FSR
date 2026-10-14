@@ -779,8 +779,14 @@ void EmitContext::DefineOutputs() {
 
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
+    // Only motion shaders declare motion_param (the last member): every other shader keeps the
+    // exact SPIR-V of builds without character motion, which HDR mods such as RenoDX identify
+    // shaders by.
     const Id struct_type{Name(
-        TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], U32[2]), "AuxData")};
+        VertexMotion()
+            ? TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], U32[2])
+            : TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]),
+        "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
     MemberName(struct_type, PushData::YOffsetIndex, "yoffset");
@@ -796,8 +802,10 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 16U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
-    MemberName(struct_type, PushData::MotionParamIndex, "motion_param");
-    MemberDecorate(struct_type, PushData::MotionParamIndex, spv::Decoration::Offset, 56U);
+    if (VertexMotion()) {
+        MemberName(struct_type, PushData::MotionParamIndex, "motion_param");
+        MemberDecorate(struct_type, PushData::MotionParamIndex, spv::Decoration::Offset, 56U);
+    }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
