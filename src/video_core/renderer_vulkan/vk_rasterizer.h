@@ -16,8 +16,8 @@
 #include "video_core/amdgpu/regs.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
-#include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
+#include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -257,15 +257,15 @@ private:
     /// Character motion inputs of a skinned draw that need no history: worked out on stage A
     /// with the threaded renderer, so the draw recorder only does the bookkeeping.
     struct MotionPrep {
-        u64 geometry;      ///< hash of the vertex stream V#s
-        u64 palette;       ///< hash of small bone palettes (gated draws)
+        u64 geometry; ///< hash of the vertex stream V#s
+        u64 palette;  ///< hash of small bone palettes (gated draws)
         VAddr index_address;
         u32 vertex_offset, instance_offset;
         u32 index_size, num_indices, num_instances;
-        u64 topology;      ///< hash of the index list
+        u64 topology;              ///< hash of the index list
         Motion::VertexRange range; ///< vertices the draw references
-        bool gated;        ///< no character-size skeleton: history only while bones move
-        bool valid;        ///< false: no motion for this draw (still, or no usable indices)
+        bool gated;                ///< no character-size skeleton: history only while bones move
+        bool valid;                ///< false: no motion for this draw (still, or no usable indices)
     };
     MotionPrep ComputeMotionPrep(const GraphicsPipeline* pipeline, bool is_indexed,
                                  u32 index_offset);

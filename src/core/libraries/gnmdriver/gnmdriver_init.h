@@ -60,7 +60,7 @@ constexpr std::array InitSequence175{
     // A fake preamble to mimic context reset sent by FW
     0xc0001200u, 0u, // IT_CLEAR_STATE
 
-    // Actual init state sequence 
+    // Actual init state sequence
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x215u, 0u,
@@ -106,7 +106,7 @@ constexpr std::array InitSequence200{
     // A fake preamble to mimic context reset sent by FW
     0xc0001200u, 0u, // IT_CLEAR_STATE
 
-    // Actual init state sequence    
+    // Actual init state sequence
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x215u, 0u,
@@ -255,7 +255,7 @@ constexpr std::array InitSequence350{
     // A fake preamble to mimic context reset sent by FW
     0xc0001200u, 0u, // IT_CLEAR_STATE
 
-    // Actual init state sequence    
+    // Actual init state sequence
     0xc0017600u, 0x216u, 0xffffffffu,
     0xc0017600u, 0x217u, 0xffffffffu,
     0xc0017600u, 0x215u, 0u,

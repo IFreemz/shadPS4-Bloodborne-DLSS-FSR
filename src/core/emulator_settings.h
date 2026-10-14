@@ -490,8 +490,7 @@ struct GPUSettings {
                                        &GPUSettings::bb_background_texture_copies),
             make_override<GPUSettings>("bb_vram_budget_test_mb",
                                        &GPUSettings::bb_vram_budget_test_mb),
-            make_override<GPUSettings>("bb_geometry_in_place",
-                                       &GPUSettings::bb_geometry_in_place),
+            make_override<GPUSettings>("bb_geometry_in_place", &GPUSettings::bb_geometry_in_place),
         };
     }
 };

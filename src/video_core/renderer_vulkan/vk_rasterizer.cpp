@@ -30,10 +30,10 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
-#include <vk_mem_alloc.h>
-#include <xxhash.h>
 #include <mutex>
 #include <unordered_set>
+#include <vk_mem_alloc.h>
+#include <xxhash.h>
 
 namespace Vulkan {
 
@@ -317,9 +317,9 @@ Rasterizer::MotionPrep Rasterizer::ComputeMotionPrep(const GraphicsPipeline* pip
     prep.geometry = XXH3_64bits(streams.data(), num_streams * sizeof(AmdGpu::Buffer));
     std::tie(prep.vertex_offset, prep.instance_offset) = GetDrawOffsets(regs, vs, fetch);
     prep.index_size = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
-    prep.index_address = is_indexed ? regs.index_base_address.Address<VAddr>() +
-                                          u64(index_offset) * prep.index_size
-                                    : 0;
+    prep.index_address =
+        is_indexed ? regs.index_base_address.Address<VAddr>() + u64(index_offset) * prep.index_size
+                   : 0;
     prep.num_indices = regs.num_indices;
     prep.num_instances = regs.num_instances.NumInstances();
     prep.gated = true;
@@ -347,7 +347,7 @@ Rasterizer::MotionPrep Rasterizer::ComputeMotionPrep(const GraphicsPipeline* pip
     // Small skeletons (weapons, props, mostly static world pieces) only get history while
     // their bone palette differs from the last time this draw was seen.
     if (prep.gated) {
-        const std::array<u64, 6> identity{vs.pgm_hash,       prep.geometry,
+        const std::array<u64, 6> identity{vs.pgm_hash,        prep.geometry,
                                           prep.index_address, prep.num_indices,
                                           prep.num_instances, prep.instance_offset};
         const u64 key = XXH3_64bits(identity.data(), sizeof(identity));
@@ -380,8 +380,8 @@ Rasterizer::MotionPrep Rasterizer::ComputeMotionPrep(const GraphicsPipeline* pip
         }
         const bool restart = (regs.enable_primitive_restart & 1) != 0;
         const s32 base = s32(prep.vertex_offset);
-        const auto scanned = motion_index_ranges.Get(
-            {index_address, count, index_size, base, restart}, frame, [&] {
+        const auto scanned =
+            motion_index_ranges.Get({index_address, count, index_size, base, restart}, frame, [&] {
                 const auto* data = reinterpret_cast<const void*>(index_address);
                 const auto scan_range =
                     index_size == 2
@@ -1607,7 +1607,8 @@ static void NoteHleReject(const char* kind, u64 hash, const std::string& reason)
     static std::mutex mutex;
     static std::unordered_set<u64> seen;
     std::scoped_lock lock{mutex};
-    const u64 key = hash ^ (std::hash<std::string>{}(reason) * 31) ^ std::hash<std::string_view>{}(kind);
+    const u64 key =
+        hash ^ (std::hash<std::string>{}(reason) * 31) ^ std::hash<std::string_view>{}(kind);
     if (seen.size() < 256 && seen.insert(key).second) {
         LOG_INFO(Render_Vulkan, "[HLE check] {} cs {:08x}: {}", kind, hash, reason);
     }
@@ -1675,8 +1676,8 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     if (buf0.GetSize() != buf1.GetSize() || cs_pgm.dim_x != (buf0.GetSize() / 256)) {
         if (diag) {
             NoteHleReject("copy", hash,
-                          fmt::format("sizes {:#x}/{:#x} groups {}", buf0.GetSize(),
-                                      buf1.GetSize(), cs_pgm.dim_x));
+                          fmt::format("sizes {:#x}/{:#x} groups {}", buf0.GetSize(), buf1.GetSize(),
+                                      cs_pgm.dim_x));
         }
         return false;
     }
@@ -1721,9 +1722,8 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
         const VAddr tail = dst_buf.base_address + image0.info.guest_size;
         const u64 tail_size = buf0.GetSize() - image0.info.guest_size;
         bool tail_used = false;
-        texture_cache.ForEachImageInRegion(tail, tail_size, [&](VideoCore::ImageId, auto&) {
-            tail_used = true;
-        });
+        texture_cache.ForEachImageInRegion(tail, tail_size,
+                                           [&](VideoCore::ImageId, auto&) { tail_used = true; });
         size_ok = !tail_used;
     }
     if (image0.info.guest_size != image1.info.guest_size ||
@@ -1738,9 +1738,10 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
         return false;
     }
     if (diag) {
-        NoteHleReject("copy", hash, fmt::format("done as an image copy: {} -> {}",
-                                               DescribeImage(desc0.is_written ? image1 : image0),
-                                               DescribeImage(desc0.is_written ? image0 : image1)));
+        NoteHleReject("copy", hash,
+                      fmt::format("done as an image copy: {} -> {}",
+                                  DescribeImage(desc0.is_written ? image1 : image0),
+                                  DescribeImage(desc0.is_written ? image0 : image1)));
     }
 
     // Perform image copy
@@ -1790,9 +1791,9 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         texture_cache.FindImageFromRange(buf1.base_address, buf1.GetSize(), false);
     if (!image1_id) {
         if (diag) {
-            NoteHleReject("clear", info.pgm_hash,
-                          fmt::format("no image at {:#x} size {:#x}", buf1.base_address,
-                                      buf1.GetSize()));
+            NoteHleReject(
+                "clear", info.pgm_hash,
+                fmt::format("no image at {:#x} size {:#x}", buf1.base_address, buf1.GetSize()));
         }
         return false;
     }
@@ -2062,10 +2063,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     const auto new_layout = image.info.props.is_depth
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
-                    needs_barrier |= runtime.Transit(&image, new_layout,
-                                                     vk::PipelineStageFlagBits2::eAllCommands,
-                                                     vk::AccessFlagBits2::eShaderRead,
-                                                     entry.view_info.range);
+                    needs_barrier |= runtime.Transit(
+                        &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eShaderRead, entry.view_info.range);
                     image.usage.texture = 1u;
                     temporal_dlss.ObserveTexture(image, entry.id, entry.view_info, stage.pgm_hash,
                                                  i);
@@ -2265,8 +2265,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
             if (set_ok && slot < resolved.size()) {
-                resolved[slot] = {image_id, *image_view.image_view, image.backing,
-                                  desc.view_info};
+                resolved[slot] = {image_id, *image_view.image_view, image.backing, desc.view_info};
                 set_ok = !is_storage && !binding.force_general && !binding.is_target;
             }
             ProfileLap(Section::TexLayout);
@@ -3214,8 +3213,8 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
         static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().motion_vectors;
     MotionPrep motion_prep{};
     if (motion_prepared) {
-        motion_prep = ComputeMotionPrep(static_cast<const GraphicsPipeline*>(pipeline),
-                                        is_indexed, index_offset);
+        motion_prep = ComputeMotionPrep(static_cast<const GraphicsPipeline*>(pipeline), is_indexed,
+                                        index_offset);
     }
     // Storage buffers this draw writes: later prefetches must not read them early.
     {

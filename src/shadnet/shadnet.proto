@@ -574,7 +574,7 @@ message NotifyRoomMessage {
     bytes msg = 10;
 }
 
-// Title User Storage (TUS) 
+// Title User Storage (TUS)
 
 message TusVariable {
     string ownerNpId                  = 1;
@@ -746,7 +746,7 @@ message TssGetDataRequest {
 }
 
 message TssGetDataResponse {
-    
+
     int32  statusCodeType = 1; // OrbisNpTssStatusCodeType: 0 = OK, 1 = PARTIAL, 2 = NOT_MODIFIED.
     uint64 lastModified   = 2; // seconds since epoch, 0 when the file is absent
     uint64 contentLength  = 3; // size the client should expect for this status
@@ -776,5 +776,5 @@ message SyncTrophiesReply {
 }
 
 message SetClientVersionRequest {
-    string version = 1; 
+    string version = 1;
 }

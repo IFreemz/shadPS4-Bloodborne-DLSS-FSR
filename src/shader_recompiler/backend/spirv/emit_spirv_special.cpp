@@ -76,14 +76,14 @@ static void EmitVertexMotion(EmitContext& ctx) {
     const Id u32_type = ctx.U32[1];
     const Id bool_type = ctx.U1[1];
     const Id position = ctx.OpLoad(ctx.F32[4], ctx.output_position);
-    const Id param_ptr = ctx.OpAccessChain(
-        ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[2]), ctx.push_data_block,
-        ctx.ConstU32(PushData::MotionParamIndex));
+    const Id param_ptr =
+        ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[2]),
+                          ctx.push_data_block, ctx.ConstU32(PushData::MotionParamIndex));
     const Id param_words = ctx.OpLoad(ctx.U32[2], param_ptr);
     const auto to_u64 = [&](Id lo, Id hi) {
-        return ctx.OpBitwiseOr(ctx.U64, ctx.OpUConvert(ctx.U64, lo),
-                               ctx.OpShiftLeftLogical(ctx.U64, ctx.OpUConvert(ctx.U64, hi),
-                                                      ctx.ConstU32(32U)));
+        return ctx.OpBitwiseOr(
+            ctx.U64, ctx.OpUConvert(ctx.U64, lo),
+            ctx.OpShiftLeftLogical(ctx.U64, ctx.OpUConvert(ctx.U64, hi), ctx.ConstU32(32U)));
     };
     const Id param_address = to_u64(ctx.OpCompositeExtract(u32_type, param_words, 0u),
                                     ctx.OpCompositeExtract(u32_type, param_words, 1u));
@@ -91,10 +91,11 @@ static void EmitVertexMotion(EmitContext& ctx) {
     const Id f32x4_ptr = ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, ctx.F32[4]);
     const Id addresses = ctx.OpLoad(ctx.U32[4], ctx.OpConvertUToPtr(u32x4_ptr, param_address),
                                     spv::MemoryAccessMask::Aligned, 16u);
-    const Id ranges = ctx.OpLoad(
-        ctx.U32[4],
-        ctx.OpConvertUToPtr(u32x4_ptr, ctx.OpIAdd(ctx.U64, param_address, ctx.Constant(ctx.U64, u64(16)))),
-        spv::MemoryAccessMask::Aligned, 16u);
+    const Id ranges =
+        ctx.OpLoad(ctx.U32[4],
+                   ctx.OpConvertUToPtr(u32x4_ptr, ctx.OpIAdd(ctx.U64, param_address,
+                                                             ctx.Constant(ctx.U64, u64(16)))),
+                   spv::MemoryAccessMask::Aligned, 16u);
     const Id store_address = to_u64(ctx.OpCompositeExtract(u32_type, addresses, 0u),
                                     ctx.OpCompositeExtract(u32_type, addresses, 1u));
     const Id load_address = to_u64(ctx.OpCompositeExtract(u32_type, addresses, 2u),
@@ -104,18 +105,17 @@ static void EmitVertexMotion(EmitContext& ctx) {
     const Id first_instance = ctx.OpCompositeExtract(u32_type, ranges, 2u);
     const Id instances = ctx.OpCompositeExtract(u32_type, ranges, 3u);
     const Id vertex = ctx.OpISub(u32_type, ctx.OpLoad(u32_type, ctx.vertex_index), first_vertex);
-    const Id instance =
-        ctx.OpISub(u32_type, ctx.OpLoad(u32_type, ctx.instance_id), first_instance);
+    const Id instance = ctx.OpISub(u32_type, ctx.OpLoad(u32_type, ctx.instance_id), first_instance);
     const Id in_range = ctx.OpLogicalAnd(bool_type, ctx.OpULessThan(bool_type, vertex, vertices),
                                          ctx.OpULessThan(bool_type, instance, instances));
     const Id slot = ctx.OpIAdd(u32_type, vertex, ctx.OpIMul(u32_type, instance, vertices));
-    const Id slot_offset = ctx.OpIMul(ctx.U64, ctx.OpUConvert(ctx.U64, slot),
-                                      ctx.Constant(ctx.U64, u64(16)));
+    const Id slot_offset =
+        ctx.OpIMul(ctx.U64, ctx.OpUConvert(ctx.U64, slot), ctx.Constant(ctx.U64, u64(16)));
     const Id zero64 = ctx.Constant(ctx.U64, u64(0));
-    const Id do_store = ctx.OpLogicalAnd(bool_type, in_range,
-                                         ctx.OpINotEqual(bool_type, store_address, zero64));
-    const Id do_load = ctx.OpLogicalAnd(bool_type, in_range,
-                                        ctx.OpINotEqual(bool_type, load_address, zero64));
+    const Id do_store =
+        ctx.OpLogicalAnd(bool_type, in_range, ctx.OpINotEqual(bool_type, store_address, zero64));
+    const Id do_load =
+        ctx.OpLogicalAnd(bool_type, in_range, ctx.OpINotEqual(bool_type, load_address, zero64));
 
     const Id store_label = ctx.OpLabel();
     const Id store_merge = ctx.OpLabel();
@@ -138,10 +138,9 @@ static void EmitVertexMotion(EmitContext& ctx) {
     ctx.OpSelectionMerge(load_merge, spv::SelectionControlMask::MaskNone);
     ctx.OpBranchConditional(do_load, load_label, load_merge);
     ctx.AddLabel(load_label);
-    const Id loaded =
-        ctx.OpLoad(ctx.F32[4],
-                   ctx.OpConvertUToPtr(f32x4_ptr, ctx.OpIAdd(ctx.U64, load_address, slot_offset)),
-                   spv::MemoryAccessMask::Aligned, 16u);
+    const Id loaded = ctx.OpLoad(
+        ctx.F32[4], ctx.OpConvertUToPtr(f32x4_ptr, ctx.OpIAdd(ctx.U64, load_address, slot_offset)),
+        spv::MemoryAccessMask::Aligned, 16u);
     ctx.OpBranch(load_merge);
     ctx.AddLabel(load_merge);
     Id previous = ctx.OpPhi(ctx.F32[4], position, store_merge, loaded, load_label);
@@ -160,10 +159,9 @@ static void EmitFragmentMotion(EmitContext& ctx) {
     const Id current = ctx.OpLoad(ctx.F32[4], ctx.motion_in_cur);
     const Id previous = ctx.OpLoad(ctx.F32[4], ctx.motion_in_prev);
     const auto push = [&](u32 index) {
-        return ctx.OpLoad(f32_type,
-                          ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant,
-                                                            f32_type),
-                                            ctx.push_data_block, ctx.ConstU32(index)));
+        return ctx.OpLoad(
+            f32_type, ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, f32_type),
+                                        ctx.push_data_block, ctx.ConstU32(index)));
     };
     const Id xscale = push(PushData::XScaleIndex);
     const Id yscale = push(PushData::YScaleIndex);
@@ -183,8 +181,7 @@ static void EmitFragmentMotion(EmitContext& ctx) {
         ctx.OpFOrdGreaterThan(bool_type, ctx.OpCompositeExtract(f32_type, current, 3u), epsilon));
     const Id valid =
         ctx.OpSelect(f32_type, front, ctx.OpCompositeExtract(f32_type, previous, 2u), zero);
-    const Id depth =
-        ctx.OpCompositeExtract(f32_type, ctx.OpLoad(ctx.F32[4], ctx.frag_coord), 2u);
+    const Id depth = ctx.OpCompositeExtract(f32_type, ctx.OpLoad(ctx.F32[4], ctx.frag_coord), 2u);
     ctx.OpStore(ctx.motion_frag_out,
                 ctx.OpCompositeConstruct(ctx.F32[4],
                                          std::array<Id, 4>{ctx.OpSelect(f32_type, front, dx, zero),

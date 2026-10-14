@@ -431,8 +431,8 @@ bool PipelineCache::RefreshGraphicsKey() {
             bound += (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) ? 1 : 0;
         }
         motion_possible = bound >= 5 && !regs.color_buffers[Shader::MotionVectors::Output] &&
-                          regs.depth_buffer.DepthValid() &&
-                          regs.depth_buffer.NumSamples() == 1 && !regs.IsClipDisabled() &&
+                          regs.depth_buffer.DepthValid() && regs.depth_buffer.NumSamples() == 1 &&
+                          !regs.IsClipDisabled() &&
                           regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs;
     }
     motion_select = false;
@@ -546,11 +546,10 @@ bool PipelineCache::RefreshGraphicsKey() {
         color_buffer.num_format = AmdGpu::NumberFormat::Float;
         color_buffer.swizzle = AmdGpu::IdentityMapping;
         key.blend_controls[mv] = {};
-        key.write_masks[mv] = motion_select
-                                  ? vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-                                        vk::ColorComponentFlagBits::eB |
-                                        vk::ColorComponentFlagBits::eA
-                                  : vk::ColorComponentFlags{};
+        key.write_masks[mv] =
+            motion_select ? vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                                vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
+                          : vk::ColorComponentFlags{};
         key.color_samples[mv] = 1;
     }
     motion_select = false;

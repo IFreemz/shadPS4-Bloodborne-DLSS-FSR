@@ -24,9 +24,9 @@
 #include "video_core/host_shaders/bb_dlss_motion_comp.h"
 #include "video_core/host_shaders/bb_dlss_sharpen_hdr_comp.h"
 #include "video_core/host_shaders/bb_hudless_dim_comp.h"
+#include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_resolution.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
-#include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_fsr4_addon.h"
@@ -1386,8 +1386,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         push.jitter[0] = applied[0];
         push.jitter[1] = applied[1];
         push.use_mirror = use_mirror ? 1u : 0u;
-        push.flags = (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u) |
-                     (character_valid ? 4u : 0u);
+        push.flags =
+            (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u) | (character_valid ? 4u : 0u);
         command.bindPipeline(vk::PipelineBindPoint::eCompute, *motion_pass->pipeline);
         command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *motion_pass->layout, 0,
                                      writes);

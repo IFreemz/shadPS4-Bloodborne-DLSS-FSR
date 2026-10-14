@@ -1,3 +1,4 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Character motion vector bookkeeping, from bbport (gpu/shadps4/video_core/renderer_vulkan/
 // motion_history.h).
@@ -22,7 +23,8 @@ struct VertexRange {
 // Reserve only the vertices referenced by this draw, not the whole shared vertex buffer.
 // Primitive restart markers are not vertex shader invocations. Reject signed overflow.
 template <class Index, size_t Extent>
-VertexRange IndexedRange(std::span<const Index, Extent> indices, int32_t base_vertex, bool restart) {
+VertexRange IndexedRange(std::span<const Index, Extent> indices, int32_t base_vertex,
+                         bool restart) {
     uint32_t lo = UINT32_MAX, hi = 0;
     for (const auto index : indices) {
         if (restart && index == std::numeric_limits<Index>::max()) {
@@ -31,8 +33,7 @@ VertexRange IndexedRange(std::span<const Index, Extent> indices, int32_t base_ve
         lo = std::min(lo, uint32_t(index));
         hi = std::max(hi, uint32_t(index));
     }
-    if (lo > hi || int64_t(lo) + base_vertex < 0 ||
-        int64_t(hi) + base_vertex > INT32_MAX) {
+    if (lo > hi || int64_t(lo) + base_vertex < 0 || int64_t(hi) + base_vertex > INT32_MAX) {
         return {};
     }
     return {uint32_t(int64_t(lo) + base_vertex), hi - lo + 1};
@@ -84,8 +85,8 @@ public:
         }
         ++stats.scans;
         const Result fresh = scan();
-        if (entry.valid && (fresh.topology != entry.result.topology ||
-                            !(fresh.range == entry.result.range))) {
+        if (entry.valid &&
+            (fresh.topology != entry.result.topology || !(fresh.range == entry.result.range))) {
             ++stats.stale; // the cached result was wrong for up to Revalidate frames
         }
         entry.result = fresh;
@@ -94,9 +95,12 @@ public:
         return entry.result;
     }
     void Trim(uint64_t frame) {
-        std::erase_if(entries, [frame](const auto& e) { return frame - e.second.last_use > Unused; });
+        std::erase_if(entries,
+                      [frame](const auto& e) { return frame - e.second.last_use > Unused; });
     }
-    size_t Size() const { return entries.size(); }
+    size_t Size() const {
+        return entries.size();
+    }
 
 private:
     struct Entry {
@@ -274,8 +278,8 @@ public:
             return {};
         }
         const auto* prev = previous.find(key);
-        Allocation result{0, 0, draw.vertices.count, draw.instances,
-                          draw.vertices.first, draw.first_instance};
+        Allocation result{
+            0, 0, draw.vertices.count, draw.instances, draw.vertices.first, draw.first_instance};
         if (prev) {
             result.load = *prev;
             ++stats.loaded;
@@ -293,7 +297,9 @@ public:
         return result;
     }
 
-    uint32_t Used() const { return used; }
+    uint32_t Used() const {
+        return used;
+    }
 
 private:
     struct Key {
@@ -304,11 +310,20 @@ private:
     struct Hash {
         size_t operator()(const Key& key) const {
             uint64_t h = 0;
-            const auto mix = [&](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+            const auto mix = [&](uint64_t v) {
+                h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            };
             const auto& d = key.draw;
-            mix(d.shader); mix(d.geometry); mix(d.indices); mix(d.topology);
-            mix(d.index_count); mix(d.instances); mix(d.first_instance);
-            mix(d.vertices.first); mix(d.vertices.count); mix(key.occurrence);
+            mix(d.shader);
+            mix(d.geometry);
+            mix(d.indices);
+            mix(d.topology);
+            mix(d.index_count);
+            mix(d.instances);
+            mix(d.first_instance);
+            mix(d.vertices.first);
+            mix(d.vertices.count);
+            mix(key.occurrence);
             return size_t(h);
         }
     };
@@ -318,9 +333,16 @@ private:
     struct GateHash {
         size_t operator()(const GateKey& key) const {
             uint64_t h = 0;
-            const auto mix = [&](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
-            mix(key.shader); mix(key.geometry); mix(key.indices); mix(key.index_count);
-            mix(key.instances); mix(key.first_instance); mix(key.occurrence);
+            const auto mix = [&](uint64_t v) {
+                h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            };
+            mix(key.shader);
+            mix(key.geometry);
+            mix(key.indices);
+            mix(key.index_count);
+            mix(key.instances);
+            mix(key.first_instance);
+            mix(key.occurrence);
             return size_t(h);
         }
     };
