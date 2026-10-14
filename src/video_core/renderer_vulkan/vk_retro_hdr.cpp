@@ -4,6 +4,7 @@
 #include "video_core/renderer_vulkan/vk_retro_hdr.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -17,12 +18,9 @@
 #include "video_core/renderer_vulkan/vk_hdr_mod.h"
 
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
 #include <vector>
-#include <windows.h>
-// After windows.h.
 #include <dxgi1_6.h>
+#include <windows.h>
 #endif
 
 namespace Vulkan::RetroHdr {
@@ -61,10 +59,6 @@ struct Settings {
     float peak_override{};
 };
 
-float FiniteOr(float value, float fallback) {
-    return std::isfinite(value) ? value : fallback;
-}
-
 Settings ReadSettings() {
     Settings settings;
     std::ifstream file{BbDlssSettingsPath()};
@@ -77,9 +71,9 @@ Settings ReadSettings() {
         if (key == "retro_hdr")
             settings.enabled = std::atoi(value.c_str()) != 0;
         else if (key == "retro_hdr_brightness")
-            settings.brightness = FiniteOr(float(std::atof(value.c_str())), DefaultBrightness);
+            settings.brightness = ParseFloat(value, DefaultBrightness);
         else if (key == "retro_hdr_peak")
-            settings.peak_override = FiniteOr(float(std::atof(value.c_str())), 0.0f);
+            settings.peak_override = ParseFloat(value, 0.0f);
     }
     return settings;
 }
@@ -139,10 +133,9 @@ std::optional<Display> QueryDisplay(HWND window) {
         return std::nullopt;
     std::optional<Display> display;
     IDXGIAdapter1* adapter{};
-    for (UINT a = 0; !display && factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; ++a) {
+    for (UINT a = 0; !display && SUCCEEDED(factory->EnumAdapters1(a, &adapter)); ++a) {
         IDXGIOutput* output{};
-        for (UINT o = 0; !display && adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND;
-             ++o) {
+        for (UINT o = 0; !display && SUCCEEDED(adapter->EnumOutputs(o, &output)); ++o) {
             IDXGIOutput6* output6{};
             DXGI_OUTPUT_DESC1 desc{};
             if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6),
@@ -195,6 +188,19 @@ bool Start(void* native_window, bool scrgb_supported) {
     LOG_INFO(Render_Vulkan, "RetroHDR: {} (Windows peak {:.0f} nits, SDR white {:.0f} nits)",
              Describe(session.state), session.windows_peak_nits, session.sdr_white_nits);
     return session.state == State::Active;
+}
+
+float ParseFloat(std::string_view value, float fallback) {
+    const char* const end = value.data() + value.size();
+    float parsed{};
+    const auto [stop, error] = std::from_chars(value.data(), end, parsed);
+    if (error != std::errc{} || !std::isfinite(parsed))
+        return fallback;
+    for (const char* c = stop; c != end; ++c) {
+        if (*c != ' ' && *c != '\t' && *c != '\r')
+            return fallback;
+    }
+    return parsed;
 }
 
 const Session& GetSession() {
