@@ -24,6 +24,7 @@
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_hdr_meter.h"
 #include "video_core/renderer_vulkan/vk_hdr_mod.h"
+#include "video_core/renderer_vulkan/vk_retro_hdr.h"
 
 namespace ImGui::Dlss {
 namespace {
@@ -415,6 +416,43 @@ void DlssLayer::Draw() {
                    "trigger it too.\nThe game's performance is the same either way.");
     SameLine();
     TextDisabled("(steady menu backgrounds)");
+
+    SeparatorText("SDR to HDR");
+    namespace RetroHdr = ::Vulkan::RetroHdr;
+    const auto& retro_hdr = RetroHdr::GetSession();
+    BeginDisabled(retro_hdr.state != RetroHdr::State::Active &&
+                  retro_hdr.state != RetroHdr::State::Disabled);
+    bool retro_hdr_on = settings.Get("retro_hdr", "0") != "0";
+    if (Checkbox("SDR to HDR", &retro_hdr_on))
+        settings.Set("retro_hdr", retro_hdr_on ? "1" : "0");
+    SameLine();
+    if (retro_hdr.state == RetroHdr::State::Active)
+        TextDisabled(retro_hdr_on ? "(untick to compare with SDR)" : "(showing SDR)");
+    else if (retro_hdr.state == RetroHdr::State::Disabled)
+        TextDisabled(retro_hdr_on ? "(restart the game to turn it on)"
+                                  : "(Special K style HDR from the SDR image)");
+    else
+        TextDisabled("(%s)", RetroHdr::Describe(retro_hdr.state).data());
+
+    int peak_override = std::atoi(settings.Get("retro_hdr_peak", "0").c_str());
+    const float peak = RetroHdr::PeakNits(float(peak_override));
+    const float max_brightness = RetroHdr::MaxBrightness(peak);
+    float brightness = RetroHdr::ParseFloat(settings.Get("retro_hdr_brightness", "2.00"),
+                                            RetroHdr::DefaultBrightness);
+    brightness = std::clamp(brightness, RetroHdr::MinBrightness, max_brightness);
+    if (SliderFloat("HDR brightness", &brightness, RetroHdr::MinBrightness, max_brightness,
+                    "%.2fx"))
+        settings.Set("retro_hdr_brightness", fmt::format("{:.2f}", brightness));
+    TextDisabled("white %.0f nits, 18%% gray %.0f nits", brightness * RetroHdr::BoostedNits(1.0f),
+                 brightness * RetroHdr::BoostedNits(0.18f));
+    if (SliderInt("HDR peak", &peak_override, 0, 4000, peak_override < 100 ? "auto" : "%d nits"))
+        settings.Set("retro_hdr_peak", std::to_string(peak_override < 100 ? 0 : peak_override));
+    SameLine();
+    if (retro_hdr.windows_peak_nits >= 100.0f)
+        TextDisabled("(Windows reports %.0f nits)", retro_hdr.windows_peak_nits);
+    else
+        TextDisabled("(no Windows value, %.0f nits used)", peak);
+    EndDisabled();
 
     SeparatorText("Resolution");
     TextWrapped("The game's render resolution is upscaled to your shadPS4 window size. The "
