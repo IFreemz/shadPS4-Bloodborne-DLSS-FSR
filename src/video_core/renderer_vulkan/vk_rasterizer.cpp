@@ -32,6 +32,8 @@
 
 #include <vk_mem_alloc.h>
 #include <xxhash.h>
+#include <mutex>
+#include <unordered_set>
 
 namespace Vulkan {
 
@@ -1599,6 +1601,26 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
     return false;
 }
 
+// Diagnostics: why a compute shader that looks like a memory copy or clear of a render target
+// is not turned into an image copy or clear (each reason once per shader).
+static void NoteHleReject(const char* kind, u64 hash, const std::string& reason) {
+    static std::mutex mutex;
+    static std::unordered_set<u64> seen;
+    std::scoped_lock lock{mutex};
+    const u64 key = hash ^ (std::hash<std::string>{}(reason) * 31) ^ std::hash<std::string_view>{}(kind);
+    if (seen.size() < 256 && seen.insert(key).second) {
+        LOG_INFO(Render_Vulkan, "[HLE check] {} cs {:08x}: {}", kind, hash, reason);
+    }
+}
+
+static std::string DescribeImage(const VideoCore::Image& image) {
+    return fmt::format("{}x{} {} bits={} pitch={} guest_size={:#x} tile={} depth={} flags={:#x}",
+                       image.info.size.width, image.info.size.height,
+                       vk::to_string(image.info.pixel_format), image.info.num_bits,
+                       image.info.pitch, image.info.guest_size, u32(image.info.tile_mode),
+                       image.info.props.is_depth ? 1 : 0, u32(image.flags));
+}
+
 bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     if (!pipeline->IsCompute()) {
         return false;
@@ -1607,7 +1629,14 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = CsRegs();
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
+    const bool diag = diagnostics.load(std::memory_order_relaxed);
+    const u64 hash = info.pgm_hash;
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
+        if (diag && (hash == 0x3d5ebf4e || hash == 0x8b355b5a || hash == 0xe2c27f0c)) {
+            NoteHleReject("copy", hash,
+                          fmt::format("threads {} buffers {} images {}", cs_pgm.num_thread_x.full,
+                                      info.buffers.size(), info.images.size()));
+        }
         return false;
     }
 
@@ -1615,6 +1644,11 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     const auto& desc0 = info.buffers[0];
     const auto& desc1 = info.buffers[1];
     if (!desc0.is_formatted || !desc1.is_formatted || desc0.is_written == desc1.is_written) {
+        if (diag && hash == 0x3d5ebf4e) {
+            NoteHleReject("copy", hash,
+                          fmt::format("formatted {}/{} written {}/{}", desc0.is_formatted,
+                                      desc1.is_formatted, desc0.is_written, desc1.is_written));
+        }
         return false;
     }
 
@@ -1622,17 +1656,39 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     const AmdGpu::Buffer buf0 = desc0.GetSharp(info);
     const AmdGpu::Buffer buf1 = desc1.GetSharp(info);
     if (buf0.GetSize() != buf1.GetSize() || cs_pgm.dim_x != (buf0.GetSize() / 256)) {
+        if (diag) {
+            NoteHleReject("copy", hash,
+                          fmt::format("sizes {:#x}/{:#x} groups {}", buf0.GetSize(),
+                                      buf1.GetSize(), cs_pgm.dim_x));
+        }
         return false;
     }
 
     // Find images the buffer alias
     const auto image0_id = texture_cache.FindImageFromRange(buf0.base_address, buf0.GetSize());
     if (!image0_id) {
+        if (diag) {
+            NoteHleReject("copy", hash,
+                          fmt::format("no {} image at buffer 0 {:#x} size {:#x} ({})",
+                                      texture_cache.FindImageFromRange(buf0.base_address,
+                                                                       buf0.GetSize(), false)
+                                          ? "downloadable"
+                                          : "",
+                                      buf0.base_address, buf0.GetSize(),
+                                      desc0.is_written ? "destination" : "source"));
+        }
         return false;
     }
     const auto image1_id =
         texture_cache.FindImageFromRange(buf1.base_address, buf1.GetSize(), false);
     if (!image1_id) {
+        if (diag) {
+            NoteHleReject("copy", hash,
+                          fmt::format("no image at buffer 1 {:#x} size {:#x} ({}); buffer 0: {}",
+                                      buf1.base_address, buf1.GetSize(),
+                                      desc1.is_written ? "destination" : "source",
+                                      DescribeImage(texture_cache.GetImage(image0_id))));
+        }
         return false;
     }
 
@@ -1642,7 +1698,18 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     if (image0.info.guest_size != image1.info.guest_size ||
         image0.info.pitch != image1.info.pitch || image0.info.guest_size != buf0.GetSize() ||
         image0.info.num_bits != image1.info.num_bits) {
+        if (diag) {
+            NoteHleReject("copy", hash,
+                          fmt::format("images differ (buffer size {:#x}): 0 = {}; 1 = {}",
+                                      buf0.GetSize(), DescribeImage(image0),
+                                      DescribeImage(image1)));
+        }
         return false;
+    }
+    if (diag) {
+        NoteHleReject("copy", hash, fmt::format("done as an image copy: {} -> {}",
+                                               DescribeImage(desc0.is_written ? image1 : image0),
+                                               DescribeImage(desc0.is_written ? image0 : image1)));
     }
 
     // Perform image copy
@@ -1675,7 +1742,13 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     const AmdGpu::Buffer buf0 = desc0.GetSharp(info);
     const AmdGpu::Buffer buf1 = desc1.GetSharp(info);
     const u32 buf1_bpp = AmdGpu::NumBitsPerBlock(buf1.GetDataFmt());
+    const bool diag = diagnostics.load(std::memory_order_relaxed);
     if (buf0.GetSize() != 16 || (cs_pgm.dim_x * 128ULL * (buf1_bpp / 8)) != buf1.GetSize()) {
+        if (diag) {
+            NoteHleReject("clear", info.pgm_hash,
+                          fmt::format("sizes {}/{:#x} bpp {} groups {}", buf0.GetSize(),
+                                      buf1.GetSize(), buf1_bpp, cs_pgm.dim_x));
+        }
         return false;
     }
 
@@ -1683,6 +1756,11 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     const auto image1_id =
         texture_cache.FindImageFromRange(buf1.base_address, buf1.GetSize(), false);
     if (!image1_id) {
+        if (diag) {
+            NoteHleReject("clear", info.pgm_hash,
+                          fmt::format("no image at {:#x} size {:#x}", buf1.base_address,
+                                      buf1.GetSize()));
+        }
         return false;
     }
 
@@ -1690,6 +1768,11 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
     if (image1.info.guest_size != buf1.GetSize() || image1.info.num_bits != buf1_bpp ||
         image1.info.props.is_depth) {
+        if (diag) {
+            NoteHleReject("clear", info.pgm_hash,
+                          fmt::format("image differs (size {:#x} bpp {}): {}", buf1.GetSize(),
+                                      buf1_bpp, DescribeImage(image1)));
+        }
         return false;
     }
 
