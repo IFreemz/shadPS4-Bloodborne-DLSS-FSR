@@ -498,7 +498,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 std::pair<const Buffer*, u64> BufferCache::ObtainGeometryBuffer(VAddr device_addr, u32 size) {
     static constexpr u32 CopyBelow = 1_KB;
     if (size < CopyBelow || size > STREAM_THRESHOLD || !Common::BbTuning::Threaded() ||
-        IsRegionCpuModified(device_addr, size)) {
+        !EmulatorSettings.IsBbGeometryInPlace() || IsRegionCpuModified(device_addr, size)) {
         // Small or changed data is copied as before (no upload inside a render pass).
         return ObtainBuffer(device_addr, size, false);
     }

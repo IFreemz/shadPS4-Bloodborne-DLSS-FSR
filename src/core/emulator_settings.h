@@ -446,6 +446,9 @@ struct GPUSettings {
     // Testing: textures copied from guest memory on background threads; the copies are waited
     // for before the GPU submission that reads them and before the guest sees a fence.
     Setting<bool> bb_background_texture_copies{false};
+    // Threaded renderer: clean vertex/index data of 1-16 KiB read where it is in GPU memory
+    // instead of copied for every draw. Off: copied as before.
+    Setting<bool> bb_geometry_in_place{true};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -487,6 +490,8 @@ struct GPUSettings {
                                        &GPUSettings::bb_background_texture_copies),
             make_override<GPUSettings>("bb_vram_budget_test_mb",
                                        &GPUSettings::bb_vram_budget_test_mb),
+            make_override<GPUSettings>("bb_geometry_in_place",
+                                       &GPUSettings::bb_geometry_in_place),
         };
     }
 };
@@ -498,7 +503,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     userfaultfd, inline_fetch_shader, threaded_renderer, threaded_renderer_diagnostics,
     threaded_renderer_gpu_profile, bb_object_motion, bb_readback_queue, bb_streaming,
     bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
-    bb_vram_budget_test_mb, bb_background_texture_copies)
+    bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place)
 
 // -------------------------------
 // Vulkan settings
@@ -778,6 +783,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbVramReclaim, bb_vram_reclaim)
     SETTING_FORWARD_BOOL(m_gpu, BbBufferEviction, bb_buffer_eviction)
     SETTING_FORWARD_BOOL(m_gpu, BbBackgroundTextureCopies, bb_background_texture_copies)
+    SETTING_FORWARD_BOOL(m_gpu, BbGeometryInPlace, bb_geometry_in_place)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 

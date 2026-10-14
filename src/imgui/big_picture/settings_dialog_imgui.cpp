@@ -73,6 +73,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbVramReclaimSetting = EmulatorSettings.IsBbVramReclaim();
     bbBufferEvictionSetting = EmulatorSettings.IsBbBufferEviction();
     bbBackgroundTextureCopiesSetting = EmulatorSettings.IsBbBackgroundTextureCopies();
+    bbGeometryInPlaceSetting = EmulatorSettings.IsBbGeometryInPlace();
     bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
 
     /////////// Input Tab
@@ -143,6 +144,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbVramReclaim(bbVramReclaimSetting, isSpecific);
     EmulatorSettings.SetBbBufferEviction(bbBufferEvictionSetting, isSpecific);
     EmulatorSettings.SetBbBackgroundTextureCopies(bbBackgroundTextureCopiesSetting, isSpecific);
+    EmulatorSettings.SetBbGeometryInPlace(bbGeometryInPlaceSetting, isSpecific);
     EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
 
     /////////// Input Tab
@@ -755,6 +757,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Less CPU overhead (needs a restart)");
                 AddSettingCheckbox("    Show frames when ready", bbFlipWhenReadySetting,
                                    "Smoother above 60 fps. Off: frames on vblank ticks");
+                AddSettingCheckbox("    Geometry in place (testing)", bbGeometryInPlaceSetting,
+                                   "Static vertex/index data not copied for every draw");
             }
             // Not under the threaded renderer: the upscalers use it either way.
             AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,
