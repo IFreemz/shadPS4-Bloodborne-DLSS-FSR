@@ -1613,6 +1613,20 @@ static void NoteHleReject(const char* kind, u64 hash, const std::string& reason)
     }
 }
 
+// The game's buffers of a shader, without the ones the recompiler adds (flattened user data,
+// page table, ...). A compute copy or clear has exactly two; the extras made the image copy and
+// clear detectors reject Bloodborne's render target copies (as bbport found).
+static boost::container::small_vector<const Shader::BufferResource*, 4> GuestBuffers(
+    const Shader::Info& info) {
+    boost::container::small_vector<const Shader::BufferResource*, 4> buffers;
+    for (const auto& desc : info.buffers) {
+        if (!desc.IsSpecial()) {
+            buffers.push_back(&desc);
+        }
+    }
+    return buffers;
+}
+
 static std::string DescribeImage(const VideoCore::Image& image) {
     return fmt::format("{}x{} {} bits={} pitch={} guest_size={:#x} tile={} depth={} flags={:#x}",
                        image.info.size.width, image.info.size.height,
@@ -1631,18 +1645,21 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
     const bool diag = diagnostics.load(std::memory_order_relaxed);
     const u64 hash = info.pgm_hash;
-    if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
+    const auto guest = GuestBuffers(info);
+    if (cs_pgm.num_thread_x.full != 64 || guest.size() != 2 || !info.images.empty() ||
+        info.uses_dma) {
         if (diag && (hash == 0x3d5ebf4e || hash == 0x8b355b5a || hash == 0xe2c27f0c)) {
             NoteHleReject("copy", hash,
-                          fmt::format("threads {} buffers {} images {}", cs_pgm.num_thread_x.full,
-                                      info.buffers.size(), info.images.size()));
+                          fmt::format("threads {} buffers {} (game {}) images {} dma {}",
+                                      cs_pgm.num_thread_x.full, info.buffers.size(), guest.size(),
+                                      info.images.size(), info.uses_dma));
         }
         return false;
     }
 
     // Those 2 buffers must both be formatted. One must be source and another destination.
-    const auto& desc0 = info.buffers[0];
-    const auto& desc1 = info.buffers[1];
+    const auto& desc0 = *guest[0];
+    const auto& desc1 = *guest[1];
     if (!desc0.is_formatted || !desc1.is_formatted || desc0.is_written == desc1.is_written) {
         if (diag && hash == 0x3d5ebf4e) {
             NoteHleReject("copy", hash,
@@ -1727,13 +1744,15 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = CsRegs();
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
-    if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
+    const auto guest = GuestBuffers(info);
+    if (cs_pgm.num_thread_x.full != 64 || guest.size() != 2 || !info.images.empty() ||
+        info.uses_dma) {
         return false;
     }
 
     // From those 2 buffers, first must hold the clear vector and second the image being cleared
-    const auto& desc0 = info.buffers[0];
-    const auto& desc1 = info.buffers[1];
+    const auto& desc0 = *guest[0];
+    const auto& desc1 = *guest[1];
     if (desc0.is_formatted || !desc1.is_formatted || desc0.is_written || !desc1.is_written) {
         return false;
     }
