@@ -660,8 +660,7 @@ static void UpdateMouseCursor() {
     ImGuiMouseCursor imgui_cursor = ImGui::GetMouseCursor();
     SDL_Window* focus = SDL_GetKeyboardFocus();
     if ((focus && SDL_GetWindowRelativeMouseMode(focus)) || io.MouseDrawCursor ||
-        imgui_cursor == ImGuiMouseCursor_None ||
-        cursorState == HideCursorState::Always) {
+        imgui_cursor == ImGuiMouseCursor_None || cursorState == HideCursorState::Always) {
         // Hide OS mouse cursor if imgui is drawing it or if it wants no cursor
         SDL_HideCursor();
 

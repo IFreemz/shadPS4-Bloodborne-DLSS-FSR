@@ -103,9 +103,8 @@ std::string GetSetting(const std::string& key, const std::string& fallback) {
 
 void SetSetting(const std::string& key, const std::string& value, bool remove = false) {
     auto lines = ReadLines(SettingsPath());
-    const auto it = std::ranges::find_if(lines, [&](const std::string& line) {
-        return line.rfind(key + "=", 0) == 0;
-    });
+    const auto it = std::ranges::find_if(
+        lines, [&](const std::string& line) { return line.rfind(key + "=", 0) == 0; });
     if (remove) {
         if (it != lines.end())
             lines.erase(it);
@@ -284,17 +283,28 @@ void RequestMouseLook(bool on) {
 
 std::string DisplayName(std::string_view name) {
     static constexpr std::pair<std::string_view, std::string_view> Names[] = {
-        {"leftbutton", "Left click"},       {"rightbutton", "Right click"},
-        {"middlebutton", "Middle click"},   {"sidebuttonback", "Mouse 4"},
-        {"sidebuttonforward", "Mouse 5"},   {"mousewheelup", "Wheel up"},
-        {"mousewheeldown", "Wheel down"},   {"lshift", "Left Shift"},
-        {"rshift", "Right Shift"},          {"lctrl", "Left Ctrl"},
-        {"rctrl", "Right Ctrl"},            {"lalt", "Left Alt"},
-        {"ralt", "Right Alt"},              {"space", "Space"},
-        {"escape", "Esc"},                  {"enter", "Enter"},
-        {"tab", "Tab"},                     {"backspace", "Backspace"},
-        {"capslock", "Caps Lock"},          {"up", "Up"},
-        {"down", "Down"},                   {"left", "Left"},
+        {"leftbutton", "Left click"},
+        {"rightbutton", "Right click"},
+        {"middlebutton", "Middle click"},
+        {"sidebuttonback", "Mouse 4"},
+        {"sidebuttonforward", "Mouse 5"},
+        {"mousewheelup", "Wheel up"},
+        {"mousewheeldown", "Wheel down"},
+        {"lshift", "Left Shift"},
+        {"rshift", "Right Shift"},
+        {"lctrl", "Left Ctrl"},
+        {"rctrl", "Right Ctrl"},
+        {"lalt", "Left Alt"},
+        {"ralt", "Right Alt"},
+        {"space", "Space"},
+        {"escape", "Esc"},
+        {"enter", "Enter"},
+        {"tab", "Tab"},
+        {"backspace", "Backspace"},
+        {"capslock", "Caps Lock"},
+        {"up", "Up"},
+        {"down", "Down"},
+        {"left", "Left"},
         {"right", "Right"},
     };
     if (name.empty())

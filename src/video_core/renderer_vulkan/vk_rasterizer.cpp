@@ -2416,7 +2416,7 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
             vk_sampler =
                 texture_cache.GetSampler(ssharp, Regs().ta_bc_base, sampler.is_depth, lod_bias);
             if (memo) {
-                *memo = {sharp_words, sampler.is_depth,       true,      lod_bias,
+                *memo = {sharp_words,        sampler.is_depth,       true,      lod_bias,
                          sampler_generation, texture_cache.GcTick(), vk_sampler};
             }
         }

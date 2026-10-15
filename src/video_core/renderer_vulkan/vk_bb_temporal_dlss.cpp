@@ -364,7 +364,7 @@ struct Tune {
     bool motion_blur = false;
     bool character_motion = true; // skinned meshes' own motion vectors (vk_bb_object_motion)
     bool menu_fix = true;
-    bool auto_exposure = true; // HDR input (decoupled UI): FSR computes the exposure
+    bool auto_exposure = true;    // HDR input (decoupled UI): FSR computes the exposure
     bool texture_lod_bias = true; // sharper scene textures while upscaling (BbSceneMipBias)
 };
 

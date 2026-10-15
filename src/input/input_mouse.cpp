@@ -5,10 +5,10 @@
 
 #include "common/assert.h"
 #include "common/types.h"
+#include "core/bb_mouse_camera.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input_mouse.h"
-#include "core/bb_mouse_camera.h"
 
 #include <common/singleton.h>
 #include <emulator.h>

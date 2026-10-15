@@ -11,10 +11,10 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/bb_mouse_camera.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
 #include "core/file_sys/bb_hdr_compat.h"
-#include "core/bb_mouse_camera.h"
 #include "input/bb_kbm.h"
 #include "memory_patcher.h"
 

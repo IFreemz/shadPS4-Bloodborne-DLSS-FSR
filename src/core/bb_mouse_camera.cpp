@@ -4,8 +4,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <new>
@@ -16,9 +16,9 @@
 #include <fmt/format.h>
 
 #include "common/logging/log.h"
-#include "common/types.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
+#include "common/types.h"
 #include "core/bb_mouse_camera.h"
 
 #ifdef _WIN32
@@ -88,7 +88,8 @@ std::vector<std::string> ReadSettings() {
 // Sensitivity 1.5 (F1's default) is 0.225 degrees a count.
 void LoadSettings() {
     const auto lines = ReadSettings();
-    float sensitivity = static_cast<float>(std::atof(Setting(lines, "mouse_sensitivity", "1.5").c_str()));
+    float sensitivity =
+        static_cast<float>(std::atof(Setting(lines, "mouse_sensitivity", "1.5").c_str()));
     if (!(sensitivity > 0.0f))
         sensitivity = 1.5f;
     settings.radians_per_count = sensitivity * 0.15f * 0.0174532924f;
@@ -125,13 +126,13 @@ std::vector<u8> BuildStub(const u8* store, const Data* d) {
             code.push_back(u8(value >> (i * 8)));
     };
     code.insert(code.end(), TurnStore.begin(), TurnStore.end()); // the game's stores
-    emit({0x48, 0x8d, 0x64, 0x24, 0x80});                         // lea rsp, [rsp-0x80] (red zone)
-    emit({0x9c, 0x50, 0x51});                                     // pushfq; push rax; push rcx
-    emit({0x48, 0x83, 0xec, 0x60});                               // sub rsp, 0x60
-    emit({0xc5, 0xfe, 0x7f, 0x14, 0x24});                         // vmovdqu [rsp], ymm2
-    emit({0xc5, 0xfe, 0x7f, 0x5c, 0x24, 0x20});                   // vmovdqu [rsp+0x20], ymm3
-    emit({0xc5, 0xfe, 0x7f, 0x64, 0x24, 0x40});                   // vmovdqu [rsp+0x40], ymm4
-    emit({0x48, 0xb8});                                           // mov rax, data
+    emit({0x48, 0x8d, 0x64, 0x24, 0x80});                        // lea rsp, [rsp-0x80] (red zone)
+    emit({0x9c, 0x50, 0x51});                                    // pushfq; push rax; push rcx
+    emit({0x48, 0x83, 0xec, 0x60});                              // sub rsp, 0x60
+    emit({0xc5, 0xfe, 0x7f, 0x14, 0x24});                        // vmovdqu [rsp], ymm2
+    emit({0xc5, 0xfe, 0x7f, 0x5c, 0x24, 0x20});                  // vmovdqu [rsp+0x20], ymm3
+    emit({0xc5, 0xfe, 0x7f, 0x64, 0x24, 0x40});                  // vmovdqu [rsp+0x40], ymm4
+    emit({0x48, 0xb8});                                          // mov rax, data
     emit64(reinterpret_cast<u64>(d));
     emit({0x4c, 0x89, 0x68, 0x18}); // mov [rax+24], r13
     emit({0x31, 0xc9});             // xor ecx, ecx
@@ -241,7 +242,8 @@ void Install() {
     settings_ms = NowMs();
     installed = true;
     LOG_INFO(Loader, "Mouse camera: installed (auto-rotation {})",
-             hold ? fmt::format("held at {} of {} sites", held, HoldSites.size()) : std::string{"kept"});
+             hold ? fmt::format("held at {} of {} sites", held, HoldSites.size())
+                  : std::string{"kept"});
 #endif
 }
 
@@ -266,7 +268,7 @@ void AddMotion(float dx, float dy) {
         std::memcpy(&limit_a, data->camera + 0x1ec, 4);
         std::memcpy(&limit_b, data->camera + 0x1f0, 4);
         LOG_DEBUG(Loader, "Mouse camera: dx {} dy {} pitch {:.4f} yaw {:.4f} limits {:.4f} {:.4f}",
-                 dx, dy, pitch_now, yaw_now, limit_a, limit_b);
+                  dx, dy, pitch_now, yaw_now, limit_a, limit_b);
     }
     const float pitch = dy * settings.radians_per_count * (settings.invert_y ? -1.0f : 1.0f);
     const float yaw = dx * settings.radians_per_count * (settings.invert_x ? -1.0f : 1.0f);
