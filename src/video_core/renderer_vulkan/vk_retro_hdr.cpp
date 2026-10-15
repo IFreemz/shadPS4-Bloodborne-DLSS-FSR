@@ -60,8 +60,8 @@ struct Settings {
     float peak_override{};
 };
 
-Settings ReadSettings() {
-    Settings settings;
+Settings ReadSettings(const Settings& previous) {
+    Settings settings = previous;
     std::ifstream file{BbDlssSettingsPath()};
     for (std::string line; std::getline(file, line);) {
         const auto eq = line.find('=');
@@ -91,19 +91,19 @@ struct Display {
     float sdr_white_nits;
 };
 
-float SdrWhiteNits(HMONITOR monitor) {
+std::optional<float> FindSdrWhiteNits(HMONITOR monitor) {
     MONITORINFOEXW monitor_info{};
     monitor_info.cbSize = sizeof(monitor_info);
     UINT32 path_count{}, mode_count{};
     if (!GetMonitorInfoW(monitor, &monitor_info) ||
         GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) !=
             ERROR_SUCCESS)
-        return FallbackSdrWhiteNits;
+        return std::nullopt;
     std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
     std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
     if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count,
                            modes.data(), nullptr) != ERROR_SUCCESS)
-        return FallbackSdrWhiteNits;
+        return std::nullopt;
     for (UINT32 i = 0; i < path_count; ++i) {
         const auto& path = paths[i];
         DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
@@ -122,6 +122,14 @@ float SdrWhiteNits(HMONITOR monitor) {
         if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS)
             return float(white.SDRWhiteLevel) / 1000.0f * 80.0f;
     }
+    return std::nullopt;
+}
+
+float SdrWhiteNits(HMONITOR monitor) {
+    if (const auto nits = FindSdrWhiteNits(monitor))
+        return *nits;
+    LOG_WARNING(Render_Vulkan, "RetroHDR: no SDR white level from Windows, using {:.0f} nits",
+                FallbackSdrWhiteNits);
     return FallbackSdrWhiteNits;
 }
 
@@ -184,7 +192,7 @@ State ResolveState([[maybe_unused]] void* native_window, [[maybe_unused]] bool s
 bool Start(void* native_window, bool scrgb_supported) {
     std::error_code error;
     polled_time = std::filesystem::last_write_time(BbDlssSettingsPath(), error);
-    polled = ReadSettings();
+    polled = ReadSettings(Settings{});
     session.state = ResolveState(native_window, scrgb_supported);
     LOG_INFO(Render_Vulkan, "RetroHDR: {} (Windows peak {:.0f} nits, SDR white {:.0f} nits)",
              Describe(session.state), session.windows_peak_nits, session.sdr_white_nits);
@@ -238,7 +246,7 @@ PassParams Poll() {
         const auto time = std::filesystem::last_write_time(BbDlssSettingsPath(), error);
         if (!error && time != polled_time) {
             polled_time = time;
-            polled = ReadSettings();
+            polled = ReadSettings(polled);
         }
     }
     return {
