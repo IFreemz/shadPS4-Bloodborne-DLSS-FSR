@@ -5,7 +5,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # shadPS4 Bloodborne DLSS & FSR
 
-> **New experimental: [2.1.0-pre.2](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.2) is on shadPS4 0.20.0.** It has @eFMann's threaded renderer, frame pacing and new character motion vectors, and the VRAM cleanup by @Cainhurst27 (u/EnglishDave_) and @eFMann. RenoDX HDR doesn't work on it yet; for HDR, use [2.1.0-pre.1](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.1). Stable: [2.0.0](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.0), same DLSS / FSR / frame generation as 1.8.6 on shadPS4 0.20.0. Feedback is welcome in the [issues](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues).
+> **New: [2.0.1](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.1) and [2.1.0-pre.3](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.3) (experimental).** SDR to HDR for any GPU (thanks @zeroznet), keyboard and mouse controls with a real mouse camera, sharper textures while upscaling. The experimental adds @eFMann's threaded renderer, frame pacing and character motion vectors, and the VRAM cleanup by @Cainhurst27 (u/EnglishDave_) and @eFMann. Feedback is welcome in the [issues](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues).
 
 Temporal upscaling for Bloodborne on [shadPS4](https://github.com/shadps4-emu/shadPS4): NVIDIA
 DLSS on GeForce RTX cards, AMD FSR 3.1 on everything else, plus frame generation (DLSS on RTX 40
@@ -27,7 +27,7 @@ upscaler DLLs the build behaves exactly like shadPS4 0.20.0.
 Both rendered at 1280x720; open them full size to compare.
 
 **Jump to:** [Install](#install) · [Frame generation](#frame-generation) ·
-[HDR with RenoDX](#hdr-with-renodx) · [Tested setups](#tested-setups) · [Settings](#settings) ·
+[HDR](#hdr-sdr-to-hdr) · [Keyboard and mouse](#keyboard-and-mouse) · [Tested setups](#tested-setups) · [Settings](#settings) ·
 [Troubleshooting](#troubleshooting) · [FAQ](#faq)
 
 ## Requirements
@@ -189,10 +189,30 @@ They are meant for 1080p screens and low VRAM. The result is 1080p scaled to you
 1440p or 4K the regular Resolution Patches look sharper. FSR shimmers more on thin detail from
 720p and below; DLSS copes well. Sharpness applies here too.
 
+### HDR: SDR to HDR
+
+Turn on **Use HDR** in the Windows display settings, then tick **SDR to HDR** in F1 and restart
+the game. It works on any GPU (AMD, Intel, NVIDIA) and with DLSS and FSR frame generation;
+brightness and peak sliders are in F1. Thanks to @zeroznet, who wrote it.
+
+It converts the finished image like Special K's SDR to HDR does, so it can't bring back detail the
+game already clipped: very bright lights, fire and the moon stay flat white, just brighter, and
+the HUD gets brighter with the game. RenoDX (below) rebuilds the game's lighting in HDR and looks
+better where it works.
+
+### Keyboard and mouse
+
+F1 → **Keyboard & mouse** → **Use keyboard & mouse controls**, then restart the game once. WASD
+moves, the mouse turns the camera like a PC game (update 1.09; on other versions it acts as the
+right stick), left click attacks, right click is the firearm, Space dodges, the arrow keys and
+Enter work the menus. Every action can be rebound in F1 (click a cell, press the key), with mouse
+sensitivity and invert. F7 turns the mouse camera off and on. Your previous controls are kept:
+**Restore previous controls** puts them back. A controller keeps working alongside.
+
 ### HDR with RenoDX
 
 > [!WARNING]
-> **RenoDX doesn't work with 2.0.0 and 2.1.0-pre.2 yet.** shadPS4 0.20.0 compiles the game's shaders
+> **RenoDX doesn't work with 2.0.0, 2.0.1 and the 2.1.0-pre.2 and later builds yet.** shadPS4 0.20.0 compiles the game's shaders
 > differently, so RenoDX doesn't recognise them until it gets an update. For HDR, use
 > [1.8.6](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.8.6) or [2.1.0-pre.1](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.1) (experimental) for now.
 
@@ -352,7 +372,7 @@ add-on uses the community Vulkan port of the v07 model.
 **Frame generation?** Built in, see *Frame generation*, including mods for DLSS frame
 generation on RTX 20, 30 and 40.
 
-**HDR?** Yes, with NVIDIA RTX HDR, or with RenoDX on 1.8.6 or 2.1.0-pre.1 (see *HDR with RenoDX*; it doesn't work on the shadPS4 0.20.0 builds yet).
+**HDR?** Yes: SDR to HDR in F1 on any GPU (see *HDR: SDR to HDR*), NVIDIA RTX HDR, or RenoDX on 1.8.6 or 2.1.0-pre.1 (it doesn't work on the shadPS4 0.20.0 builds yet).
 
 **Other games?** No. It depends on how Bloodborne renders: which shaders draw the HUD, where the
 camera matrices live and which passes write motion data.
@@ -454,6 +474,7 @@ An AI coding agent was used in the development of this project.
 - The authors of the Bloodborne patches for shadPS4 (Kyo, illusion and others), including the
   resolution patches and the AA, chromatic aberration and depth-of-field patches.
 - The [RenoDX](https://github.com/clshortfuse/renodx) authors, for the HDR mod.
+- zeroznet, for SDR to HDR.
 - EnglishDave_, for testing.
 - eFMann, for the RTX 3060 DLSS frame-pacing diagnosis, Reflex options reapplication patch, logs, and testing.
 - NVIDIA, for DLSS, Streamline and Reflex, and AMD, for FSR and the open FidelityFX SDK.
