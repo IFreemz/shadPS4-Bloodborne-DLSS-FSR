@@ -47,6 +47,9 @@ struct BbDlssStatus {
     u32 render_width{}, render_height{}, output_width{}, output_height{};
 };
 BbDlssStatus BbTemporalDlssStatus();
+// Extra texture LOD bias for the scene's material textures while the upscaler runs (NVIDIA's
+// DLSS guide, AMD's FSR guide: log2(render / output) - 1), 0 otherwise or when turned off in F1.
+float BbSceneMipBias();
 void BbTemporalDlssReportGpu(std::string_view gpu);
 void BbTemporalDlssReportProblem(std::string_view problem);
 

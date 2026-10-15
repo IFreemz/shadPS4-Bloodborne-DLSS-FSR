@@ -459,12 +459,14 @@ private:
         std::array<u64, 2> sharp{};
         bool is_depth{};
         bool valid{};
+        float lod_bias{};
         u64 generation{};
         u64 touched_gc_tick{};
         vk::Sampler handle{};
     };
     static constexpr u32 SamplerMemoSize = 1024;
     std::unique_ptr<std::array<SamplerMemoEntry, SamplerMemoSize>> sampler_memo;
+    float scene_lod_bias{}; ///< this draw's upscaler texture LOD bias (G-buffer draws only)
     std::atomic<u64> write_faults{};
     u64 stat_draws{};  ///< stage A: draws seen (queued or run here)
     u64 stat_frames{}; ///< stage A: submissions done (one per game frame)

@@ -1331,6 +1331,16 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     bool uses_dma = false;
 
+    // Upscaling: the G-buffer's material textures (5+ targets) get the upscaler's LOD bias, so
+    // they keep the detail of the output resolution (NVIDIA's DLSS programming guide). Shadows,
+    // post-processing and UI keep the game's.
+    scene_lod_bias = 0.0f;
+    if (!pipeline->IsCompute() &&
+        std::popcount(static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().mrt_mask &
+                      0xffu) >= 5) {
+        scene_lod_bias = BbSceneMipBias();
+    }
+
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(Regs());
@@ -2385,25 +2395,28 @@ void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindin
         static_assert(sizeof(ssharp) == sizeof(sharp_words));
         std::memcpy(sharp_words.data(), &ssharp, sizeof(sharp_words));
         SamplerMemoEntry* memo = nullptr;
+        const float lod_bias = sampler.is_depth ? 0.0f : scene_lod_bias;
         if (sampler_memo && target_memo_enabled.load(std::memory_order_relaxed)) {
             const u64 hash = ((sharp_words[0] ^ (sharp_words[1] * 0x9E3779B97F4A7C15ull)) ^
-                              u64(sampler.is_depth)) *
+                              u64(sampler.is_depth) ^ (u64(std::bit_cast<u32>(lod_bias)) << 1)) *
                              0xFF51AFD7ED558CCDull;
             memo = &(*sampler_memo)[(hash >> 40) % SamplerMemoSize];
         }
         const u64 sampler_generation = texture_cache.SamplerGeneration();
         if (memo && memo->valid && memo->sharp == sharp_words &&
-            memo->is_depth == sampler.is_depth && memo->generation == sampler_generation) {
+            memo->is_depth == sampler.is_depth && memo->lod_bias == lod_bias &&
+            memo->generation == sampler_generation) {
             vk_sampler = memo->handle;
             // Keep it alive: GetSampler's LRU touch, once per garbage collection tick.
             if (memo->touched_gc_tick != texture_cache.GcTick()) {
-                texture_cache.TouchSampler(ssharp, sampler.is_depth);
+                texture_cache.TouchSampler(ssharp, sampler.is_depth, lod_bias);
                 memo->touched_gc_tick = texture_cache.GcTick();
             }
         } else {
-            vk_sampler = texture_cache.GetSampler(ssharp, Regs().ta_bc_base, sampler.is_depth);
+            vk_sampler =
+                texture_cache.GetSampler(ssharp, Regs().ta_bc_base, sampler.is_depth, lod_bias);
             if (memo) {
-                *memo = {sharp_words,        sampler.is_depth,       true,
+                *memo = {sharp_words, sampler.is_depth,       true,      lod_bias,
                          sampler_generation, texture_cache.GcTick(), vk_sampler};
             }
         }
