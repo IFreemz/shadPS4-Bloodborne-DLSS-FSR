@@ -264,7 +264,7 @@ void DlssLayer::Draw() {
         PushStyleColor(ImGuiCol_Text, ImVec4{1.0f, 0.4f, 0.4f, 1.0f});
         TextWrapped("The Disable Motion Blur patch is on. It removes the depth and motion data "
                     "the upscaler needs: turn it off below and restart the game. To get rid of "
-                    "motion blur, untick Game motion blur instead.");
+                    "motion blur, leave Game motion blur (at the bottom) unticked instead.");
         PopStyleColor();
     }
 
@@ -401,12 +401,6 @@ void DlssLayer::Draw() {
     SameLine();
     TextDisabled("(top-left corner)");
 
-    bool motion_blur = settings.Get("motion_blur", "0") != "0";
-    if (Checkbox("Game motion blur", &motion_blur))
-        settings.Set("motion_blur", motion_blur ? "1" : "0");
-    SameLine();
-    TextDisabled("(off = sharper in motion)");
-
     bool menu_fix = settings.Get("menu_fix", "1") != "0";
     if (Checkbox("Menu fix", &menu_fix))
         settings.Set("menu_fix", menu_fix ? "1" : "0");
@@ -451,6 +445,12 @@ void DlssLayer::Draw() {
     bool retro_hdr_on = std::atoi(settings.Get("retro_hdr", "0").c_str()) != 0;
     if (Checkbox("SDR to HDR", &retro_hdr_on))
         settings.Set("retro_hdr", retro_hdr_on ? "1" : "0");
+    if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        SetTooltip("Brightens the finished SDR image into HDR, like Special K's SDR to HDR. Works "
+                   "on any GPU, with frame generation.\nUnlike RenoDX it can't recover detail the "
+                   "game already clipped: very bright lights stay flat white,\nand the HUD is "
+                   "brightened too. For the best HDR, use RenoDX where it works (NVIDIA, "
+                   "2.1.0-pre.1 or 1.8.6).");
     SameLine();
     if (retro_hdr.state == RetroHdr::State::Active)
         TextDisabled(retro_hdr_on ? "(untick to compare with SDR)" : "(showing SDR)");
@@ -469,10 +469,17 @@ void DlssLayer::Draw() {
     if (SliderFloat("HDR brightness", &brightness, RetroHdr::MinBrightness, max_brightness,
                     "%.2fx"))
         settings.Set("retro_hdr_brightness", fmt::format("{:.2f}", brightness));
+    SameLine();
+    if (Button("Default##retro_hdr_brightness"))
+        settings.Set("retro_hdr_brightness",
+                     fmt::format("{:.2f}", std::min(RetroHdr::DefaultBrightness, max_brightness)));
     TextDisabled("white %.0f nits, 18%% gray %.0f nits", brightness * RetroHdr::BoostedNits(1.0f),
                  brightness * RetroHdr::BoostedNits(0.18f));
     if (SliderInt("HDR peak", &peak_override, 0, 4000, peak_override < 100 ? "auto" : "%d nits"))
         settings.Set("retro_hdr_peak", std::to_string(peak_override < 100 ? 0 : peak_override));
+    SameLine();
+    if (Button("Default##retro_hdr_peak"))
+        settings.Set("retro_hdr_peak", "0");
     SameLine();
     if (retro_hdr.windows_peak_nits >= 100.0f)
         TextDisabled("(Windows reports %.0f nits)", retro_hdr.windows_peak_nits);
@@ -521,6 +528,14 @@ void DlssLayer::Draw() {
         if (!patch_message.empty())
             TextWrapped("%s", patch_message.c_str());
     }
+
+    // Down here on purpose: hardly anyone wants it back.
+    SeparatorText("Game effects");
+    bool motion_blur = settings.Get("motion_blur", "0") != "0";
+    if (Checkbox("Game motion blur", &motion_blur))
+        settings.Set("motion_blur", motion_blur ? "1" : "0");
+    SameLine();
+    TextDisabled("(off = sharper in motion)");
     End();
 }
 
