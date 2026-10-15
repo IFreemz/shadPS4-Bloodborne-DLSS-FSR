@@ -1048,6 +1048,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_settings.retro_mode = retro_hdr.mode;
     pp_settings.retro_brightness = retro_hdr.brightness;
     pp_settings.retro_sdr_white = retro_hdr.sdr_white;
+    pp_settings.retro_pq = retro_hdr.pq;
     pp_pass.Render(cmdbuf, image_view, source_size, *frame, pp_settings);
 
     // FSR frame generation: the same frame without the game's HUD, through the same pass.
@@ -1416,7 +1417,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 extent.width, extent.height,
                 swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
                                    : swapchain.GetSurfaceFormat().format,
-                swapchain.GetHDR());
+                swapchain.GetHDR() || RetroHdr::GetSession().pq);
 
             const vk::ImageMemoryBarrier to_transfer{
                 .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,

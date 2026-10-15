@@ -21,6 +21,7 @@ public:
         u32 retro_mode = 0;
         float retro_brightness = 1.0f;
         float retro_sdr_white = 1.0f;
+        u32 retro_pq = 0;
     };
 
     void Create(vk::Device device, vk::Format surface_format);
