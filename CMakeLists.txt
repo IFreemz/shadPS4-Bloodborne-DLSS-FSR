@@ -1305,6 +1305,10 @@ set(INPUT src/input/controller.cpp
           src/input/controller_state.cpp
           src/input/input_handler.cpp
           src/input/input_handler.h
+          src/core/bb_mouse_camera.cpp
+          src/core/bb_mouse_camera.h
+          src/input/bb_kbm.cpp
+          src/input/bb_kbm.h
           src/input/input_mouse.cpp
           src/input/input_mouse.h
 )
