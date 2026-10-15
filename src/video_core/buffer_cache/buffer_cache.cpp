@@ -33,6 +33,7 @@
 namespace VideoCore {
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
+static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 // Background texture copies (test setting): smaller copies are done in place.
 static constexpr u64 BackgroundCopyMin = 16_KB;
@@ -61,6 +62,24 @@ static constexpr u64 RESIDENT_BUFFER_GC_COOLDOWN = 120;
 static constexpr u64 RESIDENT_BUFFER_GC_TARGET = 256_MB;
 // Less than this idle isn't worth a pass: each one waits for the GPU.
 static constexpr u64 RESIDENT_BUFFER_GC_MIN = 32_MB;
+constexpr std::optional<u32> CmaskColorExpandedValue(u32 num_samples) {
+    switch (num_samples) {
+    case 1:
+        return 0xFFFFFFFF;
+    case 2:
+        return 0xDDDDDDDD;
+    case 4:
+        return 0xEEEEEEEE;
+    case 8:
+        return 0xFFFFFFFF;
+    default:
+        return 0;
+    }
+}
+static_assert(CmaskColorExpandedValue(1) == 0xFFFFFFFF);
+static_assert(CmaskColorExpandedValue(2) == 0xDDDDDDDD);
+static_assert(CmaskColorExpandedValue(4) == 0xEEEEEEEE);
+static_assert(CmaskColorExpandedValue(8) == 0xFFFFFFFF);
 
 static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
@@ -144,6 +163,11 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         }));
         readback_cmdbuf = std::move(buffers[0]);
         readback_fence = Vulkan::Check(device.createFenceUnique({}));
+    }
+    if (!instance.IsMaintenance6Supported()) {
+        null_index_buffer = std::make_unique<Buffer>(instance, 0, NULL_INDEX_BUFFER_SIZE,
+                                                     MemoryType::DeviceLocal, "Null Index Buffer");
+        runtime.FillBuffer(null_index_buffer.get(), 0u, NULL_INDEX_BUFFER_SIZE, 0u);
     }
 }
 
@@ -485,9 +509,6 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         MarkResidentUse(device_addr, size);
     }
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
-    if (is_texel_buffer && !is_written) {
-        SynchronizeMemoryFromImage(arena, device_addr, size);
-    }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
         NoteGpuWrite(device_addr, size);
@@ -660,7 +681,12 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         resident_slab = vk::DeviceMemory{};
     }
     if (!resident_slab || resident_slab_used + bind_bytes > resident_slab_size) {
+        // Arenas have buffer device addresses: their sparse backing needs the flag too.
+        const vk::MemoryAllocateFlagsInfo alloc_flags = {
+            .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+        };
         const vk::MemoryAllocateInfo alloc_info = {
+            .pNext = &alloc_flags,
             .allocationSize = Common::BbTuning::Streaming()
                                   ? std::max<u64>(ResidentSlabSize, bind_bytes)
                                   : bind_bytes,
@@ -779,7 +805,11 @@ BufferCache::ResidentBlocks BufferCache::TakeResidentBlocks(u64 wanted) {
     }
     if (!slab) {
         const u64 slab_blocks = std::max<u64>(EvictionSlabSize >> block_shift, wanted);
+        const vk::MemoryAllocateFlagsInfo alloc_flags = {
+            .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+        };
         const vk::MemoryAllocateInfo alloc_info = {
+            .pNext = &alloc_flags,
             .allocationSize = slab_blocks << block_shift,
             .memoryTypeIndex = arena_memory_type_index,
         };
@@ -1094,13 +1124,26 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
-    if (auto type = texture_cache.IsMeta(device_addr)) {
-        if (*type == TextureCache::MetaType::HTile) {
+    if (const auto meta = texture_cache.GetMetaInfo(device_addr)) {
+        if (meta->type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;
             runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
             return true;
+        } else if (meta->type == TextureCache::MetaType::CMask) {
+            const auto expanded_value = CmaskColorExpandedValue(meta->num_samples);
+            if (!expanded_value) {
+                LOG_WARNING(Render_Vulkan,
+                            "Unsupported CMask sample count: address={:#x}, size={:#x}, "
+                            "samples={}, owner={}:{}",
+                            device_addr, size, meta->num_samples, meta->owner_id.index,
+                            meta->owner_uid);
+                return false;
+            }
+            runtime.FillBuffer(arena, arena->Offset(device_addr), size, *expanded_value);
+            return true;
         } else {
-            LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
+            LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}",
+                        magic_enum::enum_name(meta->type));
         }
     }
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);

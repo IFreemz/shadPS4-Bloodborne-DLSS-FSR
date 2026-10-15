@@ -217,8 +217,17 @@ void ShadNetClient::ConnectThread() {
     LOG_INFO(ShadNet, "Login packet sent for '{}'", m_npid);
 }
 
+namespace {
+thread_local bool t_reader_thread = false;
+}
+
+bool ShadNetClient::OnReaderThread() {
+    return t_reader_thread;
+}
+
 void ShadNetClient::ReaderThread() {
     Common::SetCurrentThreadName("ShadNet:Reader");
+    t_reader_thread = true;
     while (!m_terminate) {
         u8 hdr[SHAD_HEADER_SIZE];
         if (!RecvN(hdr, SHAD_HEADER_SIZE)) {
@@ -932,6 +941,7 @@ void ShadNetClient::HandleNotification(u16 cmd_raw, const std::vector<u8>& paylo
     case NotificationType::RoomMessage: {
         shadnet::NotifyRoomMessage pb;
         if (!pb.ParseFromString(blob)) {
+            LOG_WARNING(ShadNet, "RoomMessage parse error");
             break;
         }
         NotifyRoomMessage n;
@@ -947,6 +957,8 @@ void ShadNetClient::HandleNotification(u16 cmd_raw, const std::vector<u8>& paylo
         n.src_account_id = pb.src_account_id();
         n.src_platform = pb.src_platform();
         n.msg.assign(pb.msg().begin(), pb.msg().end());
+        LOG_DEBUG(ShadNet, "RoomMessage room_id={} src={} event={:#x} bytes={}", n.room_id,
+                  n.src_member_id, n.event, n.msg.size());
         if (onRoomMessage)
             onRoomMessage(n);
         break;
@@ -1005,6 +1017,39 @@ void ShadNetClient::HandleNotification(u16 cmd_raw, const std::vector<u8>& paylo
                  n.data.size(), n.extdData.size());
         if (onWebApiPushEvent)
             onWebApiPushEvent(n);
+        break;
+    }
+    case NotificationType::ServiceUnavailable: {
+        shadnet::NotifyServiceUnavailable pb;
+        if (!pb.ParseFromString(blob)) {
+            LOG_WARNING(ShadNet, "ServiceUnavailable parse error");
+            break;
+        }
+        NotifyServiceUnavailable n;
+        n.service = pb.service();
+        n.reason = pb.reason();
+        n.inUse = pb.in_use();
+        n.limit = pb.limit();
+        LOG_INFO(ShadNet, "ServiceUnavailable service={} reason={} in_use={} limit={}", n.service,
+                 n.reason, n.inUse, n.limit);
+        if (onServiceUnavailable)
+            onServiceUnavailable(n);
+        break;
+    }
+    case NotificationType::ClientRejected: {
+        shadnet::NotifyClientRejected pb;
+        if (!pb.ParseFromString(blob)) {
+            LOG_WARNING(ShadNet, "ClientRejected parse error");
+            break;
+        }
+        NotifyClientRejected n;
+        n.reason = pb.reason();
+        n.message = pb.message();
+        n.version = pb.version();
+        LOG_ERROR(ShadNet, "Server rejected this client (reason={}, version='{}'): {}", n.reason,
+                  n.version, n.message);
+        if (onClientRejected)
+            onClientRejected(n);
         break;
     }
     default:

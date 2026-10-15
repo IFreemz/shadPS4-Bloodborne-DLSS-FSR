@@ -808,7 +808,8 @@ struct BbTemporalDlss::Impl {
                           slot.depth->image.image, vk::ImageLayout::eTransferDstOptimal, region);
         command.copyImage(motion->image.image, vk::ImageLayout::eTransferSrcOptimal,
                           slot.motion->image.image, vk::ImageLayout::eTransferDstOptimal, region);
-        for (auto* image : {slot.depth.get(), slot.motion.get()})
+        // The motion image is sampled again later this frame (HUD composite).
+        for (auto* image : {slot.depth.get(), slot.motion.get(), motion.get()})
             image->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
                            vk::PipelineStageFlagBits2::eAllCommands,
                            vk::AccessFlagBits2::eShaderRead);
