@@ -541,7 +541,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
                                               instance.StorageMinAlignment());
     const auto start = std::chrono::steady_clock::now();
-    if (staging.size >= BackgroundCopyMin && EmulatorSettings.IsBbBackgroundTextureCopies()) {
+    if (staging.size >= BackgroundCopyMin && Common::BbTuning::Threaded() &&
+        EmulatorSettings.IsBbBackgroundTextureCopies()) {
         // Streaming a new area uploads ~1000 textures, ~200 KiB each, in a frame: copied one by
         // one they held up the draw recorder for tens of ms. On the copy threads, in pieces of up
         // to 1 MiB; waited for before the submission that reads the staging memory

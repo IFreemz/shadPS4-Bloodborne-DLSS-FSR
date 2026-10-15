@@ -459,9 +459,9 @@ struct GPUSettings {
     Setting<bool> bb_buffer_eviction{true};
     // Testing: the VRAM budget the caches assume, in MiB (0 = the GPU's real budget; at start).
     Setting<int> bb_vram_budget_test_mb{0};
-    // Testing: textures copied from guest memory on background threads; the copies are waited
-    // for before the GPU submission that reads them and before the guest sees a fence.
-    Setting<bool> bb_background_texture_copies{false};
+    // Threaded renderer: textures copied from guest memory on background threads; the copies are
+    // waited for before the GPU submission that reads them and before the guest sees a fence.
+    Setting<bool> bb_background_texture_copies{true};
     // Threaded renderer: clean vertex/index data of 1-16 KiB read where it is in GPU memory
     // instead of copied for every draw. Off: copied as before.
     Setting<bool> bb_geometry_in_place{true};
