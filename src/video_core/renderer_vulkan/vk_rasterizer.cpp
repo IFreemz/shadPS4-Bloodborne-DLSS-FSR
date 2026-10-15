@@ -579,6 +579,16 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     bool uses_dma = false;
 
+    // Upscaling: the G-buffer's material textures (5+ targets) get the upscaler's LOD bias, so
+    // they keep the detail of the output resolution (NVIDIA's DLSS programming guide). Shadows,
+    // post-processing and UI keep the game's.
+    scene_lod_bias = 0.0f;
+    if (!pipeline->IsCompute() &&
+        std::popcount(static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().mrt_mask &
+                      0xffu) >= 5) {
+        scene_lod_bias = BbSceneMipBias();
+    }
+
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     push_data = MakeUserData(liverpool->regs);
@@ -1180,7 +1190,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             ssharp = AmdGpu::Sampler{};
         }
         const auto vk_sampler =
-            texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth);
+            texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth,
+                                     sampler.is_depth ? 0.0f : scene_lod_bias);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;

@@ -197,6 +197,7 @@ private:
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    float scene_lod_bias{}; ///< this draw's upscaler texture LOD bias (G-buffer draws only)
 };
 
 } // namespace Vulkan
