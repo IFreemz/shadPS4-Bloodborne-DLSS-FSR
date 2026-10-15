@@ -45,7 +45,7 @@ struct PassParams {
     float sdr_white{1.0f}; // Windows SDR white level / 80 nits
 };
 
-// Presenter thread, every frame: re-reads dlss.ini when it changed.
+// GPU thread, every frame: re-reads dlss.ini when it changed.
 PassParams Poll();
 
 constexpr float DefaultBrightness = 2.0f;
