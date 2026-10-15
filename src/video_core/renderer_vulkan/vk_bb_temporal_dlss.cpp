@@ -353,7 +353,7 @@ struct Tune {
     int upscaler = 0;      // 0 automatic, 1 DLSS, 2 FSR 3.1, 3 FSR 4
     bool motion_blur = false;
     bool menu_fix = true;
-    bool auto_exposure = true; // HDR input (decoupled UI): FSR computes the exposure
+    bool auto_exposure = true;    // HDR input (decoupled UI): FSR computes the exposure
     bool texture_lod_bias = true; // sharper scene textures while upscaling (BbSceneMipBias)
 };
 

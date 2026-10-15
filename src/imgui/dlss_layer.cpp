@@ -15,23 +15,23 @@
 #include <imgui.h>
 
 #include "common/path_util.h"
+#include "core/bb_mouse_camera.h"
+#include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/bb_hdr_compat.h"
+#include "imgui/big_picture/settings_dialog_layer.h"
 #include "imgui/dlss_layer.h"
+#include "imgui/friends_layer.h"
 #include "imgui/imgui_layer.h"
 #include "imgui/renderer/imgui_core.h"
+#include "input/bb_kbm.h"
+#include "input/controller.h"
+#include "input/input_mouse.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_hdr_meter.h"
 #include "video_core/renderer_vulkan/vk_hdr_mod.h"
 #include "video_core/renderer_vulkan/vk_retro_hdr.h"
-#include "core/bb_mouse_camera.h"
-#include "core/devtools/layer.h"
-#include "imgui/big_picture/settings_dialog_layer.h"
-#include "imgui/friends_layer.h"
-#include "input/bb_kbm.h"
-#include "input/controller.h"
-#include "input/input_mouse.h"
 
 namespace ImGui::Dlss {
 namespace {
@@ -151,7 +151,7 @@ public:
     // Keyboard and mouse: the mouse turns the camera only while no shadPS4 window is open.
     void UpdateMouseLook();
     bool mouse_released = false;
-    int release_wait = 0; // frames until the release request is repeated
+    int release_wait = 0;       // frames until the release request is repeated
     bool camera_before = false; // the mouse turned the camera when a window took it
     void Open() {
         settings.Load();
@@ -261,8 +261,7 @@ void DlssLayer::UpdateMouseLook() {
         mouse_released = false;
         release_wait = 0;
         // Without our controls (shadPS4's own F7 mouse mode): as it was.
-        const bool want =
-            Input::BbKbm::Active() ? Input::BbKbm::MouseLookWanted() : camera_before;
+        const bool want = Input::BbKbm::Active() ? Input::BbKbm::MouseLookWanted() : camera_before;
         camera_before = false;
         const bool camera = Input::GetMouseMode() == Input::MouseMode::Joystick;
         if (want != camera)
@@ -643,7 +642,6 @@ void DlssLayer::Draw() {
     TextDisabled("(off = sharper in motion)");
     End();
 }
-
 
 // shadPS4's name for an ImGui key, empty if it can't be bound (F keys stay hotkeys).
 std::string KeyName(ImGuiKey key) {

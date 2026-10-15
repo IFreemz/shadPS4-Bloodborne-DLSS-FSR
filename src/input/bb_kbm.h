@@ -14,8 +14,8 @@ namespace Input::BbKbm {
 // kbm_<action>=<key>,<mouse> and are rebindable in F1.
 
 struct Action {
-    const char* id;    // dlss.ini key: kbm_<id>
-    const char* label; // F1
+    const char* id;     // dlss.ini key: kbm_<id>
+    const char* label;  // F1
     const char* output; // shadPS4 output (PS4 button or stick direction)
     const char* default_key;
     const char* default_mouse;

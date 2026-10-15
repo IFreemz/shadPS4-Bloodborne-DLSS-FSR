@@ -166,8 +166,8 @@ public:
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
-                                         AmdGpu::BorderColorBuffer border_color_base,
-                                         bool is_depth, float extra_lod_bias = 0.0f);
+                                         AmdGpu::BorderColorBuffer border_color_base, bool is_depth,
+                                         float extra_lod_bias = 0.0f);
 
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
