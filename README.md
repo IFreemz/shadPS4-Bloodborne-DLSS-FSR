@@ -5,7 +5,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # shadPS4 Bloodborne DLSS & FSR
 
-> **New: [2.0.0](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.0) is built on shadPS4 0.20.0.** Same DLSS / FSR / frame generation as 1.8.6, on the new shadPS4 base. Experimental: [2.1.0-pre.1](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.1) continues 1.9.0-pre with @eFMann's threaded renderer, frame pacing and new character motion vectors, and the VRAM cleanup by @Cainhurst27 (u/EnglishDave_) and @eFMann. It is still on shadPS4 0.19.0; its move to 0.20.0 is next. Feedback is welcome in the [issues](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues).
+> **New experimental: [2.1.0-pre.2](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.2) is on shadPS4 0.20.0.** It has @eFMann's threaded renderer, frame pacing and new character motion vectors, and the VRAM cleanup by @Cainhurst27 (u/EnglishDave_) and @eFMann. RenoDX HDR doesn't work on it yet; for HDR, use [2.1.0-pre.1](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.1). Stable: [2.0.0](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.0), same DLSS / FSR / frame generation as 1.8.6 on shadPS4 0.20.0. Feedback is welcome in the [issues](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues).
 
 Temporal upscaling for Bloodborne on [shadPS4](https://github.com/shadps4-emu/shadPS4): NVIDIA
 DLSS on GeForce RTX cards, AMD FSR 3.1 on everything else, plus frame generation (DLSS on RTX 40
