@@ -191,8 +191,13 @@ They are meant for 1080p screens and low VRAM. The result is 1080p scaled to you
 
 ### HDR with RenoDX
 
+> [!WARNING]
+> **RenoDX doesn't work with 2.0.0 and 2.1.0-pre.2 yet.** shadPS4 0.20.0 compiles the game's shaders
+> differently, so RenoDX doesn't recognise them until it gets an update. For HDR, use
+> [1.8.6](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.8.6) or [2.1.0-pre.1](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.1) (experimental) for now.
+
 The [RenoDX](https://github.com/clshortfuse/renodx) HDR mod for Bloodborne (ReShade 6.8.0 or
-newer) works with this build, with every upscaler, patch type and frame generation. It's out of
+newer) works with 1.8.6 and 2.1.0-pre.1, with every upscaler, patch type and frame generation. It's out of
 early access: get it free from the Bloodborne channel on the
 [RenoDX Discord](https://discord.gg/F6AUTeWJHM). If you enjoy it, donate to the RenoDX devs, they
 deserve it.
@@ -347,7 +352,7 @@ add-on uses the community Vulkan port of the v07 model.
 **Frame generation?** Built in, see *Frame generation*, including mods for DLSS frame
 generation on RTX 20, 30 and 40.
 
-**HDR?** Yes, with RenoDX (see *HDR with RenoDX*) or NVIDIA RTX HDR.
+**HDR?** Yes, with NVIDIA RTX HDR, or with RenoDX on 1.8.6 or 2.1.0-pre.1 (see *HDR with RenoDX*; it doesn't work on the shadPS4 0.20.0 builds yet).
 
 **Other games?** No. It depends on how Bloodborne renders: which shaders draw the HUD, where the
 camera matrices live and which passes write motion data.
