@@ -6,6 +6,7 @@
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
+#include "common/number_utils.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
@@ -142,6 +143,10 @@ enum class ScreenshotKind : u8 {
     WithOverlays,
 };
 
+static constexpr u64 ReadbackBytesPerPixel(const vk::Format format) {
+    return format == vk::Format::eR16G16B16A16Sfloat ? 8 : 4;
+}
+
 struct ScreenshotReadback {
     ScreenshotKind kind{};
     std::vector<std::filesystem::path> paths{};
@@ -155,7 +160,9 @@ struct ScreenshotReadback {
                        std::vector<std::filesystem::path> paths_, const u32 width_,
                        const u32 height_, const vk::Format format_, const bool hdr_encoded_)
         : kind{kind_}, paths{std::move(paths_)},
-          buffer{instance, 0, static_cast<u64>(width_) * static_cast<u64>(height_) * 4,
+          buffer{instance, 0,
+                 static_cast<u64>(width_) * static_cast<u64>(height_) *
+                     ReadbackBytesPerPixel(format_),
                  VideoCore::MemoryType::HostCached},
           width{width_}, height{height_}, format{format_}, hdr_encoded{hdr_encoded_} {}
 };
@@ -290,7 +297,7 @@ static void CopyImageToReadback(const vk::CommandBuffer& cmdbuf, const vk::Image
 
 static bool ConvertReadbackToRgba8(const ScreenshotReadback& readback, std::vector<u8>& out_rgba) {
     const u64 pixel_count = static_cast<u64>(readback.width) * static_cast<u64>(readback.height);
-    const u64 byte_size = pixel_count * 4;
+    const u64 byte_size = pixel_count * ReadbackBytesPerPixel(readback.format);
     if (readback.buffer.mapped_data.size() < byte_size) {
         LOG_ERROR(Render_Vulkan, "Screenshot readback buffer size mismatch (have {}, need {})",
                   readback.buffer.mapped_data.size(), byte_size);
@@ -299,7 +306,7 @@ static bool ConvertReadbackToRgba8(const ScreenshotReadback& readback, std::vect
 
     const auto src =
         std::span<const u8>{readback.buffer.mapped_data.data(), static_cast<size_t>(byte_size)};
-    out_rgba.resize(static_cast<size_t>(byte_size));
+    out_rgba.resize(static_cast<size_t>(pixel_count * 4));
 
     switch (readback.format) {
     case vk::Format::eR8G8B8A8Unorm:
@@ -392,6 +399,23 @@ static bool ConvertReadbackToRgba8(const ScreenshotReadback& readback, std::vect
                 out_rgba[o + 0] = unorm10_to_u8[r];
                 out_rgba[o + 1] = unorm10_to_u8[g];
                 out_rgba[o + 2] = unorm10_to_u8[b];
+            }
+            out_rgba[o + 3] = 255;
+        }
+        return true;
+    }
+    case vk::Format::eR16G16B16A16Sfloat: {
+        // scRGB: Rec.709 linear, 1.0 = 80 nits.
+        constexpr float scrgb_nits = 80.0f;
+        for (u64 i = 0; i < pixel_count; ++i) {
+            const size_t o = static_cast<size_t>(i) * 4;
+            const size_t src_offset = static_cast<size_t>(i) * 8;
+            for (size_t c = 0; c < 3; ++c) {
+                u16 half;
+                std::memcpy(&half, &src[src_offset + c * 2], sizeof(half));
+                const float nits = NumberUtils::Uf16ToF32(half) * scrgb_nits;
+                const float srgb = LinearToSrgb(ToneMapToSdrLinear(nits));
+                out_rgba[o + c] = static_cast<u8>(std::clamp(srgb, 0.0f, 1.0f) * 255.0f + 0.5f);
             }
             out_rgba[o + 3] = 255;
         }
