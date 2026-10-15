@@ -467,6 +467,16 @@ void DlssLayer::Draw() {
     SameLine();
     TextDisabled("(texture detail of the output resolution)");
 
+    bool object_motion = settings.Get("object_motion", "1") != "0";
+    if (Checkbox("Object motion vectors", &object_motion))
+        settings.Set("object_motion", object_motion ? "1" : "0");
+    if (IsItemHovered())
+        SetTooltip("Motion of moving objects (doors, elevators, enemies) for the upscaler. Off: "
+                   "only the camera's motion\nis used. Turn it off to check whether ghosting "
+                   "comes from it.");
+    SameLine();
+    TextDisabled("(less ghosting on moving objects)");
+
     SeparatorText("SDR to HDR");
     namespace RetroHdr = ::Vulkan::RetroHdr;
     const auto& retro_hdr = RetroHdr::GetSession();
