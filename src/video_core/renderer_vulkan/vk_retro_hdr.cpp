@@ -21,6 +21,7 @@
 #include <vector>
 #include <dxgi1_6.h>
 #include <windows.h>
+#pragma comment(lib, "dxgi.lib")
 #endif
 
 namespace Vulkan::RetroHdr {
