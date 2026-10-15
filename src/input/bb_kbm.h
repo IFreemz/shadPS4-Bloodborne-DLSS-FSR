@@ -42,8 +42,10 @@ bool Apply();
 bool Restore();
 // Whether the active input config is ours.
 bool Active();
-// Whether mouse look should be on while playing (ours active and not turned off in F1).
+// Whether mouse look should be on while playing (ours active and not turned off in F1 or F7).
 bool MouseLookWanted();
+// F1's Mouse look switch and F7: remembered in dlss.ini.
+void SetMouseLook(bool on);
 // Any thread: captures the mouse as the camera, or releases it.
 void RequestMouseLook(bool on);
 

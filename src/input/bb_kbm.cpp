@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <fstream>
@@ -149,7 +150,11 @@ const Action* Find(std::string_view id) {
     return nullptr;
 }
 
+// MouseLookWanted's answer, -1 unknown: it is asked every time a window closes.
+std::atomic<int> mouse_look_cache{-1};
+
 void Reload() {
+    mouse_look_cache = -1;
     SDL_Event event{};
     event.type = SDL_EVENT_RELOAD_INPUTS;
     SDL_PushEvent(&event);
@@ -257,7 +262,17 @@ bool Active() {
 }
 
 bool MouseLookWanted() {
-    return GetSetting("mouse_look", "1").rfind('0', 0) != 0 && Active();
+    int cached = mouse_look_cache.load();
+    if (cached < 0) {
+        cached = GetSetting("mouse_look", "1").rfind('0', 0) != 0 && Active() ? 1 : 0;
+        mouse_look_cache = cached;
+    }
+    return cached != 0;
+}
+
+void SetMouseLook(bool on) {
+    SetSetting("mouse_look", on ? "1" : "0");
+    mouse_look_cache = -1;
 }
 
 void RequestMouseLook(bool on) {

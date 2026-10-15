@@ -150,9 +150,8 @@ public:
     }
     // Keyboard and mouse: the mouse turns the camera only while no shadPS4 window is open.
     void UpdateMouseLook();
-    bool mouse_look_wanted = false; // read on the first frame (settings load after this layer)
-    bool mouse_look_read = false;
     bool mouse_released = false;
+    int release_wait = 0; // frames until the release request is repeated
     void Open() {
         settings.Load();
         patches = ReadPatches();
@@ -172,7 +171,6 @@ public:
         open = false;
         ImGui::Core::ReleaseGamepadInputCapture();
         GetIO().MouseDrawCursor = false;
-        mouse_look_wanted = Input::BbKbm::MouseLookWanted(); // settings may have changed
     }
     bool open{};
     bool focus{};
@@ -243,22 +241,24 @@ public:
 CounterLayer counter;
 
 void DlssLayer::UpdateMouseLook() {
-    if (!mouse_look_read) {
-        mouse_look_read = true;
-        mouse_look_wanted = Input::BbKbm::MouseLookWanted();
-    }
-    if (!mouse_look_wanted)
-        return;
+    // Any shadPS4 window takes the mouse (F7 pressed in one too); closing them gives it back to
+    // the camera if Mouse look is on.
     const bool window_open = open || ImGuiEmuSettings::IsInGameSettingsDialogOpen() ||
                              Overlay::IsQuitWindowOpen() || ImGui::Friends::IsOpen() ||
                              ImGui::Core::IsGamepadInputCaptured();
-    if (window_open && !mouse_released &&
-        Input::GetMouseMode() == Input::MouseMode::Joystick) {
-        Input::BbKbm::RequestMouseLook(false);
-        mouse_released = true;
-    } else if (!window_open && mouse_released) {
-        Input::BbKbm::RequestMouseLook(true);
+    if (window_open) {
+        if (release_wait > 0)
+            --release_wait;
+        if (Input::GetMouseMode() == Input::MouseMode::Joystick && release_wait == 0) {
+            Input::BbKbm::RequestMouseLook(false);
+            mouse_released = true;
+            release_wait = 10;
+        }
+    } else if (mouse_released) {
         mouse_released = false;
+        release_wait = 0;
+        if (Input::BbKbm::MouseLookWanted())
+            Input::BbKbm::RequestMouseLook(true);
     }
 }
 
@@ -526,9 +526,9 @@ void DlssLayer::Draw() {
                               ? "Done. The mouse turns the camera when this panel is closed."
                               : "Could not write the input config.";
     } else {
-        bool mouse_look = settings.Get("mouse_look", "1") != "0";
+        bool mouse_look = Input::BbKbm::MouseLookWanted();
         if (Checkbox("Mouse look", &mouse_look))
-            settings.Set("mouse_look", mouse_look ? "1" : "0");
+            Input::BbKbm::SetMouseLook(mouse_look);
         SameLine();
         TextDisabled("(F7 toggles it in game)");
         float sensitivity =
