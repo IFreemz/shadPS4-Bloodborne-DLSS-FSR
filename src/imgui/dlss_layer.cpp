@@ -152,6 +152,7 @@ public:
     void UpdateMouseLook();
     bool mouse_released = false;
     int release_wait = 0; // frames until the release request is repeated
+    bool camera_before = false; // the mouse turned the camera when a window took it
     void Open() {
         settings.Load();
         patches = ReadPatches();
@@ -247,18 +248,25 @@ void DlssLayer::UpdateMouseLook() {
                              Overlay::IsQuitWindowOpen() || ImGui::Friends::IsOpen() ||
                              ImGui::Core::IsGamepadInputCaptured();
     if (window_open) {
+        mouse_released = true; // checked again when the last window closes
         if (release_wait > 0)
             --release_wait;
         if (Input::GetMouseMode() == Input::MouseMode::Joystick && release_wait == 0) {
             Input::BbKbm::RequestMouseLook(false);
-            mouse_released = true;
+            camera_before = true;
             release_wait = 10;
         }
     } else if (mouse_released) {
+        // The last window closed: the camera follows Mouse look, whatever it was before.
         mouse_released = false;
         release_wait = 0;
-        if (Input::BbKbm::MouseLookWanted())
-            Input::BbKbm::RequestMouseLook(true);
+        // Without our controls (shadPS4's own F7 mouse mode): as it was.
+        const bool want =
+            Input::BbKbm::Active() ? Input::BbKbm::MouseLookWanted() : camera_before;
+        camera_before = false;
+        const bool camera = Input::GetMouseMode() == Input::MouseMode::Joystick;
+        if (want != camera)
+            Input::BbKbm::RequestMouseLook(want);
     }
 }
 
