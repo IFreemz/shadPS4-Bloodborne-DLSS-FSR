@@ -422,7 +422,7 @@ void DlssLayer::Draw() {
     const auto& retro_hdr = RetroHdr::GetSession();
     BeginDisabled(retro_hdr.state != RetroHdr::State::Active &&
                   retro_hdr.state != RetroHdr::State::Disabled);
-    bool retro_hdr_on = settings.Get("retro_hdr", "0") != "0";
+    bool retro_hdr_on = std::atoi(settings.Get("retro_hdr", "0").c_str()) != 0;
     if (Checkbox("SDR to HDR", &retro_hdr_on))
         settings.Set("retro_hdr", retro_hdr_on ? "1" : "0");
     SameLine();
@@ -434,7 +434,7 @@ void DlssLayer::Draw() {
     else
         TextDisabled("(%s)", RetroHdr::Describe(retro_hdr.state).data());
 
-    int peak_override = std::atoi(settings.Get("retro_hdr_peak", "0").c_str());
+    int peak_override = int(RetroHdr::ParseFloat(settings.Get("retro_hdr_peak", "0"), 0.0f));
     const float peak = RetroHdr::PeakNits(float(peak_override));
     const float max_brightness = RetroHdr::MaxBrightness(peak);
     float brightness = RetroHdr::ParseFloat(settings.Get("retro_hdr_brightness", "2.00"),
