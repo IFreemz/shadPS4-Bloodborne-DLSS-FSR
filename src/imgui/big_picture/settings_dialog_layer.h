@@ -23,5 +23,6 @@ private:
 };
 
 void OpenInGameSettingsDialog();
+bool IsInGameSettingsDialogOpen();
 
 }; // namespace  ImGuiEmuSettings

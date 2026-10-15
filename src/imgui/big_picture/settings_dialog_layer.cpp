@@ -42,4 +42,8 @@ void OpenInGameSettingsDialog() {
     running = true;
 }
 
+bool IsInGameSettingsDialogOpen() {
+    return settingsLayer.has_value();
+}
+
 } // namespace ImGuiEmuSettings
