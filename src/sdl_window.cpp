@@ -330,10 +330,20 @@ void WindowSDL::WaitEvent() {
         }
         break;
     }
-    case SDL_EVENT_MOUSE_TO_JOYSTICK:
-        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
-                                       Input::ToggleMouseModeTo(Input::MouseMode::Joystick));
+    case SDL_EVENT_MOUSE_TO_JOYSTICK: {
+        const bool on = Input::ToggleMouseModeTo(Input::MouseMode::Joystick);
+        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), on);
+        if (on) {
+            SDL_HideCursor();
+        } else {
+            SDL_ShowCursor();
+        }
+        // Keyboard and mouse controls: F7 is F1's Mouse look switch.
+        if (Input::BbKbm::Active()) {
+            Input::BbKbm::SetMouseLook(on);
+        }
         break;
+    }
     case SDL_EVENT_MOUSE_TO_GYRO:
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
                                        Input::ToggleMouseModeTo(Input::MouseMode::Gyro));
