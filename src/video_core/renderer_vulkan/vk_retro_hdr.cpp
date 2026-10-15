@@ -166,7 +166,7 @@ std::optional<Display> QueryDisplay(HWND window) {
 }
 #endif
 
-State ResolveState([[maybe_unused]] void* native_window, [[maybe_unused]] bool scrgb_supported) {
+State ResolveState([[maybe_unused]] void* native_window, [[maybe_unused]] bool hdr_supported) {
     if (RenoDxLoaded())
         return State::RenoDx;
 #ifdef _WIN32
@@ -179,7 +179,7 @@ State ResolveState([[maybe_unused]] void* native_window, [[maybe_unused]] bool s
     session.sdr_white_nits = display->sdr_white_nits;
     if (!display->hdr_on)
         return State::WindowsHdrOff;
-    if (!scrgb_supported)
+    if (!hdr_supported)
         return State::NoScRgbFormat;
     return polled.enabled ? State::Active : State::Disabled;
 #else
@@ -189,13 +189,17 @@ State ResolveState([[maybe_unused]] void* native_window, [[maybe_unused]] bool s
 
 } // namespace
 
-bool Start(void* native_window, bool scrgb_supported) {
+bool Start(void* native_window, bool scrgb_supported, bool hdr10_supported) {
     std::error_code error;
     polled_time = std::filesystem::last_write_time(BbDlssSettingsPath(), error);
     polled = ReadSettings(Settings{});
-    session.state = ResolveState(native_window, scrgb_supported);
-    LOG_INFO(Render_Vulkan, "RetroHDR: {} (Windows peak {:.0f} nits, SDR white {:.0f} nits)",
-             Describe(session.state), session.windows_peak_nits, session.sdr_white_nits);
+    session.state = ResolveState(native_window, scrgb_supported || hdr10_supported);
+    // HDR10 first: DLSS frame generation does not generate frames on scRGB.
+    session.pq = session.state == State::Active && hdr10_supported;
+    LOG_INFO(Render_Vulkan, "RetroHDR: {}{} (Windows peak {:.0f} nits, SDR white {:.0f} nits)",
+             Describe(session.state),
+             session.state == State::Active ? (session.pq ? ", HDR10" : ", scRGB") : "",
+             session.windows_peak_nits, session.sdr_white_nits);
     return session.state == State::Active;
 }
 
@@ -231,7 +235,7 @@ std::string_view Describe(State state) {
     case State::WindowsHdrOff:
         return "turn on Use HDR in the Windows display settings, then restart the game";
     case State::NoScRgbFormat:
-        return "the GPU driver offers no scRGB swapchain";
+        return "the GPU driver offers no HDR swapchain";
     }
     return {};
 }
@@ -254,6 +258,7 @@ PassParams Poll() {
         .brightness = std::clamp(polled.brightness, MinBrightness,
                                  MaxBrightness(PeakNits(polled.peak_override))),
         .sdr_white = session.sdr_white_nits / 80.0f,
+        .pq = session.pq ? 1u : 0u,
     };
 }
 

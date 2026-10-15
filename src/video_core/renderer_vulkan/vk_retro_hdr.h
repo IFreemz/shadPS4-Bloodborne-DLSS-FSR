@@ -7,8 +7,9 @@
 #include "common/types.h"
 
 // SDR to HDR the way Special K retrofits SDR games: Perceptual Boost on the finished frame in the
-// present pass, shown through an scRGB swapchain. Settings live in dlss.ini next to the
-// upscaler's.
+// present pass, shown through an HDR10 swapchain (Rec.2020 PQ), or scRGB when the driver offers no
+// HDR10 one. DLSS frame generation does not generate frames on scRGB. Settings live in dlss.ini
+// next to the upscaler's.
 namespace Vulkan::RetroHdr {
 
 enum class State {
@@ -24,12 +25,14 @@ enum class State {
 // Decided once, when the swapchain picks its format.
 struct Session {
     State state{State::Disabled};
+    bool pq{}; ///< HDR10 swapchain: the present pass and the overlay encode Rec.2020 PQ
     float windows_peak_nits{};
     float sdr_white_nits{203.0f};
 };
 
-// Swapchain construction: whether the swapchain should be scRGB for RetroHDR.
-bool Start(void* native_window, bool scrgb_supported);
+// Swapchain construction: whether the swapchain should be HDR for RetroHDR (HDR10 when
+// `hdr10_supported`, see Session::pq, otherwise scRGB).
+bool Start(void* native_window, bool scrgb_supported, bool hdr10_supported);
 const Session& GetSession();
 std::string_view Describe(State state);
 // A dlss.ini value as a float; `fallback` unless the whole value is a finite number.
@@ -43,6 +46,7 @@ struct PassParams {
     u32 mode{ModeNone};
     float brightness{1.0f};
     float sdr_white{1.0f}; // Windows SDR white level / 80 nits
+    u32 pq{};              // encode Rec.2020 PQ (HDR10 swapchain) instead of scRGB
 };
 
 // GPU thread, every frame: re-reads dlss.ini when it changed.

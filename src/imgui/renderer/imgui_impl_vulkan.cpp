@@ -3,6 +3,7 @@
 
 // Based on imgui_impl_vulkan.cpp from Dear ImGui repository
 
+#include <array>
 #include <cstdio>
 #include <mutex>
 
@@ -1026,17 +1027,19 @@ static void CreatePipeline(vk::Device device, const vk::AllocationCallbacks* all
 
     const auto& retro_hdr = ::Vulkan::RetroHdr::GetSession();
     const bool scrgb_overlay = overlay && retro_hdr.state == ::Vulkan::RetroHdr::State::Active;
-    const float sdr_white = retro_hdr.sdr_white_nits / 80.0f;
-    const vk::SpecializationMapEntry sdr_white_entry{
-        .constantID = 0,
-        .offset = 0,
-        .size = sizeof(sdr_white),
-    };
+    const struct {
+        float sdr_white;
+        VkBool32 pq;
+    } overlay_constants{retro_hdr.sdr_white_nits / 80.0f, retro_hdr.pq ? VK_TRUE : VK_FALSE};
+    const std::array<vk::SpecializationMapEntry, 2> overlay_entries{{
+        {.constantID = 0, .offset = 0, .size = sizeof(float)},
+        {.constantID = 1, .offset = sizeof(float), .size = sizeof(VkBool32)},
+    }};
     const vk::SpecializationInfo scrgb_overlay_constants{
-        .mapEntryCount = 1,
-        .pMapEntries = &sdr_white_entry,
-        .dataSize = sizeof(sdr_white),
-        .pData = &sdr_white,
+        .mapEntryCount = static_cast<uint32_t>(overlay_entries.size()),
+        .pMapEntries = overlay_entries.data(),
+        .dataSize = sizeof(overlay_constants),
+        .pData = &overlay_constants,
     };
 
     vk::PipelineShaderStageCreateInfo stage[2]{

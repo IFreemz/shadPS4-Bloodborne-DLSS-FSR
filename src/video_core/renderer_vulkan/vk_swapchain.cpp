@@ -254,18 +254,20 @@ void Swapchain::FindPresentFormat() {
 
     // RenoDX turns the swapchain into scRGB below us. Asking for it here instead keeps the
     // format known to everything above the layers, frame generation included. RetroHDR draws
-    // its SDR to HDR output into the same format.
+    // its SDR to HDR output into HDR10 (where DLSS frame generation works), or scRGB.
     constexpr vk::SurfaceFormatKHR scrgb{.format = vk::Format::eR16G16B16A16Sfloat,
                                          .colorSpace = vk::ColorSpaceKHR::eExtendedSrgbLinearEXT};
     const bool scrgb_supported = std::ranges::find(formats, scrgb) != formats.end();
-    const bool retro_hdr = RetroHdr::Start(window.GetWindowInfo().render_surface, scrgb_supported);
+    const bool hdr10_supported = std::ranges::find(formats, SURFACE_FORMAT_HDR) != formats.end();
+    const bool retro_hdr = RetroHdr::Start(window.GetWindowInfo().render_surface, scrgb_supported,
+                                           hdr10_supported);
     if (RenoDxLoaded() && scrgb_supported) {
         LOG_INFO(Render_Vulkan, "RenoDX loaded: scRGB swapchain");
         surface_format = scrgb;
         return;
     }
     if (retro_hdr) {
-        surface_format = scrgb;
+        surface_format = RetroHdr::GetSession().pq ? SURFACE_FORMAT_HDR : scrgb;
         return;
     }
 

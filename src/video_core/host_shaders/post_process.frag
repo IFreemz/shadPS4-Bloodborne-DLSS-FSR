@@ -15,6 +15,7 @@ layout (push_constant) uniform settings {
     uint retro_mode;
     float retro_brightness;
     float retro_sdr_white;
+    uint retro_pq;
 } pp;
 
 const uint RETRO_OFF = 1u, RETRO_ON = 2u;
@@ -73,6 +74,17 @@ vec3 perceptual_boost(vec3 rgb) {
     return xyz_to_rec709 * mix(xyz * boosted.w / xyz.y, boosted.xyz, 0.333);
 }
 
+// BT.709 to BT.2020 primaries (column-major).
+const mat3 rec709_to_rec2020 = mat3(
+    0.6274040, 0.0690970, 0.0163916,
+    0.3292820, 0.9195400, 0.0880132,
+    0.0433136, 0.0113612, 0.8955950);
+
+// scRGB (1.0 = 80 nits) to HDR10: Rec.2020 primaries, PQ where 1.0 is 10000 nits.
+vec3 scrgb_to_hdr10(vec3 scrgb) {
+    return linear_to_pq(vec4(max(rec709_to_rec2020 * scrgb, 0.0), 0.0), 10000.0 / 80.0).rgb;
+}
+
 void main() {
     vec4 color_linear = texture(texSampler, uv);
     if (pp.hdr) {
@@ -85,7 +97,10 @@ void main() {
             color = vec4(perceptual_boost(sdr) * pp.retro_brightness, color_linear.a);
         } else if (pp.retro_mode == RETRO_OFF) {
             color = vec4(degamma(clamp(encoded, 0.0, 1.0)) * pp.retro_sdr_white, color_linear.a);
-        } else {
+        }
+        if (pp.retro_mode != 0u && pp.retro_pq != 0u) {
+            color.rgb = scrgb_to_hdr10(color.rgb);
+        } else if (pp.retro_mode == 0u) {
             color = vec4(encoded, color_linear.a);
         }
     }
