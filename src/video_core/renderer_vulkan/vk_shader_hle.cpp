@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include "common/alignment.h"
 #include "common/bb_tuning.h"
 #include "shader_recompiler/info.h"
@@ -28,7 +29,7 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     if (copies.size() < 8) {
         return false;
     }
-    u64 src_min = ~0ull, src_max = 0, dst_min = ~0ull, dst_max = 0;
+    u64 src_min = ~0ull, src_max = 0, dst_min = ~0ull, dst_max = 0, dst_bytes = 0;
     for (const auto& copy : copies) {
         if ((copy.srcOffset | copy.dstOffset | copy.size) & 3) {
             return false; // dword copies only
@@ -37,6 +38,19 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
         src_max = std::max(src_max, copy.srcOffset + copy.size);
         dst_min = std::min(dst_min, copy.dstOffset);
         dst_max = std::max(dst_max, copy.dstOffset + copy.size);
+        dst_bytes += copy.size;
+    }
+    // The dispatch runs all copies at once, in no particular order. A batch that moves data
+    // within one buffer (a copy reading what another writes, e.g. compacting a list) or that
+    // writes the same bytes twice depends on the copies' order: copy those one by one.
+    const bool moves_in_place = src == dst && src_min < dst_max && dst_min < src_max;
+    if (moves_in_place || dst_bytes > dst_max - dst_min) {
+        static std::atomic<u64> ordered{};
+        if (const u64 n = ordered.fetch_add(1, std::memory_order_relaxed); (n & (n - 1)) == 0) {
+            LOG_INFO(Render_Vulkan, "Merged copies: {} batches copied in order ({})", n + 1,
+                     moves_in_place ? "data moved within a buffer" : "overlapping destinations");
+        }
+        return false;
     }
     auto& runtime = rasterizer.GetRuntime();
     auto& scheduler = runtime.GetScheduler();
