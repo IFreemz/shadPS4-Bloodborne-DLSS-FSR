@@ -408,6 +408,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
 // -------------------------------
 // GPU settings
 // -------------------------------
+// Bloodborne settings whose default changed to on are switched on once in configs saved before
+// (each saved config holds every value, so a new default never reached them). 1: "Also free idle
+// buffers" and "Background texture copies".
+constexpr int BbDefaultsVersion = 1;
+
 struct GPUSettings {
     Setting<u32> window_width{1280};
     Setting<u32> window_height{720};
@@ -465,6 +470,8 @@ struct GPUSettings {
     // Threaded renderer: clean vertex/index data of 1-16 KiB read where it is in GPU memory
     // instead of copied for every draw. Off: copied as before.
     Setting<bool> bb_geometry_in_place{true};
+    // Saved with the settings: the Bloodborne defaults they were saved with (BbDefaultsVersion).
+    Setting<int> bb_defaults{BbDefaultsVersion};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -507,6 +514,7 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_vram_budget_test_mb",
                                        &GPUSettings::bb_vram_budget_test_mb),
             make_override<GPUSettings>("bb_geometry_in_place", &GPUSettings::bb_geometry_in_place),
+            make_override<GPUSettings>("bb_defaults", &GPUSettings::bb_defaults),
         };
     }
 };
@@ -518,7 +526,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     userfaultfd, inline_fetch_shader, threaded_renderer, threaded_renderer_diagnostics,
     threaded_renderer_gpu_profile, bb_object_motion, bb_readback_queue, bb_streaming,
     bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
-    bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place)
+    bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place, bb_defaults)
 
 // -------------------------------
 // Vulkan settings
@@ -615,6 +623,9 @@ public:
     void SetAddonInstallDir(const std::filesystem::path& dir);
 
 private:
+    /// Switches on Bloodborne settings whose default changed, in a config saved before
+    /// (BbDefaultsVersion). Returns whether it changed anything.
+    bool UpdateBbDefaults(const nlohmann::json& file, bool game_specific);
     GeneralSettings m_general{};
     NetworkSettings m_network{};
     LogSettings m_log{};

@@ -394,6 +394,32 @@ void EmulatorSettingsImpl::MigrateNetworkKeys(const json& general, const json& n
 
 // ── Load ──────────────────────────────────────────────────────────────
 
+bool EmulatorSettingsImpl::UpdateBbDefaults(const json& file, bool game_specific) {
+    const json gpu = file.contains("GPU") && file["GPU"].is_object() ? file["GPU"] : json::object();
+    const auto saved = gpu.find("bb_defaults");
+    if (saved != gpu.end() && saved->is_number_integer() &&
+        saved->get<int>() >= BbDefaultsVersion) {
+        return false;
+    }
+    // Saved before these defaults: switch them on once. A game's file only overrides what it holds.
+    for (auto* setting : {&m_gpu.bb_buffer_eviction, &m_gpu.bb_background_texture_copies}) {
+        if (!game_specific) {
+            setting->value = true;
+        } else if (setting->game_specific_value) {
+            setting->game_specific_value = true;
+        }
+    }
+    if (game_specific && m_gpu.bb_defaults.game_specific_value) {
+        m_gpu.bb_defaults.game_specific_value = BbDefaultsVersion;
+    }
+    m_gpu.bb_defaults.value = BbDefaultsVersion;
+    LOG_INFO(Config,
+             "Bloodborne settings: idle buffer freeing and background texture copies "
+             "switched on (new defaults, {} config)",
+             game_specific ? "game" : "global");
+    return true;
+}
+
 bool EmulatorSettingsImpl::Load(const std::string& serial) {
     // A newly loaded profile replaces, rather than extends, the previous profile.
     ClearGameSpecificOverrides();
@@ -427,6 +453,9 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 mergeGroup(m_audio, "Audio");
                 mergeGroup(m_gpu, "GPU");
                 mergeGroup(m_vulkan, "Vulkan");
+                if (UpdateBbDefaults(gj, false)) {
+                    Save();
+                }
             } else {
                 if (std::filesystem::exists(Common::FS::GetUserPath(Common::FS::PathType::UserDir) /
                                             "config.toml")) {
@@ -512,6 +541,7 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 ApplyGroupOverrides(m_audio, gj.at("Audio"), changed);
             if (gj.contains("GPU"))
                 ApplyGroupOverrides(m_gpu, gj.at("GPU"), changed);
+            UpdateBbDefaults(gj, true);
             if (gj.contains("Vulkan"))
                 ApplyGroupOverrides(m_vulkan, gj.at("Vulkan"), changed);
 
