@@ -26,6 +26,9 @@
 #include "video_core/renderer_vulkan/vk_hdr_mod.h"
 #include "video_core/renderer_vulkan/vk_retro_hdr.h"
 #include "core/bb_mouse_camera.h"
+#include "core/devtools/layer.h"
+#include "imgui/big_picture/settings_dialog_layer.h"
+#include "imgui/friends_layer.h"
 #include "input/bb_kbm.h"
 #include "input/controller.h"
 #include "input/input_mouse.h"
@@ -142,8 +145,14 @@ class DlssLayer final : public ImGui::Layer {
 public:
     void Draw() override;
     bool ShouldKeepDrawing() override {
-        return open || toggle_requested;
+        // Also while another window holds the mouse, to give it back to the camera after.
+        return open || toggle_requested || mouse_released;
     }
+    // Keyboard and mouse: the mouse turns the camera only while no shadPS4 window is open.
+    void UpdateMouseLook();
+    bool mouse_look_wanted = false; // read on the first frame (settings load after this layer)
+    bool mouse_look_read = false;
+    bool mouse_released = false;
     void Open() {
         settings.Load();
         patches = ReadPatches();
@@ -156,9 +165,6 @@ public:
         // is open, and the mouse cursor is shown.
         ImGui::Core::AcquireGamepadInputCapture();
         GetIO().MouseDrawCursor = true;
-        // Keyboard and mouse: the mouse leaves the camera so it can use the panel.
-        if (Input::GetMouseMode() == Input::MouseMode::Joystick)
-            Input::BbKbm::RequestMouseLook(false);
     }
     void Close() {
         if (!open)
@@ -166,8 +172,7 @@ public:
         open = false;
         ImGui::Core::ReleaseGamepadInputCapture();
         GetIO().MouseDrawCursor = false;
-        if (Input::BbKbm::MouseLookWanted())
-            Input::BbKbm::RequestMouseLook(true);
+        mouse_look_wanted = Input::BbKbm::MouseLookWanted(); // settings may have changed
     }
     bool open{};
     bool focus{};
@@ -237,7 +242,28 @@ public:
 
 CounterLayer counter;
 
+void DlssLayer::UpdateMouseLook() {
+    if (!mouse_look_read) {
+        mouse_look_read = true;
+        mouse_look_wanted = Input::BbKbm::MouseLookWanted();
+    }
+    if (!mouse_look_wanted)
+        return;
+    const bool window_open = open || ImGuiEmuSettings::IsInGameSettingsDialogOpen() ||
+                             Overlay::IsQuitWindowOpen() || ImGui::Friends::IsOpen() ||
+                             ImGui::Core::IsGamepadInputCaptured();
+    if (window_open && !mouse_released &&
+        Input::GetMouseMode() == Input::MouseMode::Joystick) {
+        Input::BbKbm::RequestMouseLook(false);
+        mouse_released = true;
+    } else if (!window_open && mouse_released) {
+        Input::BbKbm::RequestMouseLook(true);
+        mouse_released = false;
+    }
+}
+
 void DlssLayer::Draw() {
+    UpdateMouseLook();
     if (toggle_requested.exchange(false)) {
         if (open)
             Close();

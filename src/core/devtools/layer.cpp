@@ -540,6 +540,10 @@ void ToggleQuitWindow() {
     show_quit_window = !show_quit_window;
 }
 
+bool IsQuitWindowOpen() {
+    return show_quit_window;
+}
+
 void ShowVolume() {
     volume_start_time = ImGui::GetTime();
     show_volume = true;

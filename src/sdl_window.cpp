@@ -171,6 +171,10 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // input handler init-s
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
+    // Ours: written again from dlss.ini, so changed defaults reach it, then mouse look on.
+    if (Input::BbKbm::Active()) {
+        Input::BbKbm::Apply();
+    }
     if (Input::BbKbm::MouseLookWanted()) {
         Input::BbKbm::RequestMouseLook(true);
     }
@@ -316,8 +320,14 @@ void WindowSDL::WaitEvent() {
         } else if (Input::GetMouseMode() == Input::MouseMode::Joystick) {
             Input::SetMouseMode(Input::MouseMode::Off);
         }
-        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
-                                       Input::GetMouseMode() != Input::MouseMode::Off);
+        const bool captured = Input::GetMouseMode() != Input::MouseMode::Off;
+        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), captured);
+        // Relative mode alone left the cursor drawn (frozen) on the main menu.
+        if (captured) {
+            SDL_HideCursor();
+        } else {
+            SDL_ShowCursor();
+        }
         break;
     }
     case SDL_EVENT_MOUSE_TO_JOYSTICK:
