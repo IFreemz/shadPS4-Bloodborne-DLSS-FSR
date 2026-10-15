@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include "common/types.h"
 #include "shader_recompiler/ir/type.h"
 #include "video_core/amdgpu/resource.h"
@@ -240,6 +241,8 @@ struct PushData {
         buf_offsets[binding] = offset;
     }
 };
+static_assert(offsetof(PushData, motion_param) % 8 == 0,
+              "motion_param is read as a uvec2 and must be 8-byte aligned");
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
 

@@ -14,7 +14,7 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Experimental build: different from upstream's (binary 9, meta 6, key 3) and from earlier
 // experimental builds, so no build loads the others' character-motion shaders or keys.
-static constexpr u32 ShaderBinaryVersion = 10u;
+static constexpr u32 ShaderBinaryVersion = 11u;
 static constexpr u32 ShaderMetaVersion = 8u;
 static constexpr u32 PipelineKeyVersion = 5u;
 } // namespace Serialization

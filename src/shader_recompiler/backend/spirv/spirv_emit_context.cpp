@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstddef>
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -804,7 +805,9 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
     if (VertexMotion()) {
         MemberName(struct_type, PushData::MotionParamIndex, "motion_param");
-        MemberDecorate(struct_type, PushData::MotionParamIndex, spv::Decoration::Offset, 56U);
+        // After buf_offsets, wherever NUM_BUFFERS puts it (upstream raised it from 40 to 56).
+        MemberDecorate(struct_type, PushData::MotionParamIndex, spv::Decoration::Offset,
+                       static_cast<u32>(offsetof(PushData, motion_param)));
     }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
