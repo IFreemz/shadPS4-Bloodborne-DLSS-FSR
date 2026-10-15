@@ -25,6 +25,10 @@
 #include "video_core/renderer_vulkan/vk_hdr_meter.h"
 #include "video_core/renderer_vulkan/vk_hdr_mod.h"
 #include "video_core/renderer_vulkan/vk_retro_hdr.h"
+#include "core/bb_mouse_camera.h"
+#include "input/bb_kbm.h"
+#include "input/controller.h"
+#include "input/input_mouse.h"
 
 namespace ImGui::Dlss {
 namespace {
@@ -144,12 +148,17 @@ public:
         settings.Load();
         patches = ReadPatches();
         patch_message.clear();
+        kbm_message.clear();
+        capture_action = -1;
         open = true;
         focus = true;
         // Like shadPS4's other prompts: the game stops reading the controller while the panel
         // is open, and the mouse cursor is shown.
         ImGui::Core::AcquireGamepadInputCapture();
         GetIO().MouseDrawCursor = true;
+        // Keyboard and mouse: the mouse leaves the camera so it can use the panel.
+        if (Input::GetMouseMode() == Input::MouseMode::Joystick)
+            Input::BbKbm::RequestMouseLook(false);
     }
     void Close() {
         if (!open)
@@ -157,6 +166,8 @@ public:
         open = false;
         ImGui::Core::ReleaseGamepadInputCapture();
         GetIO().MouseDrawCursor = false;
+        if (Input::BbKbm::MouseLookWanted())
+            Input::BbKbm::RequestMouseLook(true);
     }
     bool open{};
     bool focus{};
@@ -167,6 +178,12 @@ private:
     SettingsFile settings;
     PatchState patches;
     std::string patch_message;
+    std::string kbm_message;
+    // Rebinding: the action and slot (0 key, 1 mouse) waiting for an input, -1 none.
+    int capture_action = -1;
+    int capture_slot = 0;
+    int capture_frames = 0;
+    void DrawKeyBindings();
 };
 
 DlssLayer layer;
@@ -233,16 +250,19 @@ void DlssLayer::Draw() {
         SetNextWindowFocus();
         focus = false;
     }
-    SetNextWindowSize({460, 0}, ImGuiCond_Appearing);
+    // Resizable, never taller or wider than the screen; the content scrolls inside it.
+    const ImVec2 screen = GetMainViewport()->WorkSize;
+    SetNextWindowSizeConstraints({420.0f, 240.0f}, {screen.x * 0.95f, screen.y * 0.9f});
+    SetNextWindowSize({520.0f, screen.y * 0.75f}, ImGuiCond_FirstUseEver);
     SetNextWindowPos(GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {0.5f, 0.5f});
     bool keep_open = true;
     if (!Begin("Upscaling  (F1 / Esc to close)", &keep_open,
-               ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking |
-                   ImGuiWindowFlags_AlwaysAutoResize)) {
+               ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking)) {
         End();
         return;
     }
-    if (!keep_open || (IsWindowFocused() && IsKeyPressed(ImGuiKey_Escape, false))) {
+    if (!keep_open ||
+        (capture_action < 0 && IsWindowFocused() && IsKeyPressed(ImGuiKey_Escape, false))) {
         End();
         Close();
         return;
@@ -411,6 +431,16 @@ void DlssLayer::Draw() {
     SameLine();
     TextDisabled("(steady menu backgrounds)");
 
+    bool texture_lod_bias = settings.Get("texture_lod_bias", "1") != "0";
+    if (Checkbox("Sharper textures", &texture_lod_bias))
+        settings.Set("texture_lod_bias", texture_lod_bias ? "1" : "0");
+    if (IsItemHovered())
+        SetTooltip("While upscaling, the scene's textures are sampled for the output resolution, "
+                   "not the lower render\nresolution (NVIDIA's DLSS guide). Off: the game's own "
+                   "texture detail. Can add a little shimmer\non fine patterns.");
+    SameLine();
+    TextDisabled("(texture detail of the output resolution)");
+
     SeparatorText("SDR to HDR");
     namespace RetroHdr = ::Vulkan::RetroHdr;
     const auto& retro_hdr = RetroHdr::GetSession();
@@ -460,6 +490,63 @@ void DlssLayer::Draw() {
     else
         TextDisabled("(no Windows value, %.0f nits used)", peak);
     EndDisabled();
+
+    SeparatorText("Keyboard & mouse");
+    if (!Input::BbKbm::Active()) {
+        TextWrapped("Bloodborne PC controls: WASD to move, the mouse for the camera, left click to "
+                    "attack, all rebindable. Your current controls are kept as a backup.");
+        if (Button("Use keyboard & mouse controls"))
+            kbm_message = Input::BbKbm::Apply()
+                              ? "Done. The mouse turns the camera when this panel is closed."
+                              : "Could not write the input config.";
+    } else {
+        bool mouse_look = settings.Get("mouse_look", "1") != "0";
+        if (Checkbox("Mouse look", &mouse_look))
+            settings.Set("mouse_look", mouse_look ? "1" : "0");
+        SameLine();
+        TextDisabled("(F7 toggles it in game)");
+        float sensitivity =
+            std::clamp(RetroHdr::ParseFloat(settings.Get("mouse_sensitivity", "1.50"),
+                                            Input::BbKbm::DefaultSensitivity),
+                       Input::BbKbm::MinSensitivity, Input::BbKbm::MaxSensitivity);
+        if (SliderFloat("Mouse sensitivity", &sensitivity, Input::BbKbm::MinSensitivity,
+                        Input::BbKbm::MaxSensitivity, "%.2f"))
+            settings.Set("mouse_sensitivity", fmt::format("{:.2f}", sensitivity));
+        if (IsItemDeactivatedAfterEdit())
+            Input::BbKbm::Apply();
+        SameLine();
+        if (Button("Default##mouse_sensitivity")) {
+            settings.Set("mouse_sensitivity",
+                         fmt::format("{:.2f}", Input::BbKbm::DefaultSensitivity));
+            Input::BbKbm::Apply();
+        }
+        bool invert_y = settings.Get("mouse_invert_y", "0") == "1";
+        if (Checkbox("Invert mouse Y", &invert_y))
+            settings.Set("mouse_invert_y", invert_y ? "1" : "0");
+        SameLine();
+        bool invert_x = settings.Get("mouse_invert_x", "0") == "1";
+        if (Checkbox("Invert mouse X", &invert_x))
+            settings.Set("mouse_invert_x", invert_x ? "1" : "0");
+        bool auto_rotation = settings.Get("camera_auto_rotation", "0") == "1";
+        if (Checkbox("Camera auto-rotation (restart)", &auto_rotation))
+            settings.Set("camera_auto_rotation", auto_rotation ? "1" : "0");
+        if (IsItemHovered())
+            SetTooltip("The game turning the camera by itself as you move. Off with keyboard and "
+                       "mouse: it fights\nevery mouse turn.");
+        if (::Core::BbMouseCamera::Installed())
+            TextDisabled("Native mouse camera: on");
+        else
+            TextDisabled("Native mouse camera: restart the game to turn it on (Bloodborne 1.09)");
+        if (TreeNode("Key bindings")) {
+            DrawKeyBindings();
+            TreePop();
+        }
+        if (Button("Restore previous controls"))
+            kbm_message = Input::BbKbm::Restore() ? "Previous controls restored."
+                                                  : "Could not restore the input config.";
+    }
+    if (!kbm_message.empty())
+        TextWrapped("%s", kbm_message.c_str());
 
     SeparatorText("Resolution");
     TextWrapped("The game's render resolution is upscaled to your shadPS4 window size. The "
@@ -511,6 +598,170 @@ void DlssLayer::Draw() {
     SameLine();
     TextDisabled("(off = sharper in motion)");
     End();
+}
+
+
+// shadPS4's name for an ImGui key, empty if it can't be bound (F keys stay hotkeys).
+std::string KeyName(ImGuiKey key) {
+    if (key >= ImGuiKey_A && key <= ImGuiKey_Z)
+        return std::string(1, char('a' + (key - ImGuiKey_A)));
+    if (key >= ImGuiKey_0 && key <= ImGuiKey_9)
+        return std::string(1, char('0' + (key - ImGuiKey_0)));
+    if (key >= ImGuiKey_Keypad0 && key <= ImGuiKey_Keypad9)
+        return fmt::format("kp{}", int(key - ImGuiKey_Keypad0));
+    switch (key) {
+    case ImGuiKey_Space:
+        return "space";
+    case ImGuiKey_Tab:
+        return "tab";
+    case ImGuiKey_Enter:
+        return "enter";
+    case ImGuiKey_Escape:
+        return "escape";
+    case ImGuiKey_Backspace:
+        return "backspace";
+    case ImGuiKey_CapsLock:
+        return "capslock";
+    case ImGuiKey_LeftShift:
+        return "lshift";
+    case ImGuiKey_RightShift:
+        return "rshift";
+    case ImGuiKey_LeftCtrl:
+        return "lctrl";
+    case ImGuiKey_RightCtrl:
+        return "rctrl";
+    case ImGuiKey_LeftAlt:
+        return "lalt";
+    case ImGuiKey_RightAlt:
+        return "ralt";
+    case ImGuiKey_UpArrow:
+        return "up";
+    case ImGuiKey_DownArrow:
+        return "down";
+    case ImGuiKey_LeftArrow:
+        return "left";
+    case ImGuiKey_RightArrow:
+        return "right";
+    case ImGuiKey_Insert:
+        return "insert";
+    case ImGuiKey_Home:
+        return "home";
+    case ImGuiKey_End:
+        return "end";
+    case ImGuiKey_PageUp:
+        return "pgup";
+    case ImGuiKey_PageDown:
+        return "pgdown";
+    case ImGuiKey_Minus:
+        return "minus";
+    case ImGuiKey_Equal:
+        return "equals";
+    case ImGuiKey_LeftBracket:
+        return "lbracket";
+    case ImGuiKey_RightBracket:
+        return "rbracket";
+    case ImGuiKey_Backslash:
+        return "backslash";
+    case ImGuiKey_Semicolon:
+        return "semicolon";
+    case ImGuiKey_Apostrophe:
+        return "apostrophe";
+    case ImGuiKey_Comma:
+        return "comma";
+    case ImGuiKey_Period:
+        return "period";
+    case ImGuiKey_Slash:
+        return "slash";
+    case ImGuiKey_GraveAccent:
+        return "grave";
+    default:
+        return {};
+    }
+}
+
+void DlssLayer::DrawKeyBindings() {
+    const auto actions = Input::BbKbm::Actions();
+    // Waiting for an input: the first key or mouse button pressed after the click.
+    if (capture_action >= 0 && ++capture_frames > 2) {
+        const auto& action = actions[capture_action];
+        auto binding = Input::BbKbm::GetBinding(action);
+        bool done = false;
+        if (capture_slot == 0) {
+            for (int key = ImGuiKey_NamedKey_BEGIN; key < ImGuiKey_NamedKey_END && !done; ++key) {
+                if (!IsKeyPressed(ImGuiKey(key), false))
+                    continue;
+                const std::string name = KeyName(ImGuiKey(key));
+                if (name.empty())
+                    continue;
+                binding.key = name;
+                done = true;
+            }
+        } else {
+            static constexpr const char* Buttons[] = {"leftbutton", "rightbutton", "middlebutton",
+                                                      "sidebuttonback", "sidebuttonforward"};
+            for (int button = 0; button < 5 && !done; ++button) {
+                if (IsMouseClicked(button)) {
+                    binding.mouse = Buttons[button];
+                    done = true;
+                }
+            }
+            const float wheel = GetIO().MouseWheel;
+            if (!done && wheel != 0.0f) {
+                binding.mouse = wheel > 0.0f ? "mousewheelup" : "mousewheeldown";
+                done = true;
+            }
+        }
+        if (done) {
+            Input::BbKbm::SetBinding(action, binding);
+            Input::BbKbm::Apply();
+            capture_action = -1;
+        }
+    }
+
+    TextDisabled("Click a cell, then press the key or mouse button. Right-click a cell to clear "
+                 "it.");
+    if (BeginTable("kbm_bindings", 3,
+                   ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                       ImGuiTableFlags_SizingStretchProp)) {
+        TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 2.0f);
+        TableSetupColumn("Key", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        TableSetupColumn("Mouse", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        TableHeadersRow();
+        for (int i = 0; i < int(actions.size()); ++i) {
+            const auto& action = actions[i];
+            const auto binding = Input::BbKbm::GetBinding(action);
+            TableNextRow();
+            TableNextColumn();
+            TextUnformatted(action.label);
+            for (int slot = 0; slot < 2; ++slot) {
+                TableNextColumn();
+                const bool waiting = capture_action == i && capture_slot == slot;
+                const std::string label =
+                    waiting ? std::string(slot == 0 ? "press a key" : "press a button")
+                            : Input::BbKbm::DisplayName(slot == 0 ? binding.key : binding.mouse);
+                PushID(i * 2 + slot);
+                if (Button(label.c_str(), {-FLT_MIN, 0.0f})) {
+                    capture_action = waiting ? -1 : i;
+                    capture_slot = slot;
+                    capture_frames = 0;
+                }
+                if (IsItemClicked(ImGuiMouseButton_Right)) {
+                    auto cleared = binding;
+                    (slot == 0 ? cleared.key : cleared.mouse).clear();
+                    Input::BbKbm::SetBinding(action, cleared);
+                    Input::BbKbm::Apply();
+                    capture_action = -1;
+                }
+                PopID();
+            }
+        }
+        EndTable();
+    }
+    if (Button("Default keys")) {
+        Input::BbKbm::ResetBindings();
+        Input::BbKbm::Apply();
+        capture_action = -1;
+    }
 }
 
 } // namespace

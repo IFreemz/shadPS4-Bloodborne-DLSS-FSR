@@ -25,6 +25,8 @@
 #include "imgui/dlss_layer.h"
 #include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
+#include "core/bb_mouse_camera.h"
+#include "input/bb_kbm.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
@@ -169,6 +171,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // input handler init-s
     Input::ControllerOutput::LinkJoystickAxes();
     Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
+    if (Input::BbKbm::MouseLookWanted()) {
+        Input::BbKbm::RequestMouseLook(true);
+    }
 
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -218,6 +223,12 @@ void WindowSDL::WaitEvent() {
         return;
     }
 
+    // Bloodborne's native mouse camera: every motion event as it arrives (the mouse timer below
+    // runs every 33 ms, which turned the camera on one frame in three at 90 fps).
+    if (event.type == SDL_EVENT_MOUSE_MOTION &&
+        Input::GetMouseMode() == Input::MouseMode::Joystick && Core::BbMouseCamera::Installed()) {
+        Core::BbMouseCamera::AddMotion(event.motion.xrel, event.motion.yrel);
+    }
     if (ImGui::Core::ProcessEvent(&event)) {
         return;
     }
@@ -298,6 +309,17 @@ void WindowSDL::WaitEvent() {
     case SDL_EVENT_RELOAD_INPUTS:
         Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
         break;
+    case SDL_EVENT_BB_MOUSE_LOOK: {
+        const bool on = reinterpret_cast<intptr_t>(event.user.data1) != 0;
+        if (on) {
+            Input::SetMouseMode(Input::MouseMode::Joystick);
+        } else if (Input::GetMouseMode() == Input::MouseMode::Joystick) {
+            Input::SetMouseMode(Input::MouseMode::Off);
+        }
+        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
+                                       Input::GetMouseMode() != Input::MouseMode::Off);
+        break;
+    }
     case SDL_EVENT_MOUSE_TO_JOYSTICK:
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
                                        Input::ToggleMouseModeTo(Input::MouseMode::Joystick));
