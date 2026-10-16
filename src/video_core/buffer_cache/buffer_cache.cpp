@@ -38,6 +38,9 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 // Background texture copies (test setting): smaller copies are done in place.
 static constexpr u64 BackgroundCopyMin = 16_KB;
 static constexpr u64 BackgroundCopyPiece = 1_MB;
+// Buffer uploads at least this large go to the copy threads (streamed geometry; the small
+// per-frame updates are cheaper to copy in place).
+static constexpr u64 BackgroundBufferCopyMin = 64_KB;
 // Buffer eviction: the "Also free idle buffers" setting (on by default, with VRAM cleanup) or
 // SHADPS4_BUFFER_EVICTION=1.
 // It crashed with the threaded renderer when it evicted memory unused for 300 frames; this
@@ -1098,8 +1101,31 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     if (!copies.empty()) {
         const auto start = std::chrono::steady_clock::now();
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
-        if (total_size_bytes >= Common::CopyPool::ParallelThreshold &&
-            Common::BbTuning::Streaming()) {
+        bool background = false;
+        if (total_size_bytes >= BackgroundBufferCopyMin && Common::BbTuning::Threaded() &&
+            EmulatorSettings.IsBbBackgroundTextureCopies()) {
+            // Streaming a new area uploads 100+ MiB of vertex and index data in one frame, in a
+            // few hundred buffers of ~0.5 MiB: copied here they held up the draw recorder for
+            // 30+ ms. On the copy threads instead, like background texture copies: waited for
+            // before the submission that reads the staging memory and before the guest sees a
+            // fence. The GPU copy below is recorded now, so the order of GPU work is unchanged.
+            for (const auto& copy : copies) {
+                for (u64 offset = 0; offset < copy.size; offset += BackgroundCopyPiece) {
+                    const u64 length = std::min(BackgroundCopyPiece, copy.size - offset);
+                    const u64 staged = copy.srcOffset + offset;
+                    Common::GuestStats::async_copies.fetch_add(1, std::memory_order_relaxed);
+                    Common::CopyPool::Async([memory = memory, source = copy.dstOffset + offset,
+                                             destination = staging.mapped + staged, length,
+                                             buffer = staging.buffer,
+                                             flush = staging.offset + staged] {
+                        memory->CopySparseMemory(source, destination, length);
+                        buffer->Flush(flush, length);
+                    });
+                }
+            }
+            background = true;
+        } else if (total_size_bytes >= Common::CopyPool::ParallelThreshold &&
+                   Common::BbTuning::Streaming()) {
             // Large uploads (newly streamed data): copied in parallel, in 512 KiB pieces.
             struct Piece {
                 VAddr source;
@@ -1127,7 +1153,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             copy.srcOffset += staging.offset;
             copy.dstOffset -= arena->cpu_addr;
         }
-        staging.Flush();
+        if (!background) {
+            staging.Flush(); // background pieces flush their own range
+        }
         runtime.CopyBuffer(staging.buffer, arena, copies);
         namespace GS = Common::GuestStats;
         GS::buffer_upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);

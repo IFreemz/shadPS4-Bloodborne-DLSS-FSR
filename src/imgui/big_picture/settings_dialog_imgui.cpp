@@ -789,9 +789,9 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Smoother above 60 fps. Off: frames on vblank ticks");
                 AddSettingCheckbox("    Geometry in place (testing)", bbGeometryInPlaceSetting,
                                    "Static vertex/index data not copied for every draw");
-                AddSettingCheckbox(
-                    "    Background texture copies (testing)", bbBackgroundTextureCopiesSetting,
-                    "Copies textures for the GPU on other threads while drawing goes on");
+                AddSettingCheckbox("    Background copies (testing)",
+                                   bbBackgroundTextureCopiesSetting,
+                                   "Copies textures and new geometry for the GPU on other threads");
             }
             // Not under the threaded renderer: the upscalers use it either way.
             AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,

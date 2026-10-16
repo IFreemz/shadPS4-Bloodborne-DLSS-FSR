@@ -1282,7 +1282,7 @@ void Rasterizer::ReportHitch() {
             "pipelines compiled | {} texture uploads ({:.1f} MiB, {:.1f} ms, copying {:.1f} ms) | "
             "buffer uploads {:.1f} MiB, {:.1f} ms | {} buffer ranges made resident ({:.1f} MiB, "
             "{:.1f} ms) | {} staging allocations ({:.1f} MiB, {:.1f} ms) | {} background "
-            "texture copies, waited {:.1f} ms | page protection {} "
+            "copies (1 MiB pieces), waited {:.1f} ms | page protection {} "
             "calls {:.1f} ms, {} write faults | "
             "game: {} files opened, {} mutex waits, {} sleeps ({:.1f} ms) | end of submissions: "
             "buffer tick {:.1f}, downloads {:.1f}, GC {:.1f}, runtime tick {:.1f} ms | "
