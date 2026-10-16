@@ -148,6 +148,44 @@ bool Rasterizer::FilterDrawPasses() const {
     return !(mode == Mode::Disable && (depth_copy || stencil_copy));
 }
 
+bool Rasterizer::DrawWritesNothing(const GraphicsPipeline* pipeline) {
+    if (pipeline->GetStages()[static_cast<u32>(Shader::SwStage::Fragment)]) {
+        return false; // colour, depth export, discard or memory writes: drawn
+    }
+    if (pipeline != no_write_pipeline) {
+        no_write_pipeline = pipeline;
+        no_write_shaders = true;
+        for (const auto* stage : pipeline->GetStages()) {
+            if (!stage) {
+                continue;
+            }
+            const bool writes =
+                stage->uses_dma || stage->has_storage_images ||
+                std::ranges::any_of(stage->buffers, [](const auto& b) { return b.is_written; }) ||
+                std::ranges::any_of(stage->images, [](const auto& i) { return i.is_written; });
+            no_write_shaders &= !writes;
+        }
+    }
+    if (!no_write_shaders) {
+        return false;
+    }
+    const auto& regs = Regs();
+    if (regs.vgt_strmout_config.raw) {
+        return false;
+    }
+    const bool depth = regs.depth_control.depth_enable && regs.depth_buffer.DepthValid();
+    const bool stencil = regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid();
+    if (depth || stencil) {
+        // Not skipped: they can write depth or stencil, and a bound target can start a clear.
+        if (!regs.depth_control.depth_write_enable && !stencil) {
+            ++depth_test_only_draws;
+        }
+        return false;
+    }
+    ++empty_draws_skipped;
+    return EmulatorSettings.IsBbSkipEmptyDraws();
+}
+
 bool Rasterizer::FilterDraw() {
     const auto& regs = Regs();
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
@@ -694,7 +732,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         ABeginDraw();
         const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
         ALap(ASection::Pipeline);
-        if (pipeline) {
+        if (pipeline && !DrawWritesNothing(pipeline)) {
             QueueDraw(PacketKind::Draw, pipeline, is_indexed, index_offset, {});
         }
         AEndDraw();
@@ -3885,6 +3923,14 @@ void Rasterizer::LogDrawPipeStats() {
         LOG_INFO(Render_Vulkan, "  vertex/index data copied ahead: {:.0f}/s",
                  (geometry - pipe_stats_geometry_ring_copies) / seconds);
         pipe_stats_geometry_ring_copies = geometry;
+        LOG_INFO(
+            Render_Vulkan,
+            "  draws that write nothing (skipped when on): {:.0f}/s; depth-test-only draws without "
+            "a pixel shader: {:.0f}/s",
+            (empty_draws_skipped - pipe_stats_empty_draws_skipped) / seconds,
+            (depth_test_only_draws - pipe_stats_depth_test_only_draws) / seconds);
+        pipe_stats_empty_draws_skipped = empty_draws_skipped;
+        pipe_stats_depth_test_only_draws = depth_test_only_draws;
     }
     {
         const u64 prepared = vertex_prepared.load(std::memory_order_relaxed);

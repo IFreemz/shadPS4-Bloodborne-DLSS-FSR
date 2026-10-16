@@ -175,6 +175,16 @@ private:
 
     bool FilterDraw();
     bool FilterDrawPasses() const;
+    /// Stage A: true for a draw that cannot write anything (no pixel shader, no depth or
+    /// stencil test, no memory writes in its shaders, no stream out), e.g. occlusion query
+    /// geometry, whose results are not emulated. Such draws are skipped (setting).
+    bool DrawWritesNothing(const GraphicsPipeline* pipeline);
+    const GraphicsPipeline* no_write_pipeline{}; ///< stage A memo: last pipeline checked
+    bool no_write_shaders{};
+    u64 empty_draws_skipped{};   ///< stage A
+    u64 depth_test_only_draws{}; ///< stage A: no pixel shader, depth/stencil read only
+    u64 pipe_stats_empty_draws_skipped{};
+    u64 pipe_stats_depth_test_only_draws{};
 
     // Threaded renderer (vk_draw_pipe.h).
     struct IndirectArgs {

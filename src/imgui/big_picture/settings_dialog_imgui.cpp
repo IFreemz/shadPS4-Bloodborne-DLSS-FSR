@@ -79,6 +79,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbBufferEvictionSetting = EmulatorSettings.IsBbBufferEviction();
     bbBackgroundTextureCopiesSetting = EmulatorSettings.IsBbBackgroundTextureCopies();
     bbGeometryInPlaceSetting = EmulatorSettings.IsBbGeometryInPlace();
+    bbSkipEmptyDrawsSetting = EmulatorSettings.IsBbSkipEmptyDraws();
     bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
 
     /////////// Input Tab
@@ -150,6 +151,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbBufferEviction(bbBufferEvictionSetting, isSpecific);
     EmulatorSettings.SetBbBackgroundTextureCopies(bbBackgroundTextureCopiesSetting, isSpecific);
     EmulatorSettings.SetBbGeometryInPlace(bbGeometryInPlaceSetting, isSpecific);
+    EmulatorSettings.SetBbSkipEmptyDraws(bbSkipEmptyDrawsSetting, isSpecific);
     EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
 
     /////////// Input Tab
@@ -792,6 +794,9 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox("    Background copies (testing)",
                                    bbBackgroundTextureCopiesSetting,
                                    "Copies textures and new geometry for the GPU on other threads");
+                AddSettingCheckbox("    Skip draws with no output (testing)",
+                                   bbSkipEmptyDrawsSetting,
+                                   "Occlusion test geometry the emulator does not use");
             }
             // Not under the threaded renderer: the upscalers use it either way.
             AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,
