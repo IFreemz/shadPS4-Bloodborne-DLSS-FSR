@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <unordered_set>
 #include <magic_enum/magic_enum.hpp>
 
@@ -1094,10 +1095,17 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                                     bool is_written, bool is_texel_buffer) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
+    std::optional<Common::GuestStats::DetailTimer> timer{std::in_place,
+                                                         Common::GuestStats::Detail::BufTrack};
     memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
         copies.emplace_back(total_size_bytes, addr, size);
         total_size_bytes += size;
     });
+    if (copies.empty()) {
+        timer.reset();
+    } else {
+        timer.emplace(Common::GuestStats::Detail::BufCopy);
+    }
     if (!copies.empty()) {
         const auto start = std::chrono::steady_clock::now();
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);

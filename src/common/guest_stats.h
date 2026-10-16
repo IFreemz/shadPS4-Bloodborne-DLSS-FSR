@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <chrono>
 
 #include "common/types.h"
 
@@ -91,6 +93,52 @@ public:
 private:
     bool active = false;
     u8 previous = 0;
+};
+
+/// "Detailed stutter reports": time of the steps of new textures and buffers (Detail), and the
+/// page protection done on the draw recorder. Only timed while `detail_timing` is set.
+enum class Detail : u32 {
+    TexTrack,        ///< texture memory protected (TrackImage)
+    TexStaging,      ///< texture data to staging (copies queued or done)
+    TexDetile,       ///< texture detiling recorded
+    TexUpload,       ///< texture copy recorded
+    TexView,         ///< texture view found or created
+    TexCreate,       ///< new texture created and registered
+    BufTrack,        ///< buffer ranges to upload found, marked and protected
+    BufCopy,         ///< buffer staging and copy queued or recorded
+    RecorderProtect, ///< page protection calls made on the draw recorder
+    Count,
+};
+inline std::atomic<bool> detail_timing{false};
+inline std::array<std::atomic<u64>, static_cast<size_t>(Detail::Count)> detail_ns{};
+inline std::atomic<u64> recorder_protect_calls{0};
+inline thread_local bool on_recorder = false;
+
+/// Adds the scope's time to `detail` while detail timing is on.
+class DetailTimer {
+public:
+    explicit DetailTimer(Detail detail_)
+        : detail{detail_}, on{detail_timing.load(std::memory_order_relaxed)} {
+        if (on) {
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~DetailTimer() {
+        if (on) {
+            detail_ns[static_cast<size_t>(detail)].fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count(),
+                std::memory_order_relaxed);
+        }
+    }
+    DetailTimer(const DetailTimer&) = delete;
+    DetailTimer& operator=(const DetailTimer&) = delete;
+
+private:
+    Detail detail;
+    bool on;
+    std::chrono::steady_clock::time_point start{};
 };
 
 } // namespace Common::GuestStats

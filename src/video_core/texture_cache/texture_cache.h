@@ -17,6 +17,7 @@
 #include <tsl/robin_map.h>
 
 #include "common/bb_tuning.h"
+#include "common/guest_stats.h"
 #include "common/lru_cache.h"
 #include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
@@ -158,7 +159,10 @@ public:
             return;
         }
         TouchImage(image);
-        TrackImage(image_id);
+        {
+            Common::GuestStats::DetailTimer timer{Common::GuestStats::Detail::TexTrack};
+            TrackImage(image_id);
+        }
         RefreshImage(image);
         // Under the image's lock: a fault handler untracking it (and clearing clean_tick) must
         // not be overwritten by a stale "clean".

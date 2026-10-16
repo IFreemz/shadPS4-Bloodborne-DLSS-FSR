@@ -199,6 +199,11 @@ private:
     void QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_indexed, u32 index_offset,
                    const IndirectArgs& args);
     static void RunDrawPacket(void* context, const u8* data, u32 size);
+    static void RunDrawPacketBody(Rasterizer& self, const u8* data, u32 size);
+    /// "Detailed stutter reports" (with diagnostics): every draw timed by section, every packet
+    /// timed by kind, and both shown for each stutter. Slower; for finding stutter causes.
+    static bool HitchProfile();
+    std::array<std::atomic<u64>, 5> packet_kind_ns{}; ///< draw recorder, by PacketKind
     void DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
     void DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_indexed,
                             const IndirectArgs& args);
@@ -223,6 +228,10 @@ private:
             staging_bytes{}, staging_ns{}, async_copies{}, async_wait_ns{}, file_opens{},
             resident_bytes{}, diag_ns{};
         std::array<u64, 4> housekeeping{};
+        std::array<s64, 20> sections{}; ///< draw recorder profile (Section), HitchProfile
+        std::array<u64, 5> packet_kinds{};
+        std::array<u64, static_cast<size_t>(Common::GuestStats::Detail::Count)> details{};
+        u64 recorder_protect_calls{};
     };
     HitchSnapshot hitch_last{};
     /// Diagnostics setting (statistics, time breakdown, hitch reports, draw profile).

@@ -172,6 +172,7 @@ private:
         Common::SetCurrentThreadName("shadPS4:GpuDrawRecorder");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
         role = Role::StageB;
+        Common::GuestStats::on_recorder = true;
         u64 at = 0;
         while (true) {
             // Packets follow each other within microseconds while a frame is decoded: spin,

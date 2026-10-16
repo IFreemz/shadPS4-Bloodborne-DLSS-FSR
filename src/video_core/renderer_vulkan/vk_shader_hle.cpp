@@ -29,6 +29,7 @@ namespace {
 struct CopyStats {
     std::atomic<u64> dispatches, batches, commands, multi, copies, bytes, flushes, cpu_ns;
     std::atomic<u64> small, unaligned, overlapping, too_large;
+    std::atomic<u64> after_write, overwrite_write, overwrite_read;
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 };
 CopyStats copy_stats;
@@ -49,6 +50,8 @@ void LogCopyStats() {
     const u64 bytes = take(c.bytes), flushes = take(c.flushes), cpu_ns = take(c.cpu_ns);
     const u64 small = take(c.small), unaligned = take(c.unaligned);
     const u64 overlapping = take(c.overlapping), too_large = take(c.too_large);
+    const u64 after_write = take(c.after_write), overwrite_write = take(c.overwrite_write);
+    const u64 overwrite_read = take(c.overwrite_read);
     if (dispatches == 0 || commands == 0) {
         return;
     }
@@ -56,14 +59,16 @@ void LogCopyStats() {
              "Copy shader: {:.0f} game dispatches/s, {:.1f} batches and {:.1f} GPU copy commands "
              "per dispatch, {:.0f} copies/s, {:.1f} MiB/s; commands: multi-copy dispatch "
              "{:.0f}%, vkCmdCopyBuffer {:.0f}% (fewer than 8 copies {:.0f}%, unaligned {:.0f}%, "
-             "too large {:.0f}%, copies overlap {:.0f}%); barriers before a command {:.0f}%; "
-             "CPU {:.0f} us per dispatch",
+             "too large {:.0f}%, copies overlap {:.0f}%); barriers before a command {:.0f}% "
+             "(reads data written since the last barrier {:.0f}%, overwrites data written {:.0f}%, "
+             "overwrites data read {:.0f}%); CPU {:.0f} us per dispatch",
              dispatches / seconds, double(batches) / dispatches, double(commands) / dispatches,
              copies / seconds, bytes / seconds / (1 << 20), 100.0 * multi / commands,
              100.0 * (commands - multi) / commands, 100.0 * small / commands,
              100.0 * unaligned / commands, 100.0 * too_large / commands,
              100.0 * overlapping / commands, 100.0 * flushes / commands,
-             cpu_ns / 1000.0 / dispatches);
+             100.0 * after_write / commands, 100.0 * overwrite_write / commands,
+             100.0 * overwrite_read / commands, cpu_ns / 1000.0 / dispatches);
 }
 
 // A batch's ranges in its host buffers (barrier checks and access tracking stay this precise).
@@ -109,6 +114,20 @@ bool RangesAccessed(Runtime& runtime, const VideoCore::Buffer* src, const VideoC
         }
     }
     return false;
+}
+
+// Diagnostics: counts a command that needs a barrier first, by what it waits for.
+void CountBarrier(Runtime& runtime, const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
+                  std::span<const BatchRange> ranges) {
+    Count(copy_stats.flushes);
+    bool src_written = false, dst_written = false;
+    for (const auto& range : ranges) {
+        src_written |= runtime.IsBufferAccessed(src, range.src_offset, range.src_size);
+        dst_written |= runtime.IsBufferAccessed(dst, range.dst_offset, range.dst_size);
+    }
+    Count(src_written   ? copy_stats.after_write
+          : dst_written ? copy_stats.overwrite_write
+                        : copy_stats.overwrite_read);
 }
 } // namespace
 
@@ -209,7 +228,7 @@ static bool MultiCopy(Rasterizer& rasterizer, const VideoCore::Buffer* src,
     scheduler.EndRendering();
     if (RangesAccessed(runtime, src, dst, ranges)) {
         if (diagnostics) {
-            Count(copy_stats.flushes);
+            CountBarrier(runtime, src, dst, ranges);
         }
         runtime.FlushBarriers();
     }
@@ -376,7 +395,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             return;
         }
         if (diagnostics && RangesAccessed(runtime, src, dst, ranges)) {
-            Count(copy_stats.flushes);
+            CountBarrier(runtime, src, dst, ranges);
         }
         runtime.CopyBuffer(src, dst, group);
     };

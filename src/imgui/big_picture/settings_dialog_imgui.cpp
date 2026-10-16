@@ -80,6 +80,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbBackgroundTextureCopiesSetting = EmulatorSettings.IsBbBackgroundTextureCopies();
     bbGeometryInPlaceSetting = EmulatorSettings.IsBbGeometryInPlace();
     bbSkipEmptyDrawsSetting = EmulatorSettings.IsBbSkipEmptyDraws();
+    bbStutterDetailSetting = EmulatorSettings.IsBbStutterDetail();
     bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
 
     /////////// Input Tab
@@ -152,6 +153,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbBackgroundTextureCopies(bbBackgroundTextureCopiesSetting, isSpecific);
     EmulatorSettings.SetBbGeometryInPlace(bbGeometryInPlaceSetting, isSpecific);
     EmulatorSettings.SetBbSkipEmptyDraws(bbSkipEmptyDrawsSetting, isSpecific);
+    EmulatorSettings.SetBbStutterDetail(bbStutterDetailSetting, isSpecific);
     EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
 
     /////////// Input Tab
@@ -814,6 +816,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                "Frame time, stutter, VRAM and readback reports");
             AddSettingCheckbox("GPU time per pass in the log", threadedRendererGpuProfileSetting,
                                "Which render passes take the GPU's time");
+            AddSettingCheckbox("Detailed stutter reports", bbStutterDetailSetting,
+                               "With diagnostics: where each stutter's time went (slower)");
             // Testing the VRAM cleanup: act as if the GPU had this much VRAM (0 = real amount).
             AddSettingSliderInt("VRAM budget for testing (MB, 0 = real)", bbVramBudgetTestSetting,
                                 0, 24000);

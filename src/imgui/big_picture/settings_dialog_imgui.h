@@ -152,6 +152,7 @@ private:
     bool bbBackgroundTextureCopiesSetting;
     bool bbGeometryInPlaceSetting;
     bool bbSkipEmptyDrawsSetting;
+    bool bbStutterDetailSetting;
     int bbVramBudgetTestSetting;
     bool rcasEnabledSetting;
     float rcasAttenuationSetting;

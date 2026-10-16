@@ -1273,6 +1273,19 @@ void Rasterizer::ReportHitch() {
     for (size_t i = 0; i < now.housekeeping.size(); ++i) {
         now.housekeeping[i] = housekeeping_total[i].load(std::memory_order_relaxed);
     }
+    static_assert(std::tuple_size_v<decltype(now.sections)> == SectionNames.size());
+    for (size_t i = 0; i < now.sections.size(); ++i) {
+        now.sections[i] = profile_ns[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < now.packet_kinds.size(); ++i) {
+        now.packet_kinds[i] = packet_kind_ns[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < now.details.size(); ++i) {
+        now.details[i] = GS::detail_ns[i].load(std::memory_order_relaxed);
+    }
+    now.recorder_protect_calls = GS::recorder_protect_calls.load(std::memory_order_relaxed);
+    GS::detail_timing.store(HitchProfile() && diagnostics.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
     const auto last = std::exchange(hitch_last, now);
     const u64 slowest_ns = GS::slowest_wait_ns.exchange(0, std::memory_order_relaxed);
     if (last.time == std::chrono::steady_clock::time_point{}) {
@@ -1352,6 +1365,56 @@ void Rasterizer::ReportHitch() {
             ms_of(delta(now.housekeeping[2], last.housekeeping[2])),
             ms_of(delta(now.housekeeping[3], last.housekeeping[3])),
             ms_of(delta(now.diag_ns, last.diag_ns)));
+        if (HitchProfile()) {
+            // Where the draw recorder's time went in this frame (every draw timed).
+            std::array<std::pair<double, const char*>, SectionNames.size()> sections{};
+            for (size_t i = 0; i < sections.size(); ++i) {
+                sections[i] = {(now.sections[i] - last.sections[i]) / 1e6, SectionNames[i]};
+            }
+            std::ranges::sort(sections, std::greater{});
+            std::string by_section;
+            for (const auto& [section_ms, name] : sections) {
+                if (section_ms >= 0.3) {
+                    by_section += fmt::format("{}{} {:.1f}", by_section.empty() ? "" : ", ", name,
+                                              section_ms);
+                }
+            }
+            static constexpr std::array<const char*, 5> kinds{
+                "draws", "indirect draws", "dispatches", "indirect dispatches", "other packets"};
+            std::string by_kind;
+            double packets_ms = 0.0;
+            for (size_t i = 0; i < kinds.size(); ++i) {
+                const double kind_ms = ms_of(delta(now.packet_kinds[i], last.packet_kinds[i]));
+                packets_ms += kind_ms;
+                if (kind_ms >= 0.1) {
+                    by_kind +=
+                        fmt::format("{}{} {:.1f}", by_kind.empty() ? "" : ", ", kinds[i], kind_ms);
+                }
+            }
+            const double busy_ms =
+                std::chrono::duration<double, std::milli>(now.busy - last.busy).count();
+            LOG_WARNING(Render_Vulkan,
+                        "Stutter detail: draw recorder by packet: {} (between packets {:.1f}) | "
+                        "draws by section: {}",
+                        by_kind.empty() ? "-" : by_kind, std::max(0.0, busy_ms - packets_ms),
+                        by_section.empty() ? "-" : by_section);
+            const auto detail = [&](GS::Detail which) {
+                const auto i = static_cast<size_t>(which);
+                return ms_of(delta(now.details[i], last.details[i]));
+            };
+            LOG_WARNING(
+                Render_Vulkan,
+                "Stutter detail: new textures: protect {:.1f}, data to staging {:.1f}, detile "
+                "{:.1f}, upload record {:.1f}, views {:.1f}, create {:.1f} ms | buffers: find, "
+                "mark and protect {:.1f}, staging and copy {:.1f} ms | page protection on the "
+                "draw recorder: {} calls, {:.1f} ms",
+                detail(GS::Detail::TexTrack), detail(GS::Detail::TexStaging),
+                detail(GS::Detail::TexDetile), detail(GS::Detail::TexUpload),
+                detail(GS::Detail::TexView), detail(GS::Detail::TexCreate),
+                detail(GS::Detail::BufTrack), detail(GS::Detail::BufCopy),
+                delta(now.recorder_protect_calls, last.recorder_protect_calls),
+                detail(GS::Detail::RecorderProtect));
+        }
     } else if (ms < 200.0) {
         // Usual frame time, stutters (and long pauses such as loading) left out.
         hitch_avg_ms = hitch_frames == 0 ? ms : hitch_avg_ms * 0.95 + ms * 0.05;
@@ -3726,15 +3789,33 @@ const Rasterizer::PrefetchedBuffer* Rasterizer::FindPrefetched(u32 buffer_index)
     return nullptr;
 }
 
+bool Rasterizer::HitchProfile() {
+    return EmulatorSettings.IsBbStutterDetail();
+}
+
 void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     auto& self = *static_cast<Rasterizer*>(context);
+    if (!HitchProfile() || !self.diagnostics.load(std::memory_order_relaxed)) [[likely]] {
+        RunDrawPacketBody(self, data, size);
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    RunDrawPacketBody(self, data, size);
+    const size_t kind = std::min<size_t>(*data, self.packet_kind_ns.size() - 1);
+    self.packet_kind_ns[kind].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count(),
+                                        std::memory_order_relaxed);
+}
+
+void Rasterizer::RunDrawPacketBody(Rasterizer& self, const u8* data, u32 size) {
     if (*data == static_cast<u8>(PacketKind::Task)) {
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
         task.task(self, data + sizeof(TaskPacket));
         return;
     }
     self.profile_draw = self.diagnostics.load(std::memory_order_relaxed) &&
-                        (self.profile_counter++ & 7) == 0 &&
+                        ((self.profile_counter++ & 7) == 0 || HitchProfile()) &&
                         *data == static_cast<u8>(PacketKind::Draw);
     if (self.profile_draw) {
         self.profile_last = std::chrono::steady_clock::now();

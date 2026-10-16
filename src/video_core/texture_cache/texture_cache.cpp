@@ -4,6 +4,7 @@
 #include <bit>
 #include <chrono>
 #include <limits>
+#include <optional>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -790,6 +791,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
+        Common::GuestStats::DetailTimer timer{Common::GuestStats::Detail::TexCreate};
         image_id = slot_images.Insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
@@ -847,6 +849,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
+    Common::GuestStats::DetailTimer timer{Common::GuestStats::Detail::TexView};
     return image.FindView(desc.view_info);
 }
 
@@ -1037,14 +1040,19 @@ void TextureCache::RefreshImage(Image& image) {
     scheduler.EndRendering();
 
     const auto upload_start = std::chrono::steady_clock::now();
+    namespace GSD = Common::GuestStats;
+    std::optional<GSD::DetailTimer> timer{std::in_place, GSD::Detail::TexStaging};
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+    timer.emplace(GSD::Detail::TexDetile);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
     }
 
+    timer.emplace(GSD::Detail::TexUpload);
     runtime.UploadImage(&image, buffer, image_copies);
+    timer.reset();
     namespace GS = Common::GuestStats;
     GS::image_uploads.fetch_add(1, std::memory_order_relaxed);
     GS::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);

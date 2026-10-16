@@ -474,6 +474,9 @@ struct GPUSettings {
     // Threaded renderer: draws that cannot write anything (no pixel shader, colour, depth or
     // stencil target, no memory writes; occlusion query geometry) skipped. Off: drawn.
     Setting<bool> bb_skip_empty_draws{true};
+    // Diagnostics: every draw timed, and where the draw recorder's time went shown for each
+    // stutter (slower: for finding stutter causes).
+    Setting<bool> bb_stutter_detail{false};
     // Saved with the settings: the Bloodborne defaults they were saved with (BbDefaultsVersion).
     Setting<int> bb_defaults{BbDefaultsVersion};
 
@@ -519,6 +522,7 @@ struct GPUSettings {
                                        &GPUSettings::bb_vram_budget_test_mb),
             make_override<GPUSettings>("bb_geometry_in_place", &GPUSettings::bb_geometry_in_place),
             make_override<GPUSettings>("bb_skip_empty_draws", &GPUSettings::bb_skip_empty_draws),
+            make_override<GPUSettings>("bb_stutter_detail", &GPUSettings::bb_stutter_detail),
             make_override<GPUSettings>("bb_defaults", &GPUSettings::bb_defaults),
         };
     }
@@ -532,7 +536,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     threaded_renderer_gpu_profile, bb_object_motion, bb_readback_queue, bb_streaming,
     bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
     bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place, bb_skip_empty_draws,
-    bb_defaults)
+    bb_stutter_detail, bb_defaults)
 
 // -------------------------------
 // Vulkan settings
@@ -843,6 +847,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbBackgroundTextureCopies, bb_background_texture_copies)
     SETTING_FORWARD_BOOL(m_gpu, BbGeometryInPlace, bb_geometry_in_place)
     SETTING_FORWARD_BOOL(m_gpu, BbSkipEmptyDraws, bb_skip_empty_draws)
+    SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 

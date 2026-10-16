@@ -439,6 +439,15 @@ struct SignalImpl : public PageManager::Impl {
             std::memory_order_relaxed);
         Common::GuestStats::protect_calls.fetch_add(1, std::memory_order_relaxed);
         Common::GuestStats::protect_pages.fetch_add(size >> 12, std::memory_order_relaxed);
+        if (Common::GuestStats::on_recorder) {
+            namespace GS = Common::GuestStats;
+            GS::recorder_protect_calls.fetch_add(1, std::memory_order_relaxed);
+            GS::detail_ns[static_cast<size_t>(GS::Detail::RecorderProtect)].fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count(),
+                std::memory_order_relaxed);
+        }
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
