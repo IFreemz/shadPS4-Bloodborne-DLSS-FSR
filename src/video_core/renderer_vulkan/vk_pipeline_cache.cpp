@@ -767,6 +767,12 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
+        // Diagnostics: a known shader in a new variant. Empty slots are variants the cache
+        // held for other pipelines that could not be preloaded.
+        const auto empty = std::ranges::count_if(
+            program->modules, [](const Program::Module& m) { return !m.module; });
+        LOG_INFO(Render_Vulkan, "New variant {} of {} shader {:#x} ({} known, {} not preloaded)",
+                 perm_idx, hw_stage, params.hash, program->modules.size() - empty, empty);
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 
