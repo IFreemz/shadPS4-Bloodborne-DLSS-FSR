@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -221,6 +222,21 @@ private:
     };
     ResidentRangeList resident_ranges;
     std::unordered_map<u64, u64> resident_chunk_use; ///< 2 MiB chunk -> second of last use
+    /// Chunks already marked used this second (MarkResidentUse skips the map write).
+    struct ChunkUseMemo {
+        u64 chunk{~0ull};
+        u64 second{};
+    };
+    std::array<ChunkUseMemo, 1024> chunk_use_memo{};
+    /// Block ranges known to be fully resident (EnsureResident skips the gap search). Valid
+    /// while resident_generation is unchanged: it changes whenever residency is taken away.
+    struct ResidentMemo {
+        u64 first_block{~0ull};
+        u64 last_block{};
+        u64 generation{};
+    };
+    std::array<ResidentMemo, 1024> resident_memo{};
+    u64 resident_generation{1};
     /// Buffer eviction: resident memory slabs, handed out and taken back block by block.
     struct ResidentSlab {
         u64 size_blocks{};

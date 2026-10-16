@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -239,9 +240,16 @@ void Liverpool::Process(std::stop_token stoken) {
             task.resume();
 
             if (task.done()) {
-                // The guest may reuse the memory of a finished submission: its draws must
-                // have been recorded first.
-                if (rasterizer) {
+                // Threaded renderer: the next submission is decoded while the draw recorder
+                // still records this one (as bbport does). The guest learns of finished work
+                // only from fences and labels, which the recorder writes in order after the
+                // draws, and from GPU idle, which waits for the recorder below.
+                // SHADPS4_SUBMIT_DRAIN=1: wait for the recorder after each submission, as before.
+                static const bool drain_each = [] {
+                    const char* value = std::getenv("SHADPS4_SUBMIT_DRAIN");
+                    return value && value[0] == '1';
+                }();
+                if (rasterizer && drain_each) {
                     rasterizer->DrainDrawPipe();
                 }
                 task.destroy();
@@ -347,6 +355,38 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     }
 
     FIBER_EXIT;
+}
+
+// DmaData into or from memory and GDS (on the draw recorder with the threaded renderer).
+static void ExecuteDmaData(Vulkan::Rasterizer& rasterizer, const PM4DmaData& dma) {
+    const auto* dma_data = &dma;
+    if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
+        rasterizer.FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(), dma_data->data, true);
+    } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+               dma_data->dst_sel == DmaDataDst::Gds) {
+        rasterizer.CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
+                              dma_data->NumBytes(), true, false);
+    } else if (dma_data->src_sel == DmaDataSrc::Data &&
+               (dma_data->dst_sel == DmaDataDst::Memory ||
+                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+        rasterizer.FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(), dma_data->data,
+                              false);
+    } else if (dma_data->src_sel == DmaDataSrc::Gds &&
+               (dma_data->dst_sel == DmaDataDst::Memory ||
+                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+        rasterizer.CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
+                              dma_data->NumBytes(), false, true);
+    } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
+                dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
+               (dma_data->dst_sel == DmaDataDst::Memory ||
+                dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
+        rasterizer.CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->SrcAddress<VAddr>(),
+                              dma_data->NumBytes(), false, false);
+    } else {
+        UNREACHABLE_MSG("DmaData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
+                        u32(dma_data->dst_sel));
+    }
 }
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
@@ -924,37 +964,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (dma_data->dst_addr_lo == 0x3022C || !rasterizer) {
                     break;
                 }
-                rasterizer->DrainDrawPipe();
                 ASSERT(dma_data->command.das == 0);
-                if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
-                    rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
-                                           dma_data->data, true);
-                } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                            dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                           dma_data->dst_sel == DmaDataDst::Gds) {
-                    rasterizer->CopyBuffer(dma_data->dst_addr_lo, dma_data->SrcAddress<VAddr>(),
-                                           dma_data->NumBytes(), true, false);
-                } else if (dma_data->src_sel == DmaDataSrc::Data &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
-                                           dma_data->data, false);
-                } else if (dma_data->src_sel == DmaDataSrc::Gds &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(), dma_data->src_addr_lo,
-                                           dma_data->NumBytes(), false, true);
-                } else if ((dma_data->src_sel == DmaDataSrc::Memory ||
-                            dma_data->src_sel == DmaDataSrc::MemoryUsingL2) &&
-                           (dma_data->dst_sel == DmaDataDst::Memory ||
-                            dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
-                    rasterizer->CopyBuffer(dma_data->DstAddress<VAddr>(),
-                                           dma_data->SrcAddress<VAddr>(), dma_data->NumBytes(),
-                                           false, false);
-                } else {
-                    UNREACHABLE_MSG("WriteData src_sel = {}, dst_sel = {}", u32(dma_data->src_sel),
-                                    u32(dma_data->dst_sel));
+                if (!Vulkan::Rasterizer::DrainForSpecialPackets()) {
+                    // Threaded renderer: run by the draw recorder, in order with the draws.
+                    const bool to_memory = dma_data->dst_sel == DmaDataDst::Memory ||
+                                           dma_data->dst_sel == DmaDataDst::MemoryUsingL2;
+                    rasterizer->RunInOrder(
+                        [](Vulkan::Rasterizer& r, const u8* data) {
+                            ExecuteDmaData(r, *reinterpret_cast<const PM4DmaData*>(data));
+                        },
+                        dma_data, sizeof(PM4DmaData), to_memory ? dma_data->DstAddress<VAddr>() : 0,
+                        to_memory ? dma_data->NumBytes() : 0);
+                    break;
                 }
+                rasterizer->DrainDrawPipe();
+                ExecuteDmaData(*rasterizer, *dma_data);
                 break;
             }
             case PM4ItOpcode::WriteData: {

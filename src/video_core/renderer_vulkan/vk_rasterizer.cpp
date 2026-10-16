@@ -691,11 +691,30 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // Threaded renderer: stage A selects the pipeline and queues the rest of the draw. Draws
     // FilterDraw handles itself (fast clear elimination, resolve, depth copy, skips) run here.
     if (UseDrawPipe() && FilterDrawPasses()) {
+        ABeginDraw();
         const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+        ALap(ASection::Pipeline);
         if (pipeline) {
             QueueDraw(PacketKind::Draw, pipeline, is_indexed, index_offset, {});
         }
+        AEndDraw();
         return;
+    }
+    if (UseDrawPipe() && !DrainForSpecialPackets()) {
+        // Draws FilterDraw handles itself (fast clear elimination, resolve, depth copy, skips)
+        // run on the draw recorder, in order: a packet without a pipeline.
+        QueueDraw(PacketKind::Draw, nullptr, is_indexed, index_offset, {});
+        return;
+    }
+    if (UseDrawPipe() && Regs().primitive_type == AmdGpu::PrimitiveType::None) {
+        // FilterDraw only skips these (fast clear, resolve and copy modes are checked first by
+        // FilterDrawPasses): no need to wait for the draw recorder.
+        using Mode = AmdGpu::ColorControl::OperationMode;
+        const auto mode = Regs().color_control.mode;
+        if (mode != Mode::EliminateFastClear && mode != Mode::FmaskDecompress &&
+            mode != Mode::Resolve) {
+            return;
+        }
     }
     DrainDrawPipe();
     scheduler.PopPendingOperations();
@@ -1299,6 +1318,13 @@ void Rasterizer::ReportHitch() {
         // Usual frame time, stutters (and long pauses such as loading) left out.
         hitch_avg_ms = hitch_frames == 0 ? ms : hitch_avg_ms * 0.95 + ms * 0.05;
     }
+    // A heavier scene is not a run of stutters: after 10 slow frames in a row their time is
+    // the new usual one (otherwise every frame of it was reported).
+    hitch_run = hitch && ms < 200.0 ? hitch_run + 1 : 0;
+    if (hitch_run >= 10) {
+        hitch_avg_ms = ms;
+        hitch_run = 0;
+    }
     ++hitch_frames;
 }
 
@@ -1349,6 +1375,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         push_data.motion_param = {u32(no_motion), u32(no_motion >> 32)};
     }
     bind_stage_ordinal = 0;
+    prefetch_cursor = 0;
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -1407,8 +1434,8 @@ bool Rasterizer::PrepareVertexInputs(const GraphicsPipeline* pipeline) {
         }
     }
     for (const auto& range : merged) {
-        vtx_ranges.push_back(
-            {range.base, memory->ClampRangeSize(range.base, range.end - range.base)});
+        const u64 size = memory->ClampRangeSize(range.base, range.end - range.base);
+        vtx_ranges.push_back({range.base, size, RingCopyGeometry(range.base, size)});
     }
     for (const auto& buffer : vtx_buffers) {
         u8 index = NoRange;
@@ -1441,6 +1468,11 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         std::array<std::pair<const VideoCore::Buffer*, u64>, MaxVertexBufferCount> obtained{};
         for (u32 i = 0; i < prepared->num_ranges; ++i) {
             const auto& range = prepared->ranges[i];
+            if (range.ring != NoRing) {
+                // Copied into the constant ring by the GPU command thread.
+                obtained[i] = {const_ring.get(), range.ring}; // not tracked: see BindBuffers
+                continue;
+            }
             const auto [buffer, offset] =
                 buffer_cache.ObtainGeometryBuffer(range.base, u32(range.size));
             obtained[i] = {buffer, offset};
@@ -1586,7 +1618,14 @@ void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
     u32 index_buffer_size = static_cast<u32>(Common::AlignDown(mapped_size, index_size));
     vk::Buffer index_buffer{};
     u64 buffer_offset{};
-    if (index_buffer_size != 0) {
+    if (index_buffer_size != 0 && !is_indirect && packet_index_ring.offset != NoRing &&
+        packet_index_ring.address == index_address && packet_index_ring.size == index_buffer_size) {
+        // Copied into the constant ring by the GPU command thread.
+        // Not tracked for barriers: see BindBuffers.
+        const auto* ring = const_ring.get();
+        index_buffer = ring->Handle();
+        buffer_offset = packet_index_ring.offset;
+    } else if (index_buffer_size != 0) {
         const auto [buffer, offset] =
             buffer_cache.ObtainGeometryBuffer(index_address, index_buffer_size);
         needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
@@ -1910,9 +1949,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                                stage.pgm_hash, binding.unified);
                 temporal_dlss.ObserveSceneConstants(stage.FlatUserData().data(), size);
             } else {
-                bound_buffers.emplace_back(ring, prefetched->offset, size,
-                                           vk::AccessFlags2{vk::AccessFlagBits2::eShaderRead});
-                needs_barrier |= runtime.IsBufferAccessed(ring, prefetched->offset, size, false);
+                // No barrier tracking: the GPU never writes the ring, and the host writes of a
+                // region are visible at submission (it is reused only after the GPU is done).
                 if (temporal_dlss.Requested()) {
                     temporal_dlss.ObserveConstants(runtime, instance, ring, prefetched->offset,
                                                    size, stage.pgm_hash, binding.unified);
@@ -3186,6 +3224,10 @@ struct PacketHeader {
     u8 num_vertex_inputs;
     u8 num_vertex_ranges;
     bool motion_prepared;
+    bool ring_used; ///< the packet reads constant ring data (retirement bookkeeping)
+    u32 index_ring_size;
+    VAddr index_ring_address;
+    u64 index_ring_offset;
 };
 
 /// Bytes of a prepared vertex input section with `count` streams and `ranges` ranges.
@@ -3193,7 +3235,7 @@ constexpr u32 VertexSectionSize(u32 count, u32 ranges) {
     return count * static_cast<u32>(sizeof(vk::VertexInputAttributeDescription2EXT) +
                                     sizeof(vk::VertexInputBindingDescription2EXT) +
                                     sizeof(AmdGpu::Buffer)) +
-           AlignPacket(count) + ranges * 16;
+           AlignPacket(count) + ranges * 24;
 }
 
 struct TaskPacket {
@@ -3237,6 +3279,14 @@ void Rasterizer::DrainDrawPipe(u32 reason, std::source_location where) {
     it->second.time += draw_pipe->drain_time - before;
 }
 
+bool Rasterizer::DrainForSpecialPackets() {
+    static const bool drain = [] {
+        const char* value = std::getenv("SHADPS4_PIPE_DRAINS");
+        return value && value[0] == '1';
+    }();
+    return drain;
+}
+
 bool Rasterizer::IsGpuSideThread() const {
     return DrawPipe::OnStageA() || DrawPipe::OnStageB() ||
            std::this_thread::get_id() == liverpool->GetGpuCommandProcessorThread();
@@ -3275,26 +3325,49 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
 
     // Small read-only buffers copied here (constant ring); only for draws.
     prefetch_scratch.clear();
-    if (const_ring && (kind == PacketKind::Draw || kind == PacketKind::DrawIndirect)) {
+    if (const_ring && pipeline && (kind == PacketKind::Draw || kind == PacketKind::DrawIndirect)) {
         PrefetchBuffers(pipeline);
     }
+    ALap(ASection::Prefetch);
     const u32 num_prefetch = static_cast<u32>(prefetch_scratch.size());
     const bool vertex_prepared =
-        (kind == PacketKind::Draw || kind == PacketKind::DrawIndirect) &&
+        pipeline && (kind == PacketKind::Draw || kind == PacketKind::DrawIndirect) &&
         PrepareVertexInputs(static_cast<const GraphicsPipeline*>(pipeline));
+    ALap(ASection::Vertex);
     const u32 num_vertex = vertex_prepared ? static_cast<u32>(vtx_attributes.size()) : 0;
     const u32 num_vertex_ranges = vertex_prepared ? static_cast<u32>(vtx_ranges.size()) : 0;
     // Character motion inputs of a skinned draw, off the draw recorder.
     const bool motion_prepared =
-        kind == PacketKind::Draw && object_motion && object_motion->Active() &&
+        pipeline && kind == PacketKind::Draw && object_motion && object_motion->Active() &&
         static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().motion_vectors;
+    // The index buffer, when stage B would copy it (BindIndexBuffer's range).
+    RingIndex index_ring{};
+    if (kind == PacketKind::Draw && pipeline && is_indexed && const_ring) {
+        const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+        const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+        const VAddr base_address = regs.index_base_address.Address<VAddr>();
+        const VAddr index_address = base_address + u64(index_offset) * index_size;
+        const u64 requested = u64(std::min(regs.num_indices, regs.max_index_size)) * index_size;
+        const u64 mapped = base_address != 0 ? memory->ClampRangeSize(index_address, requested) : 0;
+        const u32 bytes = static_cast<u32>(Common::AlignDown(mapped, index_size));
+        if (bytes != 0) {
+            index_ring = {index_address, bytes, RingCopyGeometry(index_address, bytes)};
+        }
+    }
+    bool geometry_in_ring = index_ring.offset != NoRing;
+    if (vertex_prepared) {
+        for (const auto& range : vtx_ranges) {
+            geometry_in_ring |= range.ring != NoRing;
+        }
+    }
     MotionPrep motion_prep{};
     if (motion_prepared) {
         motion_prep = ComputeMotionPrep(static_cast<const GraphicsPipeline*>(pipeline), is_indexed,
                                         index_offset);
     }
+    ALap(ASection::Motion);
     // Storage buffers this draw writes: later prefetches must not read them early.
-    {
+    if (pipeline) {
         const u64 packet_no = draw_pipe->packets + 1;
         for (const auto* info : pipeline->GetStages()) {
             if (!info) {
@@ -3326,7 +3399,7 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
     std::array<const Shader::Info*, Shader::MaxStageTypes> infos{};
     u32 num_stages = 0;
     u32 stage_bytes = 0;
-    for (const auto* info : pipeline->GetStages()) {
+    for (const auto* info : pipeline ? pipeline->GetStages() : decltype(pipeline->GetStages()){}) {
         if (!info) {
             continue;
         }
@@ -3370,6 +3443,10 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
         .num_vertex_inputs = static_cast<u8>(num_vertex),
         .num_vertex_ranges = static_cast<u8>(num_vertex_ranges),
         .motion_prepared = motion_prepared,
+        .ring_used = num_prefetch != 0 || geometry_in_ring,
+        .index_ring_size = index_ring.size,
+        .index_ring_address = index_ring.address,
+        .index_ring_offset = index_ring.offset,
     };
     if (kind == PacketKind::Dispatch || kind == PacketKind::DispatchIndirect) {
         header.cs = liverpool->GetCsRegs();
@@ -3411,7 +3488,7 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
         put(vtx_buffers.data(), num_vertex * sizeof(AmdGpu::Buffer));
         std::memcpy(at, vtx_range_index.data(), num_vertex);
         at += AlignPacket(num_vertex);
-        static_assert(sizeof(PreparedRange) == 16);
+        static_assert(sizeof(PreparedRange) == 24);
         put(vtx_ranges.data(), num_vertex_ranges * sizeof(PreparedRange));
     }
     if (motion_prepared) {
@@ -3420,6 +3497,35 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
     }
     ASSERT(static_cast<u32>(at - out) == size);
     draw_pipe->Commit(size);
+    ALap(ASection::Packet);
+}
+
+void Rasterizer::ABeginDraw() {
+    if (!diagnostics.load(std::memory_order_relaxed)) {
+        a_profile = false;
+        a_last = {};
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    a_profile = (a_profile_counter++ & 7) == 0;
+    if (a_profile && a_last != std::chrono::steady_clock::time_point{}) {
+        const auto decode = (now - a_last) - (draw_pipe->drain_time - a_drain_mark);
+        if (decode < std::chrono::milliseconds(1)) {
+            a_profile_ns[static_cast<size_t>(ASection::Decode)].fetch_add(
+                decode.count(), std::memory_order_relaxed);
+            a_profile_draws.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    a_lap = now;
+}
+
+void Rasterizer::AEndDraw() {
+    if (!diagnostics.load(std::memory_order_relaxed)) {
+        return;
+    }
+    a_profile = false;
+    a_last = std::chrono::steady_clock::now();
+    a_drain_mark = draw_pipe->drain_time;
 }
 
 u64 Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, VAddr write_addr,
@@ -3440,7 +3546,7 @@ u64 Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, VAddr w
     return draw_pipe->packets;
 }
 
-u8* Rasterizer::RingAlloc(u64 size, u64 alignment, u64& offset) {
+void Rasterizer::RingRetire() {
     // Space the GPU has finished with: the draw recorder reports, per command buffer, how far
     // into the ring its recorded draws read.
     const u64 written = ring_retire_w.load(std::memory_order_acquire);
@@ -3454,17 +3560,52 @@ u8* Rasterizer::RingAlloc(u64 size, u64 alignment, u64& offset) {
         ++read;
     }
     ring_retire_r.store(read, std::memory_order_release);
+}
 
+u8* Rasterizer::RingAlloc(u64 size, u64 alignment, u64& offset) {
     u64 pos = Common::AlignUp(ring_head, alignment);
     if (pos % ConstRingSize + size > ConstRingSize) {
         pos = Common::AlignUp(pos, ConstRingSize);
     }
     if (pos + size > ring_free_until + ConstRingSize) {
-        return nullptr; // Full: the draw recorder copies this one as before.
+        // Only when the space runs out: the retirement check reads the draw recorder's
+        // counter and may ask the driver how far the GPU is (once per allocation it cost
+        // ~0.3 us each, several times per draw).
+        RingRetire();
+        if (pos + size > ring_free_until + ConstRingSize) {
+            return nullptr; // Full: the draw recorder copies this one as before.
+        }
     }
     ring_head = pos + size;
     offset = pos % ConstRingSize;
     return const_ring->mapped_data.data() + offset;
+}
+
+u64 Rasterizer::RingCopyGeometry(VAddr address, u64 size) {
+    // BufferCache::ObtainGeometryBuffer's copy path, decided here: data it would copy to the
+    // stream buffer (under 1 KiB, or changed by the CPU) and not written by queued GPU work.
+    if (!const_ring || size == 0 || size > VideoCore::BufferCache::StreamThreshold() ||
+        buffer_cache.IsRegionGpuModified(address, size)) {
+        return NoRing;
+    }
+    const bool copied = size < 1024 || !Common::BbTuning::Threaded() ||
+                        !EmulatorSettings.IsBbGeometryInPlace() ||
+                        buffer_cache.IsRegionCpuModified(address, size);
+    if (!copied || std::ranges::any_of(pending_writes, [&](const auto& write) {
+            return address < write.end && write.begin < address + size;
+        })) {
+        return NoRing;
+    }
+    u64 offset = 0;
+    u8* dest = RingAlloc(size, instance.UniformMinAlignment(), offset);
+    if (!dest) {
+        ring_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return NoRing;
+    }
+    memory->CopySparseMemory(address, dest, size);
+    const_ring->Flush(offset, size);
+    geometry_ring_copies.fetch_add(1, std::memory_order_relaxed);
+    return offset;
 }
 
 void Rasterizer::PrefetchBuffers(const Pipeline* pipeline) {
@@ -3527,15 +3668,20 @@ void Rasterizer::PrefetchBuffers(const Pipeline* pipeline) {
             const_ring->Flush(offset, size);
             prefetch_scratch.push_back({static_cast<u8>(stage), static_cast<u8>(index), 0,
                                         static_cast<u32>(size), offset});
-            ring_prefetches.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+    if (!prefetch_scratch.empty()) {
+        ring_prefetches.fetch_add(prefetch_scratch.size(), std::memory_order_relaxed);
     }
 }
 
-const Rasterizer::PrefetchedBuffer* Rasterizer::FindPrefetched(u32 buffer_index) const {
-    for (u32 i = 0; i < packet_num_prefetch; ++i) {
-        const auto& entry = packet_prefetch[i];
+const Rasterizer::PrefetchedBuffer* Rasterizer::FindPrefetched(u32 buffer_index) {
+    // PrefetchBuffers lists them in binding order (stage, then buffer index): the next one
+    // is the only candidate.
+    if (prefetch_cursor < packet_num_prefetch) {
+        const auto& entry = packet_prefetch[prefetch_cursor];
         if (entry.stage == bind_stage_ordinal && entry.buffer == buffer_index) {
+            ++prefetch_cursor;
             return &entry;
         }
     }
@@ -3601,6 +3747,8 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         in += vertex.num_ranges * sizeof(PreparedRange);
         self.packet_vertex = &vertex;
     }
+    self.packet_index_ring = {header.index_ring_address, header.index_ring_size,
+                              header.index_ring_offset};
     self.packet_motion = nullptr;
     if (header.motion_prepared) {
         std::memcpy(&self.packet_motion_storage, in, sizeof(MotionPrep));
@@ -3623,6 +3771,11 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     };
     switch (static_cast<PacketKind>(header.kind)) {
     case PacketKind::Draw:
+        if (!header.pipeline) {
+            self.scheduler.PopPendingOperations();
+            self.FilterDraw();
+            break;
+        }
         self.ProfileLap(Section::Packet);
         self.DrawRecord(static_cast<const GraphicsPipeline*>(header.pipeline), header.is_indexed,
                         header.index_offset);
@@ -3643,7 +3796,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     }
     Shader::Info::num_ud_snapshots = 0;
     self.profile_draw = false;
-    if (header.num_prefetch != 0) {
+    if (header.ring_used) {
         // The command buffer that now holds these ring bindings (read after recording: a flush
         // during the draw moves them to a later one). When it changes, the previous one's
         // ring reach is final and goes to stage A.
@@ -3663,6 +3816,7 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     self.packet_num_prefetch = 0;
     self.packet_vertex = nullptr;
     self.packet_motion = nullptr;
+    self.packet_index_ring = {};
 }
 
 void Rasterizer::LogDrawPipeStats() {
@@ -3727,6 +3881,10 @@ void Rasterizer::LogDrawPipeStats() {
         }
         pipe_stats_ring_prefetches = prefetches;
         pipe_stats_ring_fallbacks = fallbacks;
+        const u64 geometry = geometry_ring_copies.load(std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan, "  vertex/index data copied ahead: {:.0f}/s",
+                 (geometry - pipe_stats_geometry_ring_copies) / seconds);
+        pipe_stats_geometry_ring_copies = geometry;
     }
     {
         const u64 prepared = vertex_prepared.load(std::memory_order_relaxed);
@@ -3835,6 +3993,24 @@ void Rasterizer::LogDrawPipeStats() {
         }
         LOG_INFO(Render_Vulkan, "  draw recorder per draw: {:.2f} us;{}", total / draws / 1000.0,
                  line);
+        const u64 a_draws = a_profile_draws.load(std::memory_order_relaxed);
+        if (const u64 n = a_draws - pipe_stats_a_draws; n != 0) {
+            std::string a_line;
+            s64 a_total = 0;
+            std::array<s64, static_cast<size_t>(ASection::Count)> a_ns{};
+            for (size_t i = 0; i < a_ns.size(); ++i) {
+                const s64 v = a_profile_ns[i].load(std::memory_order_relaxed);
+                a_ns[i] = v - pipe_stats_a_ns[i];
+                pipe_stats_a_ns[i] = v;
+                a_total += a_ns[i];
+            }
+            for (size_t i = 0; i < a_ns.size(); ++i) {
+                a_line += fmt::format(" {} {:.2f} us", ASectionNames[i], a_ns[i] / 1000.0 / n);
+            }
+            LOG_INFO(Render_Vulkan, "  command thread per draw: {:.2f} us;{}", a_total / 1000.0 / n,
+                     a_line);
+        }
+        pipe_stats_a_draws = a_draws;
         pipe_stats_profile_draws = profiled;
     }
     std::vector<const DrainSite*> sites;

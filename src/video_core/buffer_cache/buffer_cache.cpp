@@ -649,6 +649,18 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    // Threaded renderer (streaming optimisations): most lookups are for ranges made resident
+    // long ago; remembered ones skip the gap search until residency is taken away.
+    const bool memo = Common::BbTuning::Streaming();
+    auto& entry = resident_memo[(first_block * 0x9E3779B97F4A7C15ull ^ last_block) >> 54];
+    if (memo && entry.first_block == first_block && entry.last_block == last_block &&
+        entry.generation == resident_generation) {
+        return;
+    }
+    if (memo) {
+        // Resident once this returns (bound now, or queued before any use of it).
+        entry = {first_block, last_block, resident_generation};
+    }
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -869,6 +881,11 @@ void BufferCache::MarkResidentUse(VAddr device_addr, u64 size) {
     const u64 first = device_addr >> RESIDENT_CHUNK_SHIFT;
     const u64 last = (device_addr + size - 1) >> RESIDENT_CHUNK_SHIFT;
     for (u64 chunk = first; chunk <= last; ++chunk) {
+        auto& seen = chunk_use_memo[chunk % chunk_use_memo.size()];
+        if (seen.chunk == chunk && seen.second == cache_second) {
+            continue; // already marked this second
+        }
+        seen = {chunk, cache_second};
         resident_chunk_use[chunk] = cache_second;
     }
 }
@@ -1033,6 +1050,7 @@ void BufferCache::GarbageCollectResidentMemory() {
     u64 freed_allocations = 0;
     for (const Backing& backing : evict) {
         resident_ranges.Remove(backing.start, backing.end);
+        ++resident_generation;
         const u64 freed_blocks =
             ReturnResidentBlocks(backing.memory, backing.offset, backing.end - backing.start);
         if (freed_blocks == 0) {

@@ -45,6 +45,10 @@ public:
         return draw_pipe != nullptr && pipe_enabled.load(std::memory_order_relaxed);
     }
 
+    /// SHADPS4_PIPE_DRAINS=1: wait for the draw recorder before draws FilterDraw handles and
+    /// before DmaData, as before (instead of running them in order on the recorder).
+    static bool DrainForSpecialPackets();
+
     /// Once per game frame (the presenter, when the frame is prepared): stutter report.
     void OnGameFrame();
 
@@ -219,6 +223,7 @@ private:
     std::jthread state_sampler;
     double hitch_avg_ms{};
     u64 hitch_frames{};
+    u32 hitch_run{};                      ///< slow frames in a row
     std::array<s64, 4> housekeeping_ns{}; ///< previous frame: buffer tick, downloads, GC, runtime
     std::array<std::atomic<u64>, 4> housekeeping_total{}; ///< the same, added up
     std::atomic<u64> diag_log_ns{}; ///< time spent writing the 10 s statistics and VRAM report
@@ -356,12 +361,13 @@ private:
     bool needs_barrier{};
 
     // Threaded renderer state. The draw recording thread's copies below are only written by it,
-    // or by the GPU command thread while it is idle.
+    // or by the GPU command thread while it is idle. alignas(64) in this class keeps fields
+    // the two threads write every draw on separate cache lines.
     std::unique_ptr<AmdGpu::Regs> pipe_regs;
     std::array<AmdGpu::CbDbExtent, AmdGpu::NUM_COLOR_BUFFERS> pipe_cb_extent{};
     AmdGpu::CbDbExtent pipe_db_extent{};
     AmdGpu::ComputeProgram pipe_cs{};
-    bool pipe_synced{};
+    alignas(64) bool pipe_synced{};   ///< stage A from here (draw recorder fields above)
     std::atomic<bool> pipe_enabled{}; // read by the presentation thread
     std::vector<u16> pipe_blocks;
     std::chrono::steady_clock::time_point pipe_stats_time{};
@@ -466,13 +472,13 @@ private:
     };
     static constexpr u32 SamplerMemoSize = 1024;
     std::unique_ptr<std::array<SamplerMemoEntry, SamplerMemoSize>> sampler_memo;
-    std::atomic<u64> write_faults{};
-    u64 stat_draws{};  ///< stage A: draws seen (queued or run here)
-    u64 stat_frames{}; ///< stage A: submissions done (one per game frame)
+    alignas(64) std::atomic<u64> write_faults{}; ///< guest fault handlers
+    alignas(64) u64 stat_draws{};                ///< stage A: draws seen (queued or run here)
+    u64 stat_frames{};                           ///< stage A: submissions done (one per game frame)
     u64 pipe_stats_draws{};
     u64 pipe_stats_frames{};
     u64 pipe_stats_faults{};
-    std::atomic<u64> image_memo_hits{};
+    alignas(64) std::atomic<u64> image_memo_hits{}; ///< draw recorder
     std::atomic<u64> image_memo_misses{};
     u64 pipe_stats_image_hits{};
     u64 pipe_stats_image_misses{};
@@ -489,7 +495,8 @@ private:
     };
     static constexpr u64 ConstRingSize = 32ull << 20;
     std::unique_ptr<VideoCore::Buffer> const_ring;
-    u64 ring_head{};       ///< stage A: next position (grows forever; offset = position % size)
+    /// Stage A: next position (grows forever; offset = position % size).
+    alignas(64) u64 ring_head{};
     u64 ring_free_until{}; ///< stage A: positions below this are no longer read by the GPU
     struct RingRetire {
         u64 end;
@@ -497,10 +504,12 @@ private:
     };
     static constexpr u32 RingRetireSize = 4096;
     std::array<RingRetire, RingRetireSize> ring_retire{};
-    std::atomic<u64> ring_retire_w{}; ///< written by stage B
-    std::atomic<u64> ring_retire_r{}; ///< written by stage A
-    u64 ring_b_tick{};                ///< stage B: command buffer of its latest ring bytes
-    u64 ring_b_end{};                 ///< stage B: ring position its recorded draws reach
+    // Fields of the two threads on separate cache lines: a write by one thread to a line the
+    // other reads every draw costs both a cache miss.
+    alignas(64) std::atomic<u64> ring_retire_w{}; ///< written by stage B
+    u64 ring_b_tick{}; ///< stage B: command buffer of its latest ring bytes
+    u64 ring_b_end{};  ///< stage B: ring position its recorded draws reach
+    alignas(64) std::atomic<u64> ring_retire_r{}; ///< written by stage A
     /// Stage A: guest ranges that queued, not yet recorded draws write (storage buffers): a
     /// prefetch overlapping one would read the memory before those writes.
     struct PendingWrite {
@@ -510,15 +519,30 @@ private:
     };
     std::deque<PendingWrite> pending_writes;
     std::vector<PrefetchedBuffer> prefetch_scratch;
-    const PrefetchedBuffer* packet_prefetch{}; ///< stage B: the current packet's
+    alignas(64) const PrefetchedBuffer* packet_prefetch{}; ///< stage B: the current packet's
     u32 packet_num_prefetch{};
     u32 bind_stage_ordinal{};
-    std::atomic<u64> ring_prefetches{};
+    u32 prefetch_cursor{}; ///< stage B: next entry of packet_prefetch (same order as binding)
+    alignas(64) std::atomic<u64> ring_prefetches{}; ///< stage A
     std::atomic<u64> ring_fallbacks{};
     u64 pipe_stats_ring_prefetches{};
     u64 pipe_stats_ring_fallbacks{};
     u8* RingAlloc(u64 size, u64 alignment, u64& offset);
+    /// Stage A: takes in what the draw recorder reports as no longer read by the GPU.
+    void RingRetire();
     void PrefetchBuffers(const Pipeline* pipeline);
+    /// Stage A: small or CPU-changed vertex/index data (what stage B would copy to the stream
+    /// buffer) copied into the constant ring now. Returns the ring offset, or NoRing.
+    static constexpr u64 NoRing = ~0ull;
+    u64 RingCopyGeometry(VAddr address, u64 size);
+    std::atomic<u64> geometry_ring_copies{};
+    u64 pipe_stats_geometry_ring_copies{};
+    /// The current packet's index buffer, copied into the ring by stage A.
+    struct RingIndex {
+        VAddr address{};
+        u32 size{};
+        u64 offset{NoRing};
+    } packet_index_ring;
 
     /// Vertex inputs of a draw, worked out on stage A (which waits for stage B about half of
     /// the time): the dynamic vertex input state, each stream's V#, and the stream memory
@@ -527,6 +551,7 @@ private:
     struct PreparedRange {
         VAddr base;
         u64 size;
+        u64 ring; ///< offset in the constant ring when stage A copied it there, else NoRing
     };
     struct PreparedVertex {
         u32 count;
@@ -545,13 +570,13 @@ private:
     VertexInputs<AmdGpu::Buffer> vtx_buffers;
     VertexInputs<u8> vtx_range_index;
     VertexInputs<PreparedRange> vtx_ranges;
-    PreparedVertex packet_vertex_storage{};
+    alignas(64) PreparedVertex packet_vertex_storage{}; ///< draw recorder
     const PreparedVertex* packet_vertex{}; ///< stage B: the current packet's, if prepared
     std::atomic<u64> vertex_prepared{};
     std::atomic<u64> vertex_unprepared{};
     u64 pipe_stats_vertex_prepared{};
     u64 pipe_stats_vertex_unprepared{};
-    const PrefetchedBuffer* FindPrefetched(u32 buffer_index) const;
+    const PrefetchedBuffer* FindPrefetched(u32 buffer_index);
 
     // Draw recorder profile: every 8th direct draw on stage B is timed by section.
     enum class Section : u8 {
@@ -598,7 +623,32 @@ private:
         "dynamic",
         "record+mirror",
         "reset"};
-    bool profile_draw{};
+    // GPU command thread (stage A) profile: every 8th queued draw, by section; "decode" is the
+    // time since the previous draw was queued, less waits for the draw recorder.
+    enum class ASection : u8 { Decode, Pipeline, Prefetch, Vertex, Motion, Packet, Count };
+    static constexpr std::array<const char*, static_cast<size_t>(ASection::Count)> ASectionNames{
+        "decode+other", "pipeline select",        "constant ring copies",
+        "vertex prep",  "index copy+motion prep", "packet write"};
+    bool a_profile{};
+    u32 a_profile_counter{};
+    std::chrono::steady_clock::time_point a_last{}, a_lap{};
+    std::chrono::nanoseconds a_drain_mark{};
+    std::array<std::atomic<s64>, static_cast<size_t>(ASection::Count)> a_profile_ns{};
+    std::atomic<u64> a_profile_draws{};
+    std::array<s64, static_cast<size_t>(ASection::Count)> pipe_stats_a_ns{};
+    u64 pipe_stats_a_draws{};
+    void ALap(ASection finished) {
+        if (!a_profile) [[likely]] {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        a_profile_ns[static_cast<size_t>(finished)].fetch_add((now - a_lap).count(),
+                                                              std::memory_order_relaxed);
+        a_lap = now;
+    }
+    void ABeginDraw();
+    void AEndDraw();
+    alignas(64) bool profile_draw{}; ///< draw recorder
     u32 profile_counter{};
     std::chrono::steady_clock::time_point profile_last{};
     std::array<std::atomic<s64>, static_cast<size_t>(Section::Count)> profile_ns{};
