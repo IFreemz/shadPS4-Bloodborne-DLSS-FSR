@@ -3,12 +3,15 @@
 
 // Based on imgui_impl_vulkan.cpp from Dear ImGui repository
 
+#include <array>
 #include <cstdio>
 #include <mutex>
 
 #include <imgui.h>
 
 #include "imgui_impl_vulkan.h"
+#include "video_core/host_shaders/imgui_overlay_scrgb_frag.h"
+#include "video_core/renderer_vulkan/vk_retro_hdr.h"
 
 #ifndef IM_MAX
 #define IM_MAX(A, B) (((A) >= (B)) ? (A) : (B))
@@ -992,16 +995,25 @@ static void CreateShaderModules(vk::Device device, const vk::AllocationCallbacks
         bd->shader_module_frag = CheckVkResult(device.createShaderModule(frag_info, allocator));
     }
     if (bd->shader_module_frag_overlay == VK_NULL_HANDLE) {
-        // The generator word (third) only names the compiler; changing it changes the hash.
-        std::vector<uint32_t> code(std::begin(glsl_shader_frag_spv),
-                                   std::end(glsl_shader_frag_spv));
-        code[2] ^= 0x100;
-        vk::ShaderModuleCreateInfo frag_info{
-            .codeSize = code.size() * sizeof(uint32_t),
-            .pCode = code.data(),
-        };
-        bd->shader_module_frag_overlay =
-            CheckVkResult(device.createShaderModule(frag_info, allocator));
+        if (::Vulkan::RetroHdr::GetSession().state == ::Vulkan::RetroHdr::State::Active) {
+            vk::ShaderModuleCreateInfo frag_info{
+                .codeSize = sizeof(IMGUI_OVERLAY_SCRGB_FRAG),
+                .pCode = IMGUI_OVERLAY_SCRGB_FRAG,
+            };
+            bd->shader_module_frag_overlay =
+                CheckVkResult(device.createShaderModule(frag_info, allocator));
+        } else {
+            // The generator word (third) only names the compiler; changing it changes the hash.
+            std::vector<uint32_t> code(std::begin(glsl_shader_frag_spv),
+                                       std::end(glsl_shader_frag_spv));
+            code[2] ^= 0x100;
+            vk::ShaderModuleCreateInfo frag_info{
+                .codeSize = code.size() * sizeof(uint32_t),
+                .pCode = code.data(),
+            };
+            bd->shader_module_frag_overlay =
+                CheckVkResult(device.createShaderModule(frag_info, allocator));
+        }
     }
 }
 
@@ -1013,6 +1025,23 @@ static void CreatePipeline(vk::Device device, const vk::AllocationCallbacks* all
 
     CreateShaderModules(device, allocator);
 
+    const auto& retro_hdr = ::Vulkan::RetroHdr::GetSession();
+    const bool scrgb_overlay = overlay && retro_hdr.state == ::Vulkan::RetroHdr::State::Active;
+    const struct {
+        float sdr_white;
+        VkBool32 pq;
+    } overlay_constants{retro_hdr.sdr_white_nits / 80.0f, retro_hdr.pq ? VK_TRUE : VK_FALSE};
+    const std::array<vk::SpecializationMapEntry, 2> overlay_entries{{
+        {.constantID = 0, .offset = 0, .size = sizeof(float)},
+        {.constantID = 1, .offset = sizeof(float), .size = sizeof(VkBool32)},
+    }};
+    const vk::SpecializationInfo scrgb_overlay_constants{
+        .mapEntryCount = static_cast<uint32_t>(overlay_entries.size()),
+        .pMapEntries = overlay_entries.data(),
+        .dataSize = sizeof(overlay_constants),
+        .pData = &overlay_constants,
+    };
+
     vk::PipelineShaderStageCreateInfo stage[2]{
         {
             .stage = vk::ShaderStageFlagBits::eVertex,
@@ -1023,6 +1052,7 @@ static void CreatePipeline(vk::Device device, const vk::AllocationCallbacks* all
             .stage = vk::ShaderStageFlagBits::eFragment,
             .module = overlay ? bd->shader_module_frag_overlay : bd->shader_module_frag,
             .pName = "main",
+            .pSpecializationInfo = scrgb_overlay ? &scrgb_overlay_constants : nullptr,
         },
     };
 

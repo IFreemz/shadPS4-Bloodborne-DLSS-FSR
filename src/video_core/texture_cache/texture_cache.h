@@ -202,8 +202,8 @@ public:
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
-                                         AmdGpu::BorderColorBuffer border_color_base,
-                                         bool is_depth);
+                                         AmdGpu::BorderColorBuffer border_color_base, bool is_depth,
+                                         float extra_lod_bias = 0.0f);
 
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
@@ -227,7 +227,7 @@ public:
         return std::atomic_ref<u64>(const_cast<u64&>(gc_tick)).load(std::memory_order_acquire);
     }
     /// GetSampler's LRU touch for a remembered sampler; once per GC tick is enough.
-    void TouchSampler(const AmdGpu::Sampler& sampler, bool is_depth);
+    void TouchSampler(const AmdGpu::Sampler& sampler, bool is_depth, float extra_lod_bias = 0.0f);
 
     /// FindImage's bookkeeping for an image found through such a memo.
     void TouchFoundImage(ImageId id) {

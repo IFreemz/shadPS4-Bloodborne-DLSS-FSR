@@ -458,6 +458,7 @@ private:
     struct SamplerMemoEntry {
         std::array<u64, 2> sharp{};
         bool is_depth{};
+        float lod_bias{};
         bool valid{};
         u64 generation{};
         u64 touched_gc_tick{};
@@ -613,6 +614,7 @@ private:
                                                             std::memory_order_relaxed);
         profile_last = now;
     }
+    float scene_lod_bias{}; ///< this draw's upscaler texture LOD bias (G-buffer draws only)
     // Last member: destroyed (stopped) first, while everything the draw recording thread uses
     // still exists.
     std::unique_ptr<DrawPipe> draw_pipe;

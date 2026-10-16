@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/types.h"
+#include "core/bb_mouse_camera.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input_mouse.h"
@@ -34,6 +35,14 @@ bool ToggleMouseModeTo(MouseMode m) {
         mouse_mode = m;
     }
     return mouse_mode == m;
+}
+
+void SetMouseMode(MouseMode m) {
+    mouse_mode = m;
+}
+
+MouseMode GetMouseMode() {
+    return mouse_mode;
 }
 
 void SetMouseToJoystick(int joystick) {
@@ -68,6 +77,10 @@ void EmulateJoystick(GameController* controller, u32 interval) {
 
     float d_x = 0, d_y = 0;
     SDL_GetRelativeMouseState(&d_x, &d_y);
+    // Bloodborne's native mouse camera turns by the motion events (sdl_window.cpp), not the stick.
+    if (mouse_joystick_binding == 2 && Core::BbMouseCamera::Installed()) {
+        return;
+    }
 
     float output_speed =
         SDL_clamp(sqrt(d_x * d_x + d_y * d_y) * mouse_speed + mouse_speed_offset * 128,

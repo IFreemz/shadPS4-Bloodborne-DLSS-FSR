@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <filesystem>
+
 #include <array>
 #include <map>
 #include <string>
@@ -45,6 +47,7 @@
 #define SDL_EVENT_TOGGLE_FRIENDS SDL_EVENT_USER + 15
 #define SDL_EVENT_TOGGLE_DLSS SDL_EVENT_USER + 16
 #define SDL_EVENT_APPLY_DISPLAY_MODE SDL_EVENT_USER + 17
+#define SDL_EVENT_BB_MOUSE_LOOK SDL_EVENT_USER + 18 // data1: 1 on, 0 off
 
 #define LEFTJOYSTICK_HALFMODE 0x00010000
 #define RIGHTJOYSTICK_HALFMODE 0x00020000
@@ -114,13 +117,14 @@ public:
 class InputEvent {
 public:
     InputID input;
-    bool active;
+    u8 active : 1;
+    u8 analog_source : 1;
     s8 axis_value;
 
     InputEvent(InputID i = InputID(), bool a = false, s8 v = 0)
-        : input(i), active(a), axis_value(v) {}
+        : input(i), active(a), axis_value(v), analog_source(false) {}
     InputEvent(InputType d, u32 i, bool a = false, s8 v = 0)
-        : input(d, i), active(a), axis_value(v) {}
+        : input(d, i), active(a), axis_value(v), analog_source(false) {}
 };
 
 // i strongly suggest you collapse these maps
@@ -354,6 +358,7 @@ const std::map<std::string, u32> string_to_keyboard_key_map = {
 };
 
 void ParseInputConfig(const std::string game_id);
+std::filesystem::path GetInputConfigFile(const std::string& game_id);
 
 class InputBinding {
 public:

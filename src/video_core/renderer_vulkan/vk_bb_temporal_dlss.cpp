@@ -67,6 +67,23 @@ std::string DlssProblem() {
 }
 } // namespace
 
+namespace {
+std::atomic<float> scene_mip_bias{0.0f};
+std::atomic<s64> scene_mip_bias_ms{0}; // steady clock of the evaluation that set it
+s64 SteadyMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
+
+float BbSceneMipBias() {
+    // Menus and loading screens (no evaluation for a second): the game's own bias.
+    if (SteadyMs() - scene_mip_bias_ms.load(std::memory_order_relaxed) > 1000)
+        return 0.0f;
+    return scene_mip_bias.load(std::memory_order_relaxed);
+}
+
 BbDlssStatus BbTemporalDlssStatus() {
     std::scoped_lock lock{status_mutex};
     auto copy = status;
@@ -347,7 +364,8 @@ struct Tune {
     bool motion_blur = false;
     bool character_motion = true; // skinned meshes' own motion vectors (vk_bb_object_motion)
     bool menu_fix = true;
-    bool auto_exposure = true; // HDR input (decoupled UI): FSR computes the exposure
+    bool auto_exposure = true;    // HDR input (decoupled UI): FSR computes the exposure
+    bool texture_lod_bias = true; // sharper scene textures while upscaling (BbSceneMipBias)
 };
 
 enum class Backend { None, Dlss, Fsr, Fsr4 };
@@ -543,6 +561,8 @@ struct BbTemporalDlss::Impl {
                 next.auto_exposure = number != 0;
             else if (key == "menu_fix")
                 next.menu_fix = number != 0;
+            else if (key == "texture_lod_bias")
+                next.texture_lod_bias = number != 0;
             else if (key == "motion_blur")
                 next.motion_blur = number != 0;
             else if (key == "character_motion")
@@ -1566,6 +1586,14 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         status.backend = BackendName(backend);
         status.decoupled = upscale_to.has_value();
         status.reason.clear();
+    }
+    {
+        // Quarter steps, so a changing render size doesn't make a new sampler set every frame.
+        float bias = 0.0f;
+        if (tune.texture_lod_bias && in.width < out.width)
+            bias = std::round((std::log2(float(in.width) / float(out.width)) - 1.0f) * 4.0f) / 4.0f;
+        scene_mip_bias.store(bias, std::memory_order_relaxed);
+        scene_mip_bias_ms.store(SteadyMs(), std::memory_order_relaxed);
     }
     if (++evaluations <= 3 || evaluations % 1800 == 0)
         LOG_INFO(Render_Vulkan,

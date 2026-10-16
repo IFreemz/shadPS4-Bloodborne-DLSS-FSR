@@ -13,7 +13,6 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/host_shaders/hdr_meter_comp.h"
 #include "video_core/renderer_vulkan/vk_hdr_meter.h"
-#include "video_core/renderer_vulkan/vk_hdr_mod.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -84,7 +83,7 @@ void CreatePipeline(State& s) {
 
 bool Enabled() {
     static const bool enabled = std::getenv("SHADPS4_HDR_METER") != nullptr;
-    return enabled && RenoDxLoaded();
+    return enabled;
 }
 
 void Record(const Instance& instance, vk::CommandBuffer command, vk::Extent2D extent,

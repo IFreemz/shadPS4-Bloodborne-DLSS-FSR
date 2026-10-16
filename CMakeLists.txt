@@ -1190,6 +1190,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_hdr_mod.h
                src/video_core/renderer_vulkan/vk_hdr_meter.cpp
                src/video_core/renderer_vulkan/vk_hdr_meter.h
+               src/video_core/renderer_vulkan/vk_retro_hdr.cpp
+               src/video_core/renderer_vulkan/vk_retro_hdr.h
                src/video_core/renderer_vulkan/vk_fsr_upscaler.cpp
                src/video_core/renderer_vulkan/vk_fsr4_addon.cpp
                src/video_core/renderer_vulkan/vk_fsr4_addon.h
@@ -1303,6 +1305,10 @@ set(INPUT src/input/controller.cpp
           src/input/controller_state.cpp
           src/input/input_handler.cpp
           src/input/input_handler.h
+          src/core/bb_mouse_camera.cpp
+          src/core/bb_mouse_camera.h
+          src/input/bb_kbm.cpp
+          src/input/bb_kbm.h
           src/input/input_mouse.cpp
           src/input/input_mouse.h
 )

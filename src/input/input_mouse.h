@@ -16,6 +16,8 @@ enum MouseMode {
 };
 
 bool ToggleMouseModeTo(MouseMode m);
+void SetMouseMode(MouseMode m);
+MouseMode GetMouseMode();
 void SetMouseToJoystick(int joystick);
 void SetMouseParams(float mouse_deadzone_offset, float mouse_speed, float mouse_speed_offset);
 void SetMouseGyroRollMode(bool mode);
