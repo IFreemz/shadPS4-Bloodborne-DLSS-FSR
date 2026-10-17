@@ -156,6 +156,7 @@ private:
     bool bbBackgroundPipelinesSetting;
     int bbAnisotropySetting; ///< index into anisotropyOptions
     bool bbExactProtectionSetting;
+    bool bbBatchedUploadsSetting;
     bool bbStutterDetailSetting;
     int bbVramBudgetTestSetting;
     bool rcasEnabledSetting;

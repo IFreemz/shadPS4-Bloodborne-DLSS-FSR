@@ -483,6 +483,9 @@ struct GPUSettings {
     // Page protection: only the pages whose protection changes, not the already protected pages
     // between them (Windows' cost is per page). Off: one call over the whole stretch.
     Setting<bool> bb_exact_protection{true};
+    // New textures a draw needs are unshuffled and copied together: one barrier and one render
+    // pass break for the group instead of per texture. Off: one texture at a time.
+    Setting<bool> bb_batched_uploads{true};
     // Diagnostics: every draw timed, and where the draw recorder's time went shown for each
     // stutter (slower: for finding stutter causes).
     Setting<bool> bb_stutter_detail{false};
@@ -535,6 +538,7 @@ struct GPUSettings {
                                        &GPUSettings::bb_background_pipelines),
             make_override<GPUSettings>("bb_anisotropy", &GPUSettings::bb_anisotropy),
             make_override<GPUSettings>("bb_exact_protection", &GPUSettings::bb_exact_protection),
+            make_override<GPUSettings>("bb_batched_uploads", &GPUSettings::bb_batched_uploads),
             make_override<GPUSettings>("bb_stutter_detail", &GPUSettings::bb_stutter_detail),
             make_override<GPUSettings>("bb_defaults", &GPUSettings::bb_defaults),
         };
@@ -549,7 +553,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     threaded_renderer_gpu_profile, bb_object_motion, bb_readback_queue, bb_streaming,
     bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
     bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place, bb_skip_empty_draws,
-    bb_background_pipelines, bb_anisotropy, bb_exact_protection, bb_stutter_detail, bb_defaults)
+    bb_background_pipelines, bb_anisotropy, bb_exact_protection, bb_batched_uploads,
+    bb_stutter_detail, bb_defaults)
 
 // -------------------------------
 // Vulkan settings
@@ -862,6 +867,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbSkipEmptyDraws, bb_skip_empty_draws)
     SETTING_FORWARD_BOOL(m_gpu, BbBackgroundPipelines, bb_background_pipelines)
     SETTING_FORWARD_BOOL(m_gpu, BbExactProtection, bb_exact_protection)
+    SETTING_FORWARD_BOOL(m_gpu, BbBatchedUploads, bb_batched_uploads)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
     SETTING_FORWARD(m_gpu, BbAnisotropy, bb_anisotropy)

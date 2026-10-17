@@ -194,7 +194,8 @@ vk::Pipeline TileManager::GetTilingPipeline(const ImageInfo& info, bool is_tiler
 }
 
 std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* in_buffer,
-                                                       u64 in_offset, const ImageInfo& info) {
+                                                       u64 in_offset, const ImageInfo& info,
+                                                       bool flush_barriers) {
     if (!info.props.is_tiled) {
         return {in_buffer, in_offset};
     }
@@ -218,11 +219,15 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         .range = sizeof(params),
     };
 
+    // One at a time the output memory may be reused at once (the next detile waits for this
+    // upload's copy). Batched, every detile of the group needs memory of its own.
     const auto staging = runtime.GetStagingPool().Request(info.guest_size, MemoryType::DeviceLocal,
-                                                          256, false, true);
+                                                          256, false, flush_barriers);
 
     scheduler.EndRendering();
-    runtime.FlushBarriers();
+    if (flush_barriers) {
+        runtime.FlushBarriers();
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));

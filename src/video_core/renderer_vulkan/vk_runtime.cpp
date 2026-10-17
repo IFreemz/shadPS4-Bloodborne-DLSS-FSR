@@ -172,6 +172,19 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     return image_barriers.size() != prev_num_barriers;
 }
 
+void Runtime::RecordUploadCopies(VideoCore::Image* dst, const VideoCore::Buffer* src,
+                                 std::span<const vk::BufferImageCopy> upload_copies) {
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.copyBufferToImage(src->Handle(), dst->GetImage(), vk::ImageLayout::eTransferDstOptimal,
+                             upload_copies);
+    for (const auto& copy : upload_copies) {
+        const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
+        AccessBuffer(src, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+                     vk::AccessFlagBits2::eTransferRead);
+    }
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
     SetBackingSamples(dst, dst->info.num_samples, false);

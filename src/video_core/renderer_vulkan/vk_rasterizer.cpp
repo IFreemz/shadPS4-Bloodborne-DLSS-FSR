@@ -2244,6 +2244,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                    set.generation == generation &&
                    std::equal(sharps.begin(), sharps.begin() + set_count, set.sharps.begin());
         if (hit) {
+            // New contents of several of the set's images are uploaded together.
+            std::array<VideoCore::ImageId, TextureSet::MaxImages> refresh_ids;
+            for (u32 i = 0; i < set_count; ++i) {
+                refresh_ids[i] = set.entries[i].id;
+            }
+            if (EmulatorSettings.IsBbBatchedUploads()) {
+                texture_cache.UpdateImages(std::span{refresh_ids.data(), set_count});
+            }
             // Every image still has the backing its view belongs to.
             for (u32 i = 0; i < set_count && hit; ++i) {
                 const auto& entry = set.entries[i];
@@ -2424,6 +2432,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     ProfileLap(Section::TexLookup);
+    // Sampled images whose contents changed are uploaded together (Batched texture uploads).
+    {
+        std::array<VideoCore::ImageId, 32> refresh_ids;
+        u32 num_refresh = 0;
+        for (u32 i = 0; i < num_images && num_refresh < refresh_ids.size(); ++i) {
+            const auto& [image_id, desc] = image_bindings[i];
+            if (image_id && desc.type != VideoCore::TextureCache::BindingType::Storage) {
+                refresh_ids[num_refresh++] = image_id;
+            }
+        }
+        if (num_refresh > 1 && EmulatorSettings.IsBbBatchedUploads()) {
+            texture_cache.UpdateImages(std::span{refresh_ids.data(), num_refresh});
+        }
+    }
     // Second pass to re-bind images that were updated after binding
     for (u32 i = 0; i < num_images; ++i) {
         auto& [image_id, desc] = image_bindings[i];

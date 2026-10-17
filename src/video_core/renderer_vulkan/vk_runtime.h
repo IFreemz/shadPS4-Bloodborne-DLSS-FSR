@@ -49,6 +49,11 @@ public:
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                  std::optional<VideoCore::SubresourceRange> subres_range = {});
 
+    /// UploadImage's copy alone: the image is already in transfer layout and the barriers its
+    /// source needs are recorded (batched uploads).
+    void RecordUploadCopies(VideoCore::Image* dst, const VideoCore::Buffer* src,
+                            std::span<const vk::BufferImageCopy> upload_copies);
+
     void UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                      std::span<const vk::BufferImageCopy> upload_copies);
     void DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,

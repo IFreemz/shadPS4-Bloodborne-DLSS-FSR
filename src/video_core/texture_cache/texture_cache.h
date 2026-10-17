@@ -7,6 +7,7 @@
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -175,6 +176,11 @@ public:
         }
     }
 
+    /// UpdateImage for the images a draw binds, with the uploads of those that need one recorded
+    /// together (Batched texture uploads setting): detiles after one barrier, copies after
+    /// another, one render pass break.
+    void UpdateImages(std::span<const ImageId> image_ids);
+
     /// UpdateImage would return at once: the image was found clean, fully tracked and touched
     /// in this GC tick (threaded renderer memos reuse what it resolved).
     [[nodiscard]] bool IsClean(ImageId image_id) {
@@ -203,6 +209,9 @@ public:
 
     /// Reuploads image contents.
     void RefreshImage(Image& image);
+
+    /// RefreshImage's checks and copy regions: false when there is nothing to upload.
+    bool PrepareRefresh(Image& image, SmallVector<vk::BufferImageCopy, 14>& copies);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,

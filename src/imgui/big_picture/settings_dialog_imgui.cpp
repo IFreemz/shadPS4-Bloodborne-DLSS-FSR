@@ -82,6 +82,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbSkipEmptyDrawsSetting = EmulatorSettings.IsBbSkipEmptyDraws();
     bbBackgroundPipelinesSetting = EmulatorSettings.IsBbBackgroundPipelines();
     bbExactProtectionSetting = EmulatorSettings.IsBbExactProtection();
+    bbBatchedUploadsSetting = EmulatorSettings.IsBbBatchedUploads();
     {
         // 0 (the game's own), 2, 4, 8, 16 -> 0..4
         const int samples = EmulatorSettings.GetBbAnisotropy();
@@ -166,6 +167,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbSkipEmptyDraws(bbSkipEmptyDrawsSetting, isSpecific);
     EmulatorSettings.SetBbBackgroundPipelines(bbBackgroundPipelinesSetting, isSpecific);
     EmulatorSettings.SetBbExactProtection(bbExactProtectionSetting, isSpecific);
+    EmulatorSettings.SetBbBatchedUploads(bbBatchedUploadsSetting, isSpecific);
     EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
                                      isSpecific);
     EmulatorSettings.SetBbStutterDetail(bbStutterDetailSetting, isSpecific);
@@ -822,6 +824,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingCombo("Anisotropic filtering", bbAnisotropySetting, anisotropyOptions);
             AddSettingCheckbox("Protect only changed pages (testing)", bbExactProtectionSetting,
                                "Less CPU time protecting game memory the GPU reads");
+            AddSettingCheckbox("Batched texture uploads (testing)", bbBatchedUploadsSetting,
+                               "New textures of a draw uploaded together");
             // Not under the threaded renderer: the upscalers use it either way.
             AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,
                                "Motion of moving objects for DLSS / FSR");

@@ -975,9 +975,10 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
     stencil_image.AssociateDepth(depth_id, slot_images[depth_id].image_uid);
 }
 
-void TextureCache::RefreshImage(Image& image) {
+bool TextureCache::PrepareRefresh(Image& image,
+                                  SmallVector<vk::BufferImageCopy, 14>& image_copies) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
-        return;
+        return false;
     }
 
     RENDERER_TRACE;
@@ -998,7 +999,7 @@ void TextureCache::RefreshImage(Image& image) {
         const u64 hash = XXH3_64bits(addr, size);
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
-            return;
+            return false;
         }
         image.hash = hash;
     }
@@ -1008,7 +1009,7 @@ void TextureCache::RefreshImage(Image& image) {
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
 
-    SmallVector<vk::BufferImageCopy, 14> image_copies;
+    image_copies.clear();
     for (u32 m = 0; m < num_mips; m++) {
         const u32 width = std::max(image.info.size.width >> m, 1u);
         const u32 height = std::max(image.info.size.height >> m, 1u);
@@ -1034,6 +1035,14 @@ void TextureCache::RefreshImage(Image& image) {
 
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
+        return false;
+    }
+    return true;
+}
+
+void TextureCache::RefreshImage(Image& image) {
+    SmallVector<vk::BufferImageCopy, 14> image_copies;
+    if (!PrepareRefresh(image, image_copies)) {
         return;
     }
 
@@ -1060,6 +1069,107 @@ void TextureCache::RefreshImage(Image& image) {
                                       std::chrono::steady_clock::now() - upload_start)
                                       .count(),
                                   std::memory_order_relaxed);
+}
+
+void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
+    // Images that need an upload; the rest go through UpdateImage as before.
+    SmallVector<ImageId, 16> pending;
+    if (EmulatorSettings.IsBbBatchedUploads()) {
+        for (const ImageId image_id : image_ids) {
+            if (!image_id || IsClean(image_id)) {
+                continue;
+            }
+            Image& image = slot_images[image_id];
+            // (Images checked by hash first keep the one-at-a-time path.)
+            if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1 ||
+                (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
+                 False(image.flags & ImageFlagBits::CpuDirty)) ||
+                std::ranges::find(pending, image_id) != pending.end()) {
+                continue;
+            }
+            pending.push_back(image_id);
+        }
+    }
+    if (pending.size() < 2) {
+        for (const ImageId image_id : image_ids) {
+            if (image_id) {
+                UpdateImage(image_id);
+            }
+        }
+        return;
+    }
+
+    // Protected before their contents are read (as UpdateImage does).
+    for (const ImageId image_id : pending) {
+        TouchImage(slot_images[image_id]);
+        Common::GuestStats::DetailTimer timer{Common::GuestStats::Detail::TexTrack};
+        TrackImage(image_id);
+    }
+
+    struct Job {
+        Image* image;
+        SmallVector<vk::BufferImageCopy, 14> copies;
+        const Buffer* buffer;
+        u64 offset;
+    };
+    SmallVector<Job, 16> jobs;
+    scheduler.EndRendering();
+    const auto upload_start = std::chrono::steady_clock::now();
+    namespace GSD = Common::GuestStats;
+    {
+        GSD::DetailTimer timer{GSD::Detail::TexStaging};
+        for (const ImageId image_id : pending) {
+            Image& image = slot_images[image_id];
+            Job job{.image = &image};
+            if (!PrepareRefresh(image, job.copies)) {
+                continue;
+            }
+            const auto [buffer, offset] =
+                buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+            job.buffer = buffer;
+            job.offset = offset;
+            jobs.push_back(std::move(job));
+        }
+    }
+    if (!jobs.empty()) {
+        {
+            // One barrier for every source, then the detiles back to back.
+            GSD::DetailTimer timer{GSD::Detail::TexDetile};
+            runtime.FlushBarriers();
+            for (Job& job : jobs) {
+                const auto [buffer, offset] =
+                    tile_manager.DetileImage(job.buffer, job.offset, job.image->info, false);
+                job.buffer = buffer;
+                for (auto& copy : job.copies) {
+                    copy.bufferOffset += offset;
+                }
+            }
+        }
+        GSD::DetailTimer timer{GSD::Detail::TexUpload};
+        // Every image to transfer layout and the detiles finished: one barrier, then the copies.
+        for (Job& job : jobs) {
+            runtime.SetBackingSamples(job.image, job.image->info.num_samples, false);
+            runtime.Transit(job.image, vk::ImageLayout::eTransferDstOptimal,
+                            vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+        }
+        runtime.FlushBarriers();
+        for (Job& job : jobs) {
+            runtime.RecordUploadCopies(job.image, job.buffer, job.copies);
+            GSD::image_uploads.fetch_add(1, std::memory_order_relaxed);
+            GSD::image_upload_bytes.fetch_add(job.image->info.guest_size,
+                                              std::memory_order_relaxed);
+        }
+    }
+    GSD::image_upload_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - upload_start)
+                                       .count(),
+                                   std::memory_order_relaxed);
+    // The usual bookkeeping (clean marking); the uploads are done.
+    for (const ImageId image_id : image_ids) {
+        if (image_id) {
+            UpdateImage(image_id);
+        }
+    }
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
