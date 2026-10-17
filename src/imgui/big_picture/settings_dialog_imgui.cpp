@@ -80,6 +80,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbBackgroundTextureCopiesSetting = EmulatorSettings.IsBbBackgroundTextureCopies();
     bbGeometryInPlaceSetting = EmulatorSettings.IsBbGeometryInPlace();
     bbSkipEmptyDrawsSetting = EmulatorSettings.IsBbSkipEmptyDraws();
+    bbBackgroundPipelinesSetting = EmulatorSettings.IsBbBackgroundPipelines();
     bbStutterDetailSetting = EmulatorSettings.IsBbStutterDetail();
     bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
 
@@ -153,6 +154,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbBackgroundTextureCopies(bbBackgroundTextureCopiesSetting, isSpecific);
     EmulatorSettings.SetBbGeometryInPlace(bbGeometryInPlaceSetting, isSpecific);
     EmulatorSettings.SetBbSkipEmptyDraws(bbSkipEmptyDrawsSetting, isSpecific);
+    EmulatorSettings.SetBbBackgroundPipelines(bbBackgroundPipelinesSetting, isSpecific);
     EmulatorSettings.SetBbStutterDetail(bbStutterDetailSetting, isSpecific);
     EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
 
@@ -799,6 +801,9 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox("    Skip draws with no output (testing)",
                                    bbSkipEmptyDrawsSetting,
                                    "Occlusion test geometry the emulator does not use");
+                AddSettingCheckbox("    Background shader compiles (testing)",
+                                   bbBackgroundPipelinesSetting,
+                                   "New objects appear a frame late instead of a stutter");
             }
             // Not under the threaded renderer: the upscalers use it either way.
             AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,

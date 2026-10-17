@@ -220,8 +220,9 @@ private:
     struct HitchSnapshot {
         std::chrono::steady_clock::time_point time{};
         std::chrono::nanoseconds busy{}, drain{};
-        u64 packets{}, gpu_wait_ns{}, gpu_waits{}, pipelines{}, arena_binds{}, protect_ns{},
-            protect_calls{}, faults{};
+        u64 packets{}, gpu_wait_ns{}, gpu_waits{}, pipelines{}, background_pipelines{},
+            background_shaders{}, background_skips{}, background_wait_ns{}, arena_binds{},
+            protect_ns{}, protect_calls{}, faults{};
         std::array<u64, static_cast<size_t>(Common::GuestStats::CmdState::Count) * 2> states{};
         u64 mutex_waits{}, sleeps{}, sleep_ns{}, uploads{}, upload_bytes{}, upload_ns{},
             image_copy_ns{}, buffer_bytes{}, buffer_ns{}, resident_ns{}, staging_count{},

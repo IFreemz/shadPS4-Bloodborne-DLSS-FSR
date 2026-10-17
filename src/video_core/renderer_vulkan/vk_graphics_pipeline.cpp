@@ -521,10 +521,9 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             continue;
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
-        for (const auto& buffer : stage->buffers) {
-            const auto sharp =
-                preloading ? AmdGpu::Buffer{}
-                           : buffer.GetSharp(*stage); // See for the comment in compute PL creation
+        // The buffer sharp isn't needed for the layout, and reading it here would race with the
+        // live user data when the pipeline is built on a background compile thread.
+        for (size_t i = 0; i < stage->buffers.size(); ++i) {
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eStorageBuffer,

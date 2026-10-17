@@ -23,6 +23,12 @@ inline std::atomic<u64> sleep_actual_ns{0};    ///< total time actually slept
 inline std::atomic<u64> protect_calls{0};
 inline std::atomic<u64> protect_pages{0};
 inline std::atomic<u64> protect_ns{0};
+/// Background pipeline compiles and shader translations started, and draws skipped while one
+/// was not ready.
+inline std::atomic<u64> background_pipelines_started{0};
+inline std::atomic<u64> background_shaders_started{0};
+inline std::atomic<u64> background_wait_ns{0}; ///< waits for one needed at once
+inline std::atomic<u64> background_skipped_draws{0};
 /// Read-only buffer uploads that found nothing to upload without taking the region lock.
 inline std::atomic<u64> upload_checks_skipped{0};
 

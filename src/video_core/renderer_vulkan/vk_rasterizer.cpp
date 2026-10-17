@@ -730,7 +730,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     // FilterDraw handles itself (fast clear elimination, resolve, depth copy, skips) run here.
     if (UseDrawPipe() && FilterDrawPasses()) {
         ABeginDraw();
-        const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+        // A new scene pipeline may compile in the background: the draw is skipped until then.
+        const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline({}, true);
         ALap(ASection::Pipeline);
         if (pipeline && !DrawWritesNothing(pipeline)) {
             QueueDraw(PacketKind::Draw, pipeline, is_indexed, index_offset, {});
@@ -870,7 +871,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .max_count = max_count,
     };
     if (UseDrawPipe() && FilterDrawPasses()) {
-        const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
+        const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params, true);
         if (pipeline) {
             QueueDraw(PacketKind::DrawIndirect, pipeline, is_indexed, 0, args);
         }
@@ -1175,6 +1176,7 @@ void Rasterizer::OnSubmit() {
 }
 
 void Rasterizer::OnGameFrame() {
+    pipeline_cache.OnGameFrame();
     if (draw_pipe && diagnostics.load(std::memory_order_relaxed)) {
         ReportHitch();
     } else {
@@ -1244,6 +1246,10 @@ void Rasterizer::ReportHitch() {
         .gpu_wait_ns = GS::gpu_wait_ns.load(std::memory_order_relaxed),
         .gpu_waits = GS::gpu_waits.load(std::memory_order_relaxed),
         .pipelines = GS::pipelines_compiled.load(std::memory_order_relaxed),
+        .background_pipelines = GS::background_pipelines_started.load(std::memory_order_relaxed),
+        .background_shaders = GS::background_shaders_started.load(std::memory_order_relaxed),
+        .background_skips = GS::background_skipped_draws.load(std::memory_order_relaxed),
+        .background_wait_ns = GS::background_wait_ns.load(std::memory_order_relaxed),
         .arena_binds = GS::arena_binds.load(std::memory_order_relaxed),
         .protect_ns = GS::protect_ns.load(std::memory_order_relaxed),
         .protect_calls = GS::protect_calls.load(std::memory_order_relaxed),
@@ -1330,7 +1336,9 @@ void Rasterizer::ReportHitch() {
             Render_Vulkan,
             "Stutter: frame {:.1f} ms (usual {:.1f} ms) | GPU thread ms: {} | draw recorder busy "
             "{:.1f} ms, {} packets | GPU waits {} ({:.1f} ms, longest {:.1f} ms at {}:{}) | {} "
-            "pipelines compiled | {} texture uploads ({:.1f} MiB, {:.1f} ms, copying {:.1f} ms) | "
+            "pipelines compiled ({} more and {} shaders in the background, {} draws skipped "
+            "meanwhile, waited {:.1f} ms for them) | {} "
+            "texture uploads ({:.1f} MiB, {:.1f} ms, copying {:.1f} ms) | "
             "buffer uploads {:.1f} MiB, {:.1f} ms | {} buffer ranges made resident ({:.1f} MiB, "
             "{:.1f} ms) | {} staging allocations ({:.1f} MiB, {:.1f} ms) | {} background "
             "copies (1 MiB pieces), waited {:.1f} ms | page protection {} "
@@ -1343,7 +1351,12 @@ void Rasterizer::ReportHitch() {
             now.packets - last.packets, delta(now.gpu_waits, last.gpu_waits),
             ms_of(delta(now.gpu_wait_ns, last.gpu_wait_ns)), ms_of(slowest_ns), site,
             GS::slowest_wait_line.load(std::memory_order_relaxed),
-            delta(now.pipelines, last.pipelines), delta(now.uploads, last.uploads),
+            delta(now.pipelines, last.pipelines),
+            delta(now.background_pipelines, last.background_pipelines),
+            delta(now.background_shaders, last.background_shaders),
+            delta(now.background_skips, last.background_skips),
+            ms_of(delta(now.background_wait_ns, last.background_wait_ns)),
+            delta(now.uploads, last.uploads),
             delta(now.upload_bytes, last.upload_bytes) / 1048576.0,
             ms_of(delta(now.upload_ns, last.upload_ns)),
             ms_of(delta(now.image_copy_ns, last.image_copy_ns)),
