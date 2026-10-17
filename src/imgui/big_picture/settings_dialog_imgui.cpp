@@ -81,6 +81,15 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbGeometryInPlaceSetting = EmulatorSettings.IsBbGeometryInPlace();
     bbSkipEmptyDrawsSetting = EmulatorSettings.IsBbSkipEmptyDraws();
     bbBackgroundPipelinesSetting = EmulatorSettings.IsBbBackgroundPipelines();
+    {
+        // 0 (the game's own), 2, 4, 8, 16 -> 0..4
+        const int samples = EmulatorSettings.GetBbAnisotropy();
+        bbAnisotropySetting = samples >= 16  ? 4
+                              : samples >= 8 ? 3
+                              : samples >= 4 ? 2
+                              : samples >= 2 ? 1
+                                             : 0;
+    }
     bbStutterDetailSetting = EmulatorSettings.IsBbStutterDetail();
     bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
 
@@ -155,6 +164,8 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbGeometryInPlace(bbGeometryInPlaceSetting, isSpecific);
     EmulatorSettings.SetBbSkipEmptyDraws(bbSkipEmptyDrawsSetting, isSpecific);
     EmulatorSettings.SetBbBackgroundPipelines(bbBackgroundPipelinesSetting, isSpecific);
+    EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
+                                     isSpecific);
     EmulatorSettings.SetBbStutterDetail(bbStutterDetailSetting, isSpecific);
     EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
 
@@ -805,6 +816,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    bbBackgroundPipelinesSetting,
                                    "New objects appear a frame late instead of a stutter");
             }
+            // Sharper ground and stairs at an angle; applies after a restart.
+            AddSettingCombo("Anisotropic filtering", bbAnisotropySetting, anisotropyOptions);
             // Not under the threaded renderer: the upscalers use it either way.
             AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,
                                "Motion of moving objects for DLSS / FSR");

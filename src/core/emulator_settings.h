@@ -477,6 +477,9 @@ struct GPUSettings {
     // Threaded renderer: new scene pipelines compiled on background threads, their draws skipped
     // until ready (a frame or two) instead of the game waiting. Off: compiled at once.
     Setting<bool> bb_background_pipelines{true};
+    // Anisotropic filtering for the game's mipmapped textures (surfaces at an angle stay sharp
+    // without shimmering): 2, 4, 8 or 16 samples. 0: the game's own filtering.
+    Setting<int> bb_anisotropy{16};
     // Diagnostics: every draw timed, and where the draw recorder's time went shown for each
     // stutter (slower: for finding stutter causes).
     Setting<bool> bb_stutter_detail{false};
@@ -527,6 +530,7 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_skip_empty_draws", &GPUSettings::bb_skip_empty_draws),
             make_override<GPUSettings>("bb_background_pipelines",
                                        &GPUSettings::bb_background_pipelines),
+            make_override<GPUSettings>("bb_anisotropy", &GPUSettings::bb_anisotropy),
             make_override<GPUSettings>("bb_stutter_detail", &GPUSettings::bb_stutter_detail),
             make_override<GPUSettings>("bb_defaults", &GPUSettings::bb_defaults),
         };
@@ -541,7 +545,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     threaded_renderer_gpu_profile, bb_object_motion, bb_readback_queue, bb_streaming,
     bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
     bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place, bb_skip_empty_draws,
-    bb_background_pipelines, bb_stutter_detail, bb_defaults)
+    bb_background_pipelines, bb_anisotropy, bb_stutter_detail, bb_defaults)
 
 // -------------------------------
 // Vulkan settings
@@ -855,6 +859,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbBackgroundPipelines, bb_background_pipelines)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
+    SETTING_FORWARD(m_gpu, BbAnisotropy, bb_anisotropy)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {
