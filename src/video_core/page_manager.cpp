@@ -125,6 +125,8 @@ struct PageManager::Impl {
         u64 range_begin = page_start;
         u64 range_pages = 0;
         u64 potential_pages = 0;
+        // Windows' protection cost is per page: only runs of pages whose protection changes.
+        const bool exact = EmulatorSettings.IsBbExactProtection();
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
@@ -163,6 +165,9 @@ struct PageManager::Impl {
                 // If the protection changed add pending (un)protect action
                 release_pending();
                 perms = new_perms;
+            } else if (exact && new_perms == old_perms) {
+                // Already right: not part of the next call (see bb_exact_protection).
+                release_pending();
             } else if (range_pages != 0) {
                 ++potential_pages;
             }
@@ -200,6 +205,8 @@ struct PageManager::Impl {
         u64 range_begin = base_page + page_start;
         u64 range_pages = 0;
         u64 potential_pages = 0;
+        // Windows' protection cost is per page: only runs of pages whose protection changes.
+        const bool exact = EmulatorSettings.IsBbExactProtection();
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
@@ -231,6 +238,9 @@ struct PageManager::Impl {
                 // If the protection changed add pending (un)protect action
                 release_pending();
                 perms = new_perms;
+            } else if (exact && new_perms == old_perms) {
+                // Already right: not part of the next call (see bb_exact_protection).
+                release_pending();
             } else if (range_pages != 0) {
                 // If the protection did not change, extend the potential range
                 ++potential_pages;

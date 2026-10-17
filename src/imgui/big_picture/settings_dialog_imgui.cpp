@@ -81,6 +81,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbGeometryInPlaceSetting = EmulatorSettings.IsBbGeometryInPlace();
     bbSkipEmptyDrawsSetting = EmulatorSettings.IsBbSkipEmptyDraws();
     bbBackgroundPipelinesSetting = EmulatorSettings.IsBbBackgroundPipelines();
+    bbExactProtectionSetting = EmulatorSettings.IsBbExactProtection();
     {
         // 0 (the game's own), 2, 4, 8, 16 -> 0..4
         const int samples = EmulatorSettings.GetBbAnisotropy();
@@ -164,6 +165,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbGeometryInPlace(bbGeometryInPlaceSetting, isSpecific);
     EmulatorSettings.SetBbSkipEmptyDraws(bbSkipEmptyDrawsSetting, isSpecific);
     EmulatorSettings.SetBbBackgroundPipelines(bbBackgroundPipelinesSetting, isSpecific);
+    EmulatorSettings.SetBbExactProtection(bbExactProtectionSetting, isSpecific);
     EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
                                      isSpecific);
     EmulatorSettings.SetBbStutterDetail(bbStutterDetailSetting, isSpecific);
@@ -818,6 +820,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             }
             // Sharper ground and stairs at an angle; applies after a restart.
             AddSettingCombo("Anisotropic filtering", bbAnisotropySetting, anisotropyOptions);
+            AddSettingCheckbox("Protect only changed pages (testing)", bbExactProtectionSetting,
+                               "Less CPU time protecting game memory the GPU reads");
             // Not under the threaded renderer: the upscalers use it either way.
             AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,
                                "Motion of moving objects for DLSS / FSR");

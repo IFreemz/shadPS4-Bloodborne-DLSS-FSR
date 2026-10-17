@@ -155,6 +155,7 @@ private:
     bool bbSkipEmptyDrawsSetting;
     bool bbBackgroundPipelinesSetting;
     int bbAnisotropySetting; ///< index into anisotropyOptions
+    bool bbExactProtectionSetting;
     bool bbStutterDetailSetting;
     int bbVramBudgetTestSetting;
     bool rcasEnabledSetting;
