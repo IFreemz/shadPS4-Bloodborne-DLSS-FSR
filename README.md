@@ -5,6 +5,13 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 # shadPS4 Bloodborne DLSS & FSR
 
+> [!NOTE]
+> **This project is now maintained by [@eFMann](https://github.com/eFMann).** It was created by
+> [@IFreemz](https://github.com/IFreemz), who built the DLSS and FSR integration, frame generation
+> and keyboard and mouse controls. Huge thanks to eFMann for taking it over, and
+> for the threaded renderer, frame pacing, character motion vectors and VRAM work he has already
+> contributed. Old links to `IFreemz/shadPS4-Bloodborne-DLSS-FSR` redirect here.
+
 > **New: [2.0.1](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.1) and [2.1.0-pre.3](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.3) (experimental).** SDR to HDR for any GPU (thanks @zeroznet), keyboard and mouse controls with a real mouse camera, sharper textures while upscaling. The experimental adds @eFMann's threaded renderer, frame pacing and character motion vectors, and the VRAM cleanup by @Cainhurst27 (u/EnglishDave_) and @eFMann. Feedback is welcome in the [issues](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues).
 
 Temporal upscaling for Bloodborne on [shadPS4](https://github.com/shadps4-emu/shadPS4): NVIDIA
@@ -465,6 +472,14 @@ An AI coding agent was used in the development of this project.
 
 ## Credits
 
+- IFreemz, the original author: the DLSS and FSR upscaling and frame generation integration
+  (camera and object motion, jitter, HUD handling, Reflex), the F1 panel and keyboard and mouse
+  controls with the mouse camera.
+- eFMann, the current maintainer: the threaded renderer, frame pacing, character motion vectors,
+  the VRAM cleanup rounds and buffer eviction, the shadPS4 0.20.0 port, the RTX 3060 DLSS
+  frame-pacing diagnosis and the Reflex options reapplication patch.
+- Cainhurst27 (u/EnglishDave_), for finding and fixing shadPS4's long-standing VRAM leak, and for
+  testing.
 - [shadPS4](https://github.com/shadps4-emu/shadPS4) and its contributors, for the emulator.
 - deadinside28's [bloodborne_pc](https://github.com/deadinside28/bloodborne_pc), whose notes on
   the scene constants and viewport jitter were the starting point for camera motion and jitter
@@ -475,8 +490,6 @@ An AI coding agent was used in the development of this project.
   resolution patches and the AA, chromatic aberration and depth-of-field patches.
 - The [RenoDX](https://github.com/clshortfuse/renodx) authors, for the HDR mod.
 - zeroznet, for SDR to HDR.
-- EnglishDave_, for testing.
-- eFMann, for the RTX 3060 DLSS frame-pacing diagnosis, Reflex options reapplication patch, logs, and testing.
 - NVIDIA, for DLSS, Streamline and Reflex, and AMD, for FSR and the open FidelityFX SDK.
 
 ## License
