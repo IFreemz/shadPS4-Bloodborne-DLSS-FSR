@@ -12,7 +12,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 > for the threaded renderer, frame pacing, character motion vectors and VRAM work he has already
 > contributed. Old links to `IFreemz/shadPS4-Bloodborne-DLSS-FSR` redirect here.
 
-> **New: [2.0.1](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.1) and [2.1.0-pre.3](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.3) (experimental).** SDR to HDR for any GPU (thanks @zeroznet), keyboard and mouse controls with a real mouse camera, sharper textures while upscaling. The experimental adds @eFMann's threaded renderer, frame pacing and character motion vectors, and the VRAM cleanup by @Cainhurst27 (u/EnglishDave_) and @eFMann. Feedback is welcome in the [issues](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues).
+> **New: [2.1.0-pre.4](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.4) (experimental).** Resolution in F1 (no patch file editing), faster rendering and fewer stutters: a lighter threaded renderer, background shader compiles and a saved driver cache, batched texture uploads. Should fix the white screen edge on AMD with upscaling (#24) and the crash when loading a save. The stable build is still [2.0.1](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.1). Feedback is welcome in the [issues](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues).
 
 Temporal upscaling for Bloodborne on [shadPS4](https://github.com/shadps4-emu/shadPS4): NVIDIA
 DLSS on GeForce RTX cards, AMD FSR 3.1 on everything else, plus frame generation (DLSS on RTX 40
@@ -221,7 +221,7 @@ sensitivity and invert. F7 turns the mouse camera off and on. Your previous cont
 > [!WARNING]
 > **RenoDX doesn't work with 2.0.0, 2.0.1 and the 2.1.0-pre.2 and later builds yet.** shadPS4 0.20.0 compiles the game's shaders
 > differently, so RenoDX doesn't recognise them until it gets an update. For HDR, use
-> [1.8.6](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.8.6) or [2.1.0-pre.1](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.1) (experimental) for now.
+> [1.8.6](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v1.8.6) or [2.1.0-pre.1](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.1) (experimental) for now.
 
 The [RenoDX](https://github.com/clshortfuse/renodx) HDR mod for Bloodborne (ReShade 6.8.0 or
 newer) works with 1.8.6 and 2.1.0-pre.1, with every upscaler, patch type and frame generation. It's out of
@@ -285,7 +285,7 @@ and *Optimal 1080p*.
   sleep on. 2x and 3x look clean; 4x and above show vibration or tearing-like artifacts during
   movement on this setup. The cause is still under investigation.
 - [@TheFurryMonk](https://github.com/TheFurryMonk)
-  ([#4](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues/4)): RTX 5070 Ti, 1440p
+  ([#4](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues/4)): RTX 5070 Ti, 1440p
   144 Hz G-Sync, 2560x1440 patch (DLAA), *1440p Light Grid*. Smoothest: vblank 60 with
   *Uncap FPS++* or *60 FPS++*, capped at 120 with RTSS (NVIDIA Reflex limiter, inject after
   frame presentation). vblank 90 gives 180 fps, above 144 Hz, so it judders and tears now and
@@ -293,7 +293,7 @@ and *Optimal 1080p*.
 - EnglishDave_, RTX 5080: 2x is the most stable, 3x the best compromise. *Lower input delay*
   may be needed on RTX 50 cards. *Readbacks Mode* on causes a little stutter for him.
 - [@sunlighthell](https://github.com/sunlighthell)
-  ([#11](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues/11)): RTX 5080,
+  ([#11](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues/11)): RTX 5080,
   Ryzen 7 9800X3D, 64 GB RAM, DLSS preset M, 2x frame generation. Reported smooth 60 base /
   120 displayed fps, with occasional dips to 118-119, from character creation through Cleric
   Beast. Shader cache on, Immediate, vblank 120, driver G-SYNC/VSync on, extra memory `9999`,
@@ -353,7 +353,7 @@ F1 shows why upscaling isn't running.
 - **"DLSS Frame generation needs …"**: F1 names what's missing (RTX 40/50 card, newer driver or
   Hardware-accelerated GPU scheduling). *Automatic* uses FSR frame generation instead.
 - **Crash on AMD Radeon when the upscaler starts**: fixed in 1.7.0
-  ([#7](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues/7)). If it still happens,
+  ([#7](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues/7)). If it still happens,
   attach `user/log/shad_log.txt` there.
 - **Frame generation on, but not smoother**: close overlays (NVIDIA app overlay, RivaTuner), keep
   the game focused and check the GPU isn't maxed out (see *Frame generation*).
@@ -367,7 +367,7 @@ F1 shows why upscaling isn't running.
 - **No sound effects in menus**: if Windows uses *Dolby Atmos for Home Theater* (or another
   spatial sound format) for your audio device, turn it off in Windows' sound settings. Thanks to
   @DarthBane768 for tracking this down
-  ([#15](https://github.com/IFreemz/shadPS4-Bloodborne-DLSS-FSR/issues/15)).
+  ([#15](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues/15)).
 
 ## FAQ
 
