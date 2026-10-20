@@ -788,6 +788,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/bit_field.h
            src/common/bounded_threadsafe_queue.h
            src/common/concepts.h
+           src/common/crash_crumbs.cpp
+           src/common/crash_crumbs.h
            src/common/cstring.h
            src/common/debug.h
            src/common/decoder.cpp
@@ -1307,6 +1309,10 @@ set(INPUT src/input/controller.cpp
           src/input/input_handler.h
           src/core/bb_mouse_camera.cpp
           src/core/bb_mouse_camera.h
+          src/core/bb_game_fixes.cpp
+          src/core/bb_game_fixes.h
+          src/core/bb_resolution.cpp
+          src/core/bb_resolution.h
           src/input/bb_kbm.cpp
           src/input/bb_kbm.h
           src/input/input_mouse.cpp

@@ -441,8 +441,8 @@ struct GPUSettings {
     Setting<bool> threaded_renderer_diagnostics{false};
     // Bloodborne threaded renderer: GPU time per pass in the log (vk_gpu_profiler.h).
     Setting<bool> threaded_renderer_gpu_profile{false};
-    // Bloodborne upscalers: replay the game's velocity draws at render resolution for object
-    // motion vectors (vk_bb_velocity_mirror). Off: camera motion only, ~2-3 ms less GPU time.
+    // No longer used: F1's Object motion vectors (dlss.ini object_motion) switches the velocity
+    // mirror. Kept so saved configs still load.
     Setting<bool> bb_object_motion{true};
     // Under the threaded renderer (each off: the emulator's original behaviour for that part).
     // GPU readbacks on a second queue (copy engine), waiting only for the GPU work that wrote
@@ -480,12 +480,24 @@ struct GPUSettings {
     // Anisotropic filtering for the game's mipmapped textures (surfaces at an angle stay sharp
     // without shimmering): 2, 4, 8 or 16 samples. 0: the game's own filtering.
     Setting<int> bb_anisotropy{16};
+    // Where the per-draw data the CPU writes every frame lives: 0 auto (graphics card memory
+    // with Resizable BAR / Smart Access Memory, system RAM without), 1 graphics card, 2 system.
+    Setting<int> bb_draw_data_memory{0};
     // Page protection: only the pages whose protection changes, not the already protected pages
     // between them (Windows' cost is per page). Off: one call over the whole stretch.
     Setting<bool> bb_exact_protection{true};
     // New textures a draw needs are unshuffled and copied together: one barrier and one render
     // pass break for the group instead of per texture. Off: one texture at a time.
     Setting<bool> bb_batched_uploads{true};
+    // Threaded renderer: a draw's textures reused as found for the same textures last time
+    // (texture set memo). Off: looked up for every draw.
+    Setting<bool> bb_texture_set_memo{true};
+    // Threaded renderer: small or changed vertex/index data copied ahead into the draw data ring
+    // by the decoding thread. Off: copied by the draw recorder as before.
+    Setting<bool> bb_ring_geometry{true};
+    // Threaded renderer: the next GPU submission is decoded while the draw recorder still
+    // records the last one. Off: waits for the recorder after each submission.
+    Setting<bool> bb_submit_overlap{true};
     // Diagnostics: every draw timed, and where the draw recorder's time went shown for each
     // stutter (slower: for finding stutter causes).
     Setting<bool> bb_stutter_detail{false};
@@ -537,8 +549,12 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_background_pipelines",
                                        &GPUSettings::bb_background_pipelines),
             make_override<GPUSettings>("bb_anisotropy", &GPUSettings::bb_anisotropy),
+            make_override<GPUSettings>("bb_draw_data_memory", &GPUSettings::bb_draw_data_memory),
             make_override<GPUSettings>("bb_exact_protection", &GPUSettings::bb_exact_protection),
             make_override<GPUSettings>("bb_batched_uploads", &GPUSettings::bb_batched_uploads),
+            make_override<GPUSettings>("bb_texture_set_memo", &GPUSettings::bb_texture_set_memo),
+            make_override<GPUSettings>("bb_ring_geometry", &GPUSettings::bb_ring_geometry),
+            make_override<GPUSettings>("bb_submit_overlap", &GPUSettings::bb_submit_overlap),
             make_override<GPUSettings>("bb_stutter_detail", &GPUSettings::bb_stutter_detail),
             make_override<GPUSettings>("bb_defaults", &GPUSettings::bb_defaults),
         };
@@ -554,7 +570,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
     bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place, bb_skip_empty_draws,
     bb_background_pipelines, bb_anisotropy, bb_exact_protection, bb_batched_uploads,
-    bb_stutter_detail, bb_defaults)
+    bb_texture_set_memo, bb_ring_geometry, bb_submit_overlap, bb_stutter_detail, bb_defaults)
 
 // -------------------------------
 // Vulkan settings
@@ -868,9 +884,13 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbBackgroundPipelines, bb_background_pipelines)
     SETTING_FORWARD_BOOL(m_gpu, BbExactProtection, bb_exact_protection)
     SETTING_FORWARD_BOOL(m_gpu, BbBatchedUploads, bb_batched_uploads)
+    SETTING_FORWARD_BOOL(m_gpu, BbTextureSetMemo, bb_texture_set_memo)
+    SETTING_FORWARD_BOOL(m_gpu, BbRingGeometry, bb_ring_geometry)
+    SETTING_FORWARD_BOOL(m_gpu, BbSubmitOverlap, bb_submit_overlap)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
     SETTING_FORWARD(m_gpu, BbAnisotropy, bb_anisotropy)
+    SETTING_FORWARD(m_gpu, BbDrawDataMemory, bb_draw_data_memory)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {

@@ -42,13 +42,15 @@ public:
      * This will kill the current process and launch a new process with the same configuration
      * (using CLI args) but replacing the eboot image and guest arguments
      */
-    void Restart(std::filesystem::path eboot_path, const std::vector<std::string>& guest_args = {});
+    void Restart(std::filesystem::path eboot_path, const std::vector<std::string>& guest_args = {},
+                 bool standalone = false);
 
     /**
      * Launches a new emulator process with the supplied CLI arguments, then terminates this
-     * process. The new process waits for this one to exit before initializing.
+     * process. The new process waits for this one to exit before initializing. Standalone: the
+     * new process starts itself even under a launcher (IPC), without the launcher's link.
      */
-    [[noreturn]] void Relaunch(std::vector<std::string> args);
+    [[noreturn]] void Relaunch(std::vector<std::string> args, bool standalone = false);
 
     const char* executableName;
     bool waitForDebuggerBeforeRun{false};

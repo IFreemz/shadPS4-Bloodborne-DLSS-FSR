@@ -102,6 +102,11 @@ public:
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
     }
+    /// The last stage before the rasterizer adds the upscaler jitter (runtime_info.h,
+    /// ClipJitter), so the viewport is not offset.
+    bool UsesClipJitter() const {
+        return clip_jitter;
+    }
     /// Same pipeline rendering into the RGBA16F velocity mirror (temporal DLSS only).
     vk::Pipeline VelocityMirrorHandle() const {
         return velocity_mirror ? *velocity_mirror : vk::Pipeline{};
@@ -119,6 +124,7 @@ private:
 
 private:
     GraphicsPipelineKey key;
+    bool clip_jitter{};
     vk::UniquePipeline velocity_mirror;
     Shader::Gcn::FetchShaderData fetch_shader{};
 };

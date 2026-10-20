@@ -42,6 +42,10 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        clip_jitter |= infos[i] && runtime_infos[i].hw_stage == Shader::HwStage::Vertex &&
+                       runtime_infos[i].hw.vs.clip_jitter != 0;
+    }
     BuildDescSetLayout(preloading);
     const auto debug_str = GetDebugString();
 
@@ -197,7 +201,8 @@ GraphicsPipeline::GraphicsPipeline(
         });
     } else if (is_rect_list || is_quad_list) {
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
-        if (!preloading) {
+        // Also when a cached pipeline came without it: an empty shader stops the launch.
+        if (!preloading || sdata.tcs.empty()) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
             sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
         }
@@ -215,7 +220,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     } else if (is_rect_list || is_quad_list) {
-        if (!preloading) {
+        if (!preloading || sdata.tes.empty()) {
             const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
             sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
                 AuxShaderType::PassthroughTES, fs_info);
@@ -234,7 +239,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     } else if (runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation) {
-        if (!preloading) {
+        if (!preloading || sdata.fragment.empty()) {
             const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
 
             sdata.fragment = Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs.outputs);

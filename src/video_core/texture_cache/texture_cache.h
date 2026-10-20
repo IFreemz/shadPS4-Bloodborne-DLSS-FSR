@@ -513,7 +513,7 @@ private:
     TileManager tile_manager;
     absl::flat_hash_map<u64, SamplerId> samplers;
     absl::flat_hash_set<ImageId> download_images;
-    u64 total_used_memory = 0;
+    std::atomic<u64> total_used_memory{0}; ///< image memory (backings as allocated)
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;

@@ -276,6 +276,11 @@ public:
         return sw_stage == SwStage::Vertex && hw_stage == HwStage::Vertex &&
                runtime_info.hw.vs.motion_vectors != 0;
     }
+    /// The push data member holding motion_param (it moves in clip jitter shaders).
+    u32 motion_param_member{PushData::MotionParamIndex};
+    [[nodiscard]] bool VertexClipJitter() const {
+        return hw_stage == HwStage::Vertex && runtime_info.hw.vs.clip_jitter != 0;
+    }
     [[nodiscard]] bool FragmentMotion() const {
         return sw_stage == SwStage::Fragment && runtime_info.hw.fs.motion_vectors;
     }

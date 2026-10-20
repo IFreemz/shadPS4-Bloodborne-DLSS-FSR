@@ -1,10 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <numeric>
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -13,6 +16,29 @@
 #include <vk_mem_alloc.h>
 
 namespace VideoCore {
+
+MemoryType DrawDataMemoryType(const Vulkan::Instance& instance) {
+    static const MemoryType type = [&] {
+        // Resizable BAR (AMD: Smart Access Memory): the CPU-visible part of graphics card memory
+        // covers (nearly) all of it, not the classic 256 MiB window.
+        const auto props = instance.GetPhysicalDevice().getMemoryProperties();
+        constexpr auto bar_flags =
+            vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible;
+        u64 bar_heap = 0;
+        for (u32 i = 0; i < props.memoryTypeCount; ++i)
+            if ((props.memoryTypes[i].propertyFlags & bar_flags) == bar_flags)
+                bar_heap =
+                    std::max<u64>(bar_heap, props.memoryHeaps[props.memoryTypes[i].heapIndex].size);
+        const bool rebar = bar_heap > 1024_MB;
+        const int setting = EmulatorSettings.GetBbDrawDataMemory(); // 0 auto, 1 card, 2 system
+        const bool card = setting == 1 || (setting == 0 && rebar);
+        LOG_INFO(Render_Vulkan, "Draw data memory: {} ({}, Resizable BAR {}: {} MiB visible)",
+                 card ? "graphics card" : "system RAM", setting == 0 ? "auto" : "setting",
+                 rebar ? "on" : "off", bar_heap >> 20);
+        return card ? MemoryType::Stream : MemoryType::HostCached;
+    }();
+    return type;
+}
 
 std::string_view BufferTypeName(MemoryType type) {
     switch (type) {

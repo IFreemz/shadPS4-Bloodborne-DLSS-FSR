@@ -781,12 +781,18 @@ void EmitContext::DefineOutputs() {
 
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
-    // Only motion shaders declare motion_param (the last member): every other shader keeps the
-    // exact SPIR-V of builds without character motion, which HDR mods such as RenoDX identify
-    // shaders by.
+    // Only motion and clip jitter shaders declare motion_param and clip_jitter (the last
+    // members): every other shader keeps the exact SPIR-V of builds without them, which HDR mods
+    // such as RenoDX identify shaders by. Clip jitter shaders also declare the rest of
+    // buf_offsets (resource.h, JitterMotionParamIndex).
+    const bool jitter = VertexClipJitter();
+    const bool motion_member = VertexMotion() || jitter;
+    motion_param_member = jitter ? PushData::JitterMotionParamIndex : PushData::MotionParamIndex;
     const Id struct_type{Name(
-        VertexMotion() ? TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], U32[2])
-                       : TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]),
+        jitter ? TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4], U32[2], U32[2],
+                            F32[2])
+        : motion_member ? TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2], U32[2])
+                        : TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]),
         "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
@@ -803,11 +809,20 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 16U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
-    if (VertexMotion()) {
-        MemberName(struct_type, PushData::MotionParamIndex, "motion_param");
+    if (jitter) {
+        MemberName(struct_type, PushData::BufOffsetIndex + 3, "buf_offsets3");
+        MemberDecorate(struct_type, PushData::BufOffsetIndex + 3, spv::Decoration::Offset, 64U);
+    }
+    if (motion_member) {
+        MemberName(struct_type, motion_param_member, "motion_param");
         // After buf_offsets, wherever NUM_BUFFERS puts it (upstream raised it from 40 to 56).
-        MemberDecorate(struct_type, PushData::MotionParamIndex, spv::Decoration::Offset,
+        MemberDecorate(struct_type, motion_param_member, spv::Decoration::Offset,
                        static_cast<u32>(offsetof(PushData, motion_param)));
+    }
+    if (jitter) {
+        MemberName(struct_type, PushData::JitterClipJitterIndex, "clip_jitter");
+        MemberDecorate(struct_type, PushData::JitterClipJitterIndex, spv::Decoration::Offset,
+                       static_cast<u32>(offsetof(PushData, clip_jitter)));
     }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");

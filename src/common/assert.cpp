@@ -3,6 +3,7 @@
 
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/crash_crumbs.h"
 #include "core/signals.h"
 #include "emulator.h"
 
@@ -15,6 +16,7 @@
 #endif
 
 void assert_fail_impl() {
+    Common::Crumbs::Dump();
     Core::Signals::Instance()->RemoveHandlers();
     Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     Crash();

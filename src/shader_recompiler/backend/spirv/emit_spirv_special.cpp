@@ -78,7 +78,7 @@ static void EmitVertexMotion(EmitContext& ctx) {
     const Id position = ctx.OpLoad(ctx.F32[4], ctx.output_position);
     const Id param_ptr =
         ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[2]),
-                          ctx.push_data_block, ctx.ConstU32(PushData::MotionParamIndex));
+                          ctx.push_data_block, ctx.ConstU32(ctx.motion_param_member));
     const Id param_words = ctx.OpLoad(ctx.U32[2], param_ptr);
     const auto to_u64 = [&](Id lo, Id hi) {
         return ctx.OpBitwiseOr(
@@ -189,6 +189,32 @@ static void EmitFragmentMotion(EmitContext& ctx) {
                                                            valid, depth}));
 }
 
+// Upscaler jitter (runtime_info.h, ClipJitter): clip x/y moved by the draw's offset times w,
+// which moves the image by the same amount as the viewport offset did. After the motion code,
+// which keeps the unjittered position.
+static void AddClipJitter(EmitContext& ctx) {
+    const Id f32_type = ctx.F32[1];
+    const Id position = ctx.OpLoad(ctx.F32[4], ctx.output_position);
+    const Id offset = ctx.OpLoad(
+        ctx.F32[2],
+        ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.F32[2]),
+                          ctx.push_data_block, ctx.ConstU32(PushData::JitterClipJitterIndex)));
+    const Id w = ctx.OpCompositeExtract(f32_type, position, 3u);
+    const auto moved = [&](u32 component) {
+        const Id product =
+            ctx.OpFMul(f32_type, ctx.OpCompositeExtract(f32_type, offset, component), w);
+        const Id sum =
+            ctx.OpFAdd(f32_type, ctx.OpCompositeExtract(f32_type, position, component), product);
+        // The same result in every pipeline using this shader (depth passes and the main pass).
+        ctx.Decorate(product, spv::Decoration::NoContraction);
+        ctx.Decorate(sum, spv::Decoration::NoContraction);
+        return sum;
+    };
+    Id result = ctx.OpCompositeInsert(ctx.F32[4], moved(0u), position, 0u);
+    result = ctx.OpCompositeInsert(ctx.F32[4], moved(1u), result, 1u);
+    ctx.OpStore(ctx.output_position, result);
+}
+
 void EmitEpilogue(EmitContext& ctx) {
     if (Sirit::ValidId(ctx.motion_out_cur)) {
         EmitVertexMotion(ctx);
@@ -199,6 +225,9 @@ void EmitEpilogue(EmitContext& ctx) {
     if (ctx.hw_stage == HwStage::Vertex &&
         ctx.runtime_info.hw.vs.emulate_depth_negative_one_to_one) {
         ConvertDepthMode(ctx);
+    }
+    if (ctx.VertexClipJitter()) {
+        AddClipJitter(ctx);
     }
     if (ctx.hw_stage == HwStage::Vertex && ctx.runtime_info.hw.vs.clip_disable) {
         ConvertPositionToClipSpace(ctx);

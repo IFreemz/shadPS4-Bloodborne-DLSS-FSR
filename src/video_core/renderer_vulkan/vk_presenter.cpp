@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <SDL3/SDL_video.h>
+#include "common/crash_crumbs.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -1237,6 +1238,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    Common::Crumbs::Add("present (game frame)", is_game_frame);
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {

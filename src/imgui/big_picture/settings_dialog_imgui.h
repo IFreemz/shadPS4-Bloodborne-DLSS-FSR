@@ -119,6 +119,7 @@ private:
     const std::vector<std::string> audioBackendOptions = {"SDL", "OpenAL"};
     const std::vector<std::string> presentModeOptions = {"Mailbox", "Fifo", "Immediate"};
     const std::vector<std::string> anisotropyOptions = {"Game default", "2x", "4x", "8x", "16x"};
+    const std::vector<std::string> drawDataMemoryOptions = {"Auto", "On", "Off"};
     const std::vector<std::string> hideCursorOptions = {"Never", "Idle", "Always"};
     const std::vector<std::string> trophySideOptions = {"left", "right", "top", "bottom"};
     const std::vector<std::string> readbacksModeOptions = {"Disabled", "Relaxed", "Precise"};
@@ -142,7 +143,6 @@ private:
     bool threadedRendererSetting;
     bool threadedRendererDiagnosticsSetting;
     bool threadedRendererGpuProfileSetting;
-    bool bbObjectMotionSetting;
     bool bbReadbackQueueSetting;
     bool bbStreamingSetting;
     bool bbMergedCopiesSetting;
@@ -154,9 +154,13 @@ private:
     bool bbGeometryInPlaceSetting;
     bool bbSkipEmptyDrawsSetting;
     bool bbBackgroundPipelinesSetting;
-    int bbAnisotropySetting; ///< index into anisotropyOptions
+    int bbAnisotropySetting;     ///< index into anisotropyOptions
+    int bbDrawDataMemorySetting; ///< index into drawDataMemoryOptions
     bool bbExactProtectionSetting;
     bool bbBatchedUploadsSetting;
+    bool bbTextureSetMemoSetting;
+    bool bbRingGeometrySetting;
+    bool bbSubmitOverlapSetting;
     bool bbStutterDetailSetting;
     int bbVramBudgetTestSetting;
     bool rcasEnabledSetting;

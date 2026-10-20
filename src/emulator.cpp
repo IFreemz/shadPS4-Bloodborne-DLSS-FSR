@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -30,6 +31,7 @@
 #include "common/polyfill_thread.h"
 #include "common/scm_rev.h"
 #include "common/singleton.h"
+#include "core/bb_resolution.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/debugger.h"
 #include "core/devtools/widget/module_list.h"
@@ -116,8 +118,18 @@ Emulator::Emulator() {
     WSAStartup(versionWanted, &wsaData);
 #endif
     std::at_quick_exit([]() {
-        ShutdownDlss();
+        const bool restarting = Core::BbResolution::restarting;
+        // A restart ends the process below without the DLLs' own shutdown, so NGX needs no
+        // release first (it waits for the GPU thread, which once took 12 s and stuttered sound).
+        if (!restarting)
+            ShutdownDlss();
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
+#ifdef _WIN32
+        // A restart from F1: end at once. A normal exit then spends seconds in every loaded
+        // DLL's shutdown (driver, NGX, Streamline) while the new process waits for this one.
+        if (restarting)
+            TerminateProcess(GetCurrentProcess(), 0);
+#endif
     });
 }
 
@@ -546,6 +558,25 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "Vulkan guestMarkers: {}", EmulatorSettings.IsVkGuestMarkersEnabled());
     LOG_INFO(Config, "Vulkan rdocEnable: {}", EmulatorSettings.IsRenderdocEnabled());
     LOG_INFO(Config, "Vulkan PipelineCacheEnabled: {}", EmulatorSettings.IsPipelineCacheEnabled());
+    // Bloodborne experimental settings: which of the added code paths this session runs.
+    LOG_INFO(Config,
+             "Bloodborne threadedRenderer: {} streaming: {} readbackQueue: {} mergedCopies: {} "
+             "fastLocks: {} flipWhenReady: {} geometryInPlace: {} backgroundCopies: {} "
+             "skipEmptyDraws: {} backgroundShaderCompiles: {} textureSetMemo: {} "
+             "ringGeometry: {} submitOverlap: {}",
+             EmulatorSettings.IsThreadedRenderer(), EmulatorSettings.IsBbStreaming(),
+             EmulatorSettings.IsBbReadbackQueue(), EmulatorSettings.IsBbMergedCopies(),
+             EmulatorSettings.IsBbFastLocks(), EmulatorSettings.IsBbFlipWhenReady(),
+             EmulatorSettings.IsBbGeometryInPlace(), EmulatorSettings.IsBbBackgroundTextureCopies(),
+             EmulatorSettings.IsBbSkipEmptyDraws(), EmulatorSettings.IsBbBackgroundPipelines(),
+             EmulatorSettings.IsBbTextureSetMemo(), EmulatorSettings.IsBbRingGeometry(),
+             EmulatorSettings.IsBbSubmitOverlap());
+    LOG_INFO(Config,
+             "Bloodborne anisotropy: {} resizableBar: {} exactProtection: {} batchedUploads: {} "
+             "vramCleanup: {} bufferEviction: {}",
+             EmulatorSettings.GetBbAnisotropy(), EmulatorSettings.GetBbDrawDataMemory(),
+             EmulatorSettings.IsBbExactProtection(), EmulatorSettings.IsBbBatchedUploads(),
+             EmulatorSettings.IsBbVramReclaim(), EmulatorSettings.IsBbBufferEviction());
     LOG_INFO(Config, "Vulkan PipelineCacheArchived: {}",
              EmulatorSettings.IsPipelineCacheArchived());
 
@@ -788,8 +819,8 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     std::quick_exit(0);
 }
 
-void Emulator::Restart(std::filesystem::path eboot_path,
-                       const std::vector<std::string>& guest_args) {
+void Emulator::Restart(std::filesystem::path eboot_path, const std::vector<std::string>& guest_args,
+                       bool standalone) {
     std::vector<std::string> args;
 
     auto& game_info = Common::ElfInfo::Instance();
@@ -847,10 +878,10 @@ void Emulator::Restart(std::filesystem::path eboot_path,
         }
     }
 
-    Relaunch(std::move(args));
+    Relaunch(std::move(args), standalone);
 }
 
-[[noreturn]] void Emulator::Relaunch(std::vector<std::string> args) {
+[[noreturn]] void Emulator::Relaunch(std::vector<std::string> args, bool standalone) {
     const auto guest_args = std::find(args.begin(), args.end(), "--");
     args.insert(guest_args, {"--wait-for-pid", std::to_string(Debugger::GetCurrentPid())});
 
@@ -860,7 +891,15 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 
     auto& ipc = IPC::Instance();
 
-    if (ipc.IsEnabled()) {
+    if (ipc.IsEnabled() && standalone) {
+        // The new process starts without the launcher: it loads the patch folder itself, as
+        // the launcher would have sent it.
+#ifdef _WIN32
+        SetEnvironmentVariableW(L"SHADPS4_ENABLE_IPC", nullptr);
+#else
+        unsetenv("SHADPS4_ENABLE_IPC");
+#endif
+    } else if (ipc.IsEnabled()) {
         ipc.SendRestart(args);
         while (true) {
             std::this_thread::sleep_for(std::chrono::minutes(1));

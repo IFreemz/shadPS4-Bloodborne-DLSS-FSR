@@ -6,6 +6,7 @@
 #include <optional>
 #include <ranges>
 
+#include "common/crash_crumbs.h"
 #include "common/elf_info.h"
 #include "common/guest_stats.h"
 #include "common/hash.h"
@@ -184,6 +185,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
         info.hw.vs.motion_vectors = motion_select ? Shader::MotionVectors::VertexVersion : 0;
+        // Screen-space draws (clipping off) are never jittered.
+        info.hw.vs.clip_jitter = Shader::ClipJitter::enabled && !info.hw.vs.clip_disable
+                                     ? Shader::ClipJitter::Version
+                                     : 0;
         break;
     }
     case HwStage::Fragment: {
@@ -558,6 +563,7 @@ void PipelineCache::StartBackgroundCompile() {
                                    stage_runtime = runtime_infos, stage_modules = modules,
                                    fetch = std::move(fetch)]() mutable {
             const auto start = std::chrono::steady_clock::now();
+            Common::Crumbs::Add("background pipeline build (key hash)", hash);
             GraphicsPipeline::SerializationSupport sdata{};
             auto pipeline = std::make_unique<GraphicsPipeline>(
                 instance, scheduler, desc_heap, profile, key, *pipeline_cache, stage_infos,
@@ -617,7 +623,11 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (may_defer) {
         NoteDepthTarget();
     }
-    translate_in_background = may_defer && MayDefer();
+    // Shaders are translated here, on this thread, not in the background: translation reads the
+    // game's resource descriptors from guest memory, which the game rewrites by the time a
+    // background thread gets to them (wrong or crashing shaders). It takes about 1 ms; only the
+    // slow pipeline builds go to the background.
+    translate_in_background = false;
     stage_deferred = false;
     const bool refreshed = RefreshGraphicsKey();
     translate_in_background = false;

@@ -227,6 +227,12 @@ struct PushData {
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 BufOffsetIndex = 4;
     static constexpr u32 MotionParamIndex = BufOffsetIndex + 3;
+    /// Vertex shaders with the upscaler jitter (runtime_info.h, ClipJitter) declare all 56 bytes
+    /// of buf_offsets (bindings 32-47 in a uvec4, 48-55 in a uvec2), then motion_param and
+    /// clip_jitter. The layout above leaves bindings 40-55 outside its members, so a member
+    /// after it would be read as their buffer offsets.
+    static constexpr u32 JitterMotionParamIndex = BufOffsetIndex + 4;
+    static constexpr u32 JitterClipJitterIndex = BufOffsetIndex + 5;
 
     float xoffset;
     float yoffset;
@@ -235,12 +241,18 @@ struct PushData {
     std::array<u8, NUM_BUFFERS> buf_offsets;
     /// Character motion vectors: device address of this draw's parameters (low, high).
     std::array<u32, 2> motion_param;
+    /// Upscaler jitter in normalized device coordinates (x, y), times w (runtime_info.h,
+    /// ClipJitter). 0 for draws that are not jittered.
+    std::array<float, 2> clip_jitter;
 
     void AddOffset(u32 binding, u32 offset) {
         ASSERT(offset < 256 && binding < buf_offsets.size());
         buf_offsets[binding] = offset;
     }
 };
+static_assert(offsetof(PushData, buf_offsets) == 16 && offsetof(PushData, motion_param) == 72 &&
+                  offsetof(PushData, clip_jitter) == 80,
+              "the clip jitter push data layout (spirv_emit_context.cpp) assumes these offsets");
 static_assert(offsetof(PushData, motion_param) % 8 == 0,
               "motion_param is read as a uvec2 and must be 8-byte aligned");
 static_assert(sizeof(PushData) <= 128,

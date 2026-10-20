@@ -244,12 +244,13 @@ void Liverpool::Process(std::stop_token stoken) {
                 // still records this one (as bbport does). The guest learns of finished work
                 // only from fences and labels, which the recorder writes in order after the
                 // draws, and from GPU idle, which waits for the recorder below.
-                // SHADPS4_SUBMIT_DRAIN=1: wait for the recorder after each submission, as before.
-                static const bool drain_each = [] {
+                // Overlap GPU submissions off (or SHADPS4_SUBMIT_DRAIN=1): wait for the recorder
+                // after each submission, as before.
+                static const bool drain_env = [] {
                     const char* value = std::getenv("SHADPS4_SUBMIT_DRAIN");
                     return value && value[0] == '1';
                 }();
-                if (rasterizer && drain_each) {
+                if (rasterizer && (drain_env || !EmulatorSettings.IsBbSubmitOverlap())) {
                     rasterizer->DrainDrawPipe();
                 }
                 task.destroy();

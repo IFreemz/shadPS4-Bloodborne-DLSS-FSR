@@ -17,8 +17,8 @@ namespace Serialization {
 // Experimental build: different from upstream's (binary 9, meta 6, key 3) and from earlier
 // experimental builds, so no build loads the others' character-motion shaders or keys.
 static constexpr u32 ShaderBinaryVersion = 11u;
-static constexpr u32 ShaderMetaVersion = 8u;
-static constexpr u32 PipelineKeyVersion = 5u;
+static constexpr u32 ShaderMetaVersion = 13u;
+static constexpr u32 PipelineKeyVersion = 6u;
 } // namespace Serialization
 
 namespace {
@@ -34,6 +34,7 @@ enum StaleReason : u32 {
     MetaMissing,
     MetaVersion,
     BinaryMissing,
+    BinaryBroken,
     NumStaleReasons,
 };
 std::array<u32, NumStaleReasons> stale_reasons{};
@@ -51,6 +52,7 @@ void RegisterPipelineData(const ComputePipelineKey& key,
     Serialization::Writer pldata{ar};
 
     pldata.Write(Serialization::PipelineKeyVersion);
+    pldata.Write(Serialization::ShaderMetaVersion);
     pldata.Write(u32{1}); // compute
 
     key.Serialize(ar);
@@ -70,6 +72,7 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
     Serialization::Writer pldata{ar};
 
     pldata.Write(Serialization::PipelineKeyVersion);
+    pldata.Write(Serialization::ShaderMetaVersion);
     pldata.Write(u32{0}); // graphics
 
     key.Serialize(ar);
@@ -294,6 +297,21 @@ Program* PipelineCache::PreloadVariant(Serialization::Archive& ar, size_t& perm_
         ++stale_reasons[BinaryMissing];
         return nullptr;
     }
+    // A binary cut short or damaged (the game closed while it was written): rebuilt in game
+    // instead of stopping the launch.
+    static constexpr u32 SpirvMagic = 0x07230203;
+    if (spv.size() < 5 || spv[0] != SpirvMagic) {
+        ++stale_reasons[BinaryBroken];
+        return nullptr;
+    }
+    auto [module_result, module] = instance.GetDevice().createShaderModule(
+        vk::ShaderModuleCreateInfo{.codeSize = spv.size() * sizeof(u32), .pCode = spv.data()});
+    if (module_result != vk::Result::eSuccess) {
+        LOG_WARNING(Render, "Cached shader {:#018x}_{} was rejected by the driver ({})", pgm_hash,
+                    perm_idx, vk::to_string(module_result));
+        ++stale_reasons[BinaryBroken];
+        return nullptr;
+    }
 
     auto [it_pgm, new_program] = program_cache.try_emplace(pgm_hash);
     if (new_program) {
@@ -302,7 +320,7 @@ Program* PipelineCache::PreloadVariant(Serialization::Archive& ar, size_t& perm_
     auto* target = it_pgm.value().get();
     spec.info = &target->info;
     // At the index it was saved under: pipeline keys name variants by index.
-    target->InsertPermut(CompileSPV(spv, instance.GetDevice()), std::move(spec), perm_idx);
+    target->InsertPermut(module, std::move(spec), perm_idx);
     return target;
 }
 
@@ -314,6 +332,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     }
     infos[stage] = &program->info;
     modules[stage] = program->modules[perm_idx].module;
+    // The variant's own runtime info: the pipeline reads from it what its shaders do (the
+    // upscaler jitter in the vertex shader), not left over from the last pipeline built.
+    runtime_infos[stage] = program->modules[perm_idx].spec.runtime_info;
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
     }
@@ -399,6 +420,15 @@ void PipelineCache::WarmUp() {
                 ++stale_reasons[KeyVersion];
                 return;
             }
+            // Only pipelines saved with this build's shader variants: shader variants are saved
+            // under the same names by every build, so a pipeline from another build would
+            // otherwise come back once this build has saved its own variants under those names.
+            u32 meta_version{};
+            pldata.Read(meta_version);
+            if (meta_version != Serialization::ShaderMetaVersion) {
+                ++stale_reasons[KeyVersion];
+                return;
+            }
 
             u32 is_compute{};
             pldata.Read(is_compute);
@@ -421,9 +451,10 @@ void PipelineCache::WarmUp() {
                     num_total_pipelines - num_pipelines);
         LOG_WARNING(Render,
                     "Stale pipelines: {} from older builds, {} shader info missing, {} shader "
-                    "info from older builds, {} shader binary missing",
+                    "info from older builds, {} shader binary missing, {} shader binary damaged",
                     stale_reasons[KeyVersion], stale_reasons[MetaMissing],
-                    stale_reasons[MetaVersion], stale_reasons[BinaryMissing]);
+                    stale_reasons[MetaVersion], stale_reasons[BinaryMissing],
+                    stale_reasons[BinaryBroken]);
     }
 
     Storage::DataBase::Instance().FinishPreload();

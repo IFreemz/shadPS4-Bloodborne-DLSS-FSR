@@ -9,6 +9,7 @@
 #include <string_view>
 #include "common/bb_tuning.h"
 #include "common/copy_pool.h"
+#include "common/crash_crumbs.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/guest_stats.h"
@@ -71,6 +72,13 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         instance, scheduler,
         temporal_dlss.Requested() && temporal_dlss.CharacterMotionRequested() && !RenoDxLoaded());
     temporal_dlss.SetObjectMotion(object_motion.get());
+    // Upscaler jitter in the vertex shaders, not the viewport (runtime_info.h, ClipJitter). Not
+    // under RenoDX, for the same reason as the motion code.
+    Shader::ClipJitter::enabled = temporal_dlss.Requested() && !RenoDxLoaded();
+    if (temporal_dlss.Requested()) {
+        LOG_INFO(Render_Vulkan, "[DLSS-TEMPORAL] Jitter in {}",
+                 Shader::ClipJitter::enabled ? "the vertex shaders" : "the viewport");
+    }
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -91,7 +99,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         scheduler.EnableThreadedRecording();
         sampler_memo = std::make_unique<std::array<SamplerMemoEntry, SamplerMemoSize>>();
         const_ring = std::make_unique<VideoCore::Buffer>(
-            instance, 0, ConstRingSize, VideoCore::MemoryType::Stream, "Constant ring");
+            instance, 0, ConstRingSize, VideoCore::DrawDataMemoryType(instance), "Constant ring");
         if (const_ring->mapped_data.empty()) {
             const_ring.reset();
         }
@@ -523,6 +531,14 @@ void Rasterizer::TemporalDlssDraw(const GraphicsPipeline* pipeline, bool indirec
     };
     draw_jitter =
         temporal_dlss.OnDraw(instance, runtime, scheduler, texture_cache, velocity_mirror, info);
+    // In the vertex shader when it has the code: a viewport with a fractional edge loses its
+    // last column/row on some AMD drivers. The viewport of the draw is 2 * scale pixels wide.
+    if ((draw_jitter[0] != 0.f || draw_jitter[1] != 0.f) && pipeline->UsesClipJitter() &&
+        push_data.xscale != 0.f && push_data.yscale != 0.f) {
+        push_data.clip_jitter = {draw_jitter[0] / push_data.xscale,
+                                 draw_jitter[1] / push_data.yscale};
+        draw_jitter = {};
+    }
 }
 
 // Fills color target 0 with a copy of another image of the same size and format, with the same
@@ -781,8 +797,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     ProfileLap(Section::Pending);
     const auto& regs = Regs();
 
+    const auto stage_hash = [pipeline](Shader::SwStage stage) -> u64 {
+        const auto* info = pipeline->GetStages()[static_cast<u32>(stage)];
+        return info ? info->pgm_hash : 0;
+    };
+    Common::Crumbs::Add("draw: render targets (vs, ps)", stage_hash(Shader::SwStage::Vertex),
+                        stage_hash(Shader::SwStage::Fragment));
     PrepareRenderState(pipeline);
     ProfileLap(Section::Targets);
+    Common::Crumbs::Add("draw: textures and buffers");
     if (!BindResources(pipeline)) {
         return;
     }
@@ -793,9 +816,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         return;
     }
     ProfileLap(Section::Dlss);
+    Common::Crumbs::Add("draw: begin rendering");
     const auto state = BeginRendering(pipeline);
     ProfileLap(Section::BeginRendering);
 
+    Common::Crumbs::Add("draw: vertex and index buffers");
     BindVertexBuffers(pipeline);
     ProfileLap(Section::VertexBuffers);
     if (is_indexed) {
@@ -816,6 +841,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     }
     ProfileLap(Section::Motion);
 
+    Common::Crumbs::Add("draw: descriptors");
     pipeline->BindResources(set_writes, push_data);
     ProfileLap(Section::Descriptors);
     UpdateDynamicState(pipeline, is_indexed);
@@ -828,6 +854,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline_handle);
     });
 
+    Common::Crumbs::Add("draw: draw (indices, instances)", regs.num_indices,
+                        regs.num_instances.NumInstances());
     const u32 num_indices = regs.num_indices;
     const u32 num_instances = regs.num_instances.NumInstances();
     const auto record_draw = [=](vk::CommandBuffer cmdbuf) {
@@ -901,6 +929,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
             scheduler.KickRecording(); // nobody holds the command buffer here
         }
     }
+    Common::Crumbs::Add("indirect draw (vs, args)",
+                        pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, args.address);
     const VAddr arg_address = args.address;
     const VAddr count_address = args.count_address;
     const u32 offset = args.offset;
@@ -1010,6 +1040,7 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     const auto& cs_program = CsRegs();
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    Common::Crumbs::Add("dispatch (cs)", cs.pgm_hash);
     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
         return;
     }
@@ -1110,7 +1141,8 @@ void Rasterizer::Finish() {
 void Rasterizer::OnSubmit() {
     ++stat_frames;
     DrainDrawPipe();
-    velocity_mirror.SetEnabled(EmulatorSettings.IsBbObjectMotion());
+    // F1's Object motion vectors: the velocity draws are replayed only while an upscaler uses them.
+    velocity_mirror.SetEnabled(temporal_dlss.ObjectMotionRequested());
     if (draw_pipe) {
         // The setting applies from the next submission (the pipe is idle here).
         pipe_enabled = EmulatorSettings.IsThreadedRenderer();
@@ -2225,7 +2257,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // Texture set memo: the whole stage's sampled textures as resolved last time.
     TextureSet* set_slot = nullptr;
     const u32 set_count = static_cast<u32>(stage.images.size());
-    if (memo_on && texture_sets && set_count != 0 && set_count <= TextureSet::MaxImages &&
+    if (memo_on && texture_sets && EmulatorSettings.IsBbTextureSetMemo() && set_count != 0 &&
+        set_count <= TextureSet::MaxImages &&
         std::ranges::none_of(stage.images, [](const Shader::ImageResource& image) {
             return image.is_written ||
                    image.mip_fallback_mode != Shader::MipStorageFallbackMode::None;
@@ -3721,7 +3754,7 @@ u64 Rasterizer::RingCopyGeometry(VAddr address, u64 size) {
     // BufferCache::ObtainGeometryBuffer's copy path, decided here: data it would copy to the
     // stream buffer (under 1 KiB, or changed by the CPU) and not written by queued GPU work.
     if (!const_ring || size == 0 || size > VideoCore::BufferCache::StreamThreshold() ||
-        buffer_cache.IsRegionGpuModified(address, size)) {
+        !EmulatorSettings.IsBbRingGeometry() || buffer_cache.IsRegionGpuModified(address, size)) {
         return NoRing;
     }
     const bool copied = size < 1024 || !Common::BbTuning::Threaded() ||

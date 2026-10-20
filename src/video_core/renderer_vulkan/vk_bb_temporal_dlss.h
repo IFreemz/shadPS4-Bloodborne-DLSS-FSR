@@ -60,6 +60,8 @@ public:
     bool Requested() const;
     // dlss.ini character_motion at startup: G-buffer pipelines get the motion attachment.
     bool CharacterMotionRequested() const;
+    // F1's Object motion vectors (dlss.ini object_motion) with an upscaler requested.
+    bool ObjectMotionRequested() const;
     void SetObjectMotion(BbObjectMotion* object_motion);
 
     struct DrawInfo {

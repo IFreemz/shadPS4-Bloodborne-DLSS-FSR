@@ -35,6 +35,12 @@ enum class MemoryType : u8 {
     Sparse,       ///< Requires an unbacked sparse resident buffer.
 };
 
+/// Where the per-draw data written by the CPU every frame lives (stream buffer, constant ring):
+/// graphics card memory the CPU writes across PCIe when Resizable BAR maps all of it, otherwise
+/// cached system memory the GPU reads (writes into the small 256 MiB BAR window are slow). The
+/// setting can force either. Decided once, logged.
+MemoryType DrawDataMemoryType(const Vulkan::Instance& instance);
+
 constexpr vk::BufferUsageFlags ReadFlags =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
     vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |

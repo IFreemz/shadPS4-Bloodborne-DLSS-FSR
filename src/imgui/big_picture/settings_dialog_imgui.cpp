@@ -69,7 +69,6 @@ void SettingsWindow::LoadSettings(std::string profile) {
     threadedRendererSetting = EmulatorSettings.IsThreadedRenderer();
     threadedRendererDiagnosticsSetting = EmulatorSettings.IsThreadedRendererDiagnostics();
     threadedRendererGpuProfileSetting = EmulatorSettings.IsThreadedRendererGpuProfile();
-    bbObjectMotionSetting = EmulatorSettings.IsBbObjectMotion();
     bbReadbackQueueSetting = EmulatorSettings.IsBbReadbackQueue();
     bbStreamingSetting = EmulatorSettings.IsBbStreaming();
     bbMergedCopiesSetting = EmulatorSettings.IsBbMergedCopies();
@@ -83,6 +82,9 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbBackgroundPipelinesSetting = EmulatorSettings.IsBbBackgroundPipelines();
     bbExactProtectionSetting = EmulatorSettings.IsBbExactProtection();
     bbBatchedUploadsSetting = EmulatorSettings.IsBbBatchedUploads();
+    bbTextureSetMemoSetting = EmulatorSettings.IsBbTextureSetMemo();
+    bbRingGeometrySetting = EmulatorSettings.IsBbRingGeometry();
+    bbSubmitOverlapSetting = EmulatorSettings.IsBbSubmitOverlap();
     {
         // 0 (the game's own), 2, 4, 8, 16 -> 0..4
         const int samples = EmulatorSettings.GetBbAnisotropy();
@@ -92,6 +94,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
                               : samples >= 2 ? 1
                                              : 0;
     }
+    bbDrawDataMemorySetting = std::clamp(EmulatorSettings.GetBbDrawDataMemory(), 0, 2);
     bbStutterDetailSetting = EmulatorSettings.IsBbStutterDetail();
     bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
 
@@ -154,7 +157,6 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetThreadedRenderer(threadedRendererSetting, isSpecific);
     EmulatorSettings.SetThreadedRendererDiagnostics(threadedRendererDiagnosticsSetting, isSpecific);
     EmulatorSettings.SetThreadedRendererGpuProfile(threadedRendererGpuProfileSetting, isSpecific);
-    EmulatorSettings.SetBbObjectMotion(bbObjectMotionSetting, isSpecific);
     EmulatorSettings.SetBbReadbackQueue(bbReadbackQueueSetting, isSpecific);
     EmulatorSettings.SetBbStreaming(bbStreamingSetting, isSpecific);
     EmulatorSettings.SetBbMergedCopies(bbMergedCopiesSetting, isSpecific);
@@ -168,8 +170,12 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbBackgroundPipelines(bbBackgroundPipelinesSetting, isSpecific);
     EmulatorSettings.SetBbExactProtection(bbExactProtectionSetting, isSpecific);
     EmulatorSettings.SetBbBatchedUploads(bbBatchedUploadsSetting, isSpecific);
+    EmulatorSettings.SetBbTextureSetMemo(bbTextureSetMemoSetting, isSpecific);
+    EmulatorSettings.SetBbRingGeometry(bbRingGeometrySetting, isSpecific);
+    EmulatorSettings.SetBbSubmitOverlap(bbSubmitOverlapSetting, isSpecific);
     EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
                                      isSpecific);
+    EmulatorSettings.SetBbDrawDataMemory(bbDrawDataMemorySetting, isSpecific);
     EmulatorSettings.SetBbStutterDetail(bbStutterDetailSetting, isSpecific);
     EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
 
@@ -808,27 +814,37 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Less CPU overhead (needs a restart)");
                 AddSettingCheckbox("    Show frames when ready", bbFlipWhenReadySetting,
                                    "Smoother above 60 fps. Off: frames on vblank ticks");
-                AddSettingCheckbox("    Geometry in place (testing)", bbGeometryInPlaceSetting,
+                AddSettingCheckbox("    Geometry in place", bbGeometryInPlaceSetting,
                                    "Static vertex/index data not copied for every draw");
-                AddSettingCheckbox("    Background copies (testing)",
-                                   bbBackgroundTextureCopiesSetting,
+                AddSettingCheckbox("    Background copies", bbBackgroundTextureCopiesSetting,
                                    "Copies textures and new geometry for the GPU on other threads");
-                AddSettingCheckbox("    Skip draws with no output (testing)",
-                                   bbSkipEmptyDrawsSetting,
+                AddSettingCheckbox("    Skip draws with no output", bbSkipEmptyDrawsSetting,
                                    "Occlusion test geometry the emulator does not use");
-                AddSettingCheckbox("    Background shader compiles (testing)",
-                                   bbBackgroundPipelinesSetting,
+                AddSettingCheckbox("    Background shader compiles", bbBackgroundPipelinesSetting,
                                    "New objects appear a frame late instead of a stutter");
+                AddSettingCheckbox("    Reuse texture lookups (testing)", bbTextureSetMemoSetting,
+                                   "A draw's textures found once, not every draw");
+                AddSettingCheckbox("    Copy geometry ahead (testing)", bbRingGeometrySetting,
+                                   "Small vertex/index data copied by the decoding thread");
+                AddSettingCheckbox("    Overlap GPU submissions (testing)", bbSubmitOverlapSetting,
+                                   "Next submission decoded while the last is recorded");
             }
             // Sharper ground and stairs at an angle; applies after a restart.
             AddSettingCombo("Anisotropic filtering", bbAnisotropySetting, anisotropyOptions);
-            AddSettingCheckbox("Protect only changed pages (testing)", bbExactProtectionSetting,
+            // The per-draw data the CPU writes every frame: in graphics card memory with Resizable
+            // BAR / Smart Access Memory, else system memory. The log says which was used.
+            AddSettingCombo("Resizable BAR / Smart Access Memory (restart)",
+                            bbDrawDataMemorySetting, drawDataMemoryOptions);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Puts the data the game changes every frame straight into "
+                                  "graphics card memory.\nNeeds Resizable BAR (NVIDIA, Intel) or "
+                                  "Smart Access Memory (AMD) enabled in the BIOS.\nAuto detects "
+                                  "it. Try Off if you get stutter or crashes.");
+            }
+            AddSettingCheckbox("Protect only changed pages", bbExactProtectionSetting,
                                "Less CPU time protecting game memory the GPU reads");
-            AddSettingCheckbox("Batched texture uploads (testing)", bbBatchedUploadsSetting,
+            AddSettingCheckbox("Batched texture uploads", bbBatchedUploadsSetting,
                                "New textures of a draw uploaded together");
-            // Not under the threaded renderer: the upscalers use it either way.
-            AddSettingCheckbox("Upscaler object motion (velocity mirror)", bbObjectMotionSetting,
-                               "Motion of moving objects for DLSS / FSR");
             AddSettingCheckbox("VRAM cleanup", bbVramReclaimSetting,
                                "Frees unused VRAM in long sessions (needs a restart)");
             if (bbVramReclaimSetting) {
@@ -843,7 +859,10 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingCheckbox("GPU time per pass in the log", threadedRendererGpuProfileSetting,
                                "Which render passes take the GPU's time");
             AddSettingCheckbox("Detailed stutter reports", bbStutterDetailSetting,
-                               "With diagnostics: where each stutter's time went (slower)");
+                               "With diagnostics: where each stutter's time went");
+            // Times every draw: heavy on the CPU.
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.2f, 1.0f), "(costs fps)");
             // Testing the VRAM cleanup: act as if the GPU had this much VRAM (0 = real amount).
             AddSettingSliderInt("VRAM budget for testing (MB, 0 = real)", bbVramBudgetTestSetting,
                                 0, 24000);

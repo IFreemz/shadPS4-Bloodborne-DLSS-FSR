@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <utility>
 #include <fmt/format.h>
+#include "common/crash_crumbs.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -590,9 +591,11 @@ struct BbTemporalDlss::Impl {
         FrameGen::SetReflex(tune.fg_reflex, tune.fg_reflex_sleep);
         LOG_INFO(Render_Vulkan,
                  "[DLSS-TEMPORAL] Settings: enabled={} upscaler={} jitter={} sign=({},{}) "
-                 "object_motion={} hud={} debug_motion={} quality={} output={}x{}",
+                 "object_motion={} character_motion={} texture_lod_bias={} hud={} "
+                 "debug_motion={} quality={} output={}x{}",
                  tune.enabled, tune.upscaler, tune.jitter, tune.sign_x, tune.sign_y, tune.mirror,
-                 tune.hud, tune.debug_motion, tune.quality, tune.output.width, tune.output.height);
+                 tune.character_motion, tune.texture_lod_bias, tune.hud, tune.debug_motion,
+                 tune.quality, tune.output.width, tune.output.height);
     }
 
     void EnsurePipelines(const Instance& instance) {
@@ -1114,6 +1117,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         profiler->Mark(0xD155ull, [] { return std::string{"DLSS (temporal upscale and passes)"}; });
     }
     const bool hdr = upscale_to.has_value();
+    Common::Crumbs::Add("upscaler: evaluate (width, height)", source.info.size.width,
+                        source.info.size.height);
     auto* ngx = instance.GetDlssNgx();
     const vk::Extent2D in{source.info.size.width, source.info.size.height};
     VideoCore::Image* depth =
@@ -1814,6 +1819,10 @@ bool BbTemporalDlss::Requested() const {
 
 bool BbTemporalDlss::CharacterMotionRequested() const {
     return impl->requested && impl->tune.character_motion;
+}
+
+bool BbTemporalDlss::ObjectMotionRequested() const {
+    return impl->requested && impl->tune.mirror;
 }
 
 void BbTemporalDlss::SetObjectMotion(BbObjectMotion* object_motion) {

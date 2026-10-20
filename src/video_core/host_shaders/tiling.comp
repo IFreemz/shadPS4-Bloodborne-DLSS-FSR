@@ -84,10 +84,11 @@ const uint NUM_PIPE_BITS = PIPE_CONFIG == 0 ? 1 : 3;
 
 #define _BIT(v, b) bitfieldExtract((v), (b), 1)
 
+// pitch_height: the host's 16-bit pitch and height, read as one 32-bit word (no 16-bit
+// members in the uniform buffer).
 struct MipInfo {
     uint size;
-    uint16_t pitch;
-    uint16_t height;
+    uint pitch_height;
     uint offset;
 };
 
@@ -427,8 +428,8 @@ uint GetMipLevel(inout uint texel) {
 void main() {
     uint texel = gl_GlobalInvocationID.x;
     uint mip = GetMipLevel(texel);
-    uint pitch = info.mips[mip].pitch;
-    uint height = info.mips[mip].height;
+    uint pitch = info.mips[mip].pitch_height & 0xffffu;
+    uint height = info.mips[mip].pitch_height >> 16;
     uint tiled_offset = info.mips[mip].offset;
     uint x = texel % pitch;
     uint y = (texel / pitch) % height;

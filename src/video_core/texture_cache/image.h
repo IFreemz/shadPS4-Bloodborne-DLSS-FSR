@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <optional>
 
@@ -115,6 +116,15 @@ struct Image : public Common::LRUNode<> {
         depth_uid = {};
     }
 
+    /// VRAM the image takes: all its backings (sample counts), as allocated.
+    vk::DeviceSize SizeBytes() const {
+        vk::DeviceSize size = 0;
+        for (const auto& backing_image : backing_images) {
+            size += backing_image.image.size_bytes;
+        }
+        return size;
+    }
+
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
     using Barriers = SmallVector<vk::ImageMemoryBarrier2, 32>;
@@ -155,6 +165,9 @@ public:
     };
     SmallVector<BackingImage, 2> backing_images;
     BackingImage* backing{};
+    /// While registered: the texture cache's count of image memory (a backing added later, for
+    /// another sample count, is counted too).
+    std::atomic<u64>* memory_usage_counter{};
     u64 image_uid{};
     u64 lru_id{};
     u64 tick_accessed_last{};

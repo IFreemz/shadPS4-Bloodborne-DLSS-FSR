@@ -12,6 +12,7 @@
 #include "common/alignment.h"
 #include "common/bb_tuning.h"
 #include "common/copy_pool.h"
+#include "common/crash_crumbs.h"
 #include "common/guest_stats.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
@@ -112,7 +113,7 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
-      stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
+      stream_buffer{instance, scheduler, DrawDataMemoryType(instance), STREAM_BUFFER_SIZE},
       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
       memory_semaphore{instance} {
     vram_reclaim = EvictIdleBuffers() && EmulatorSettings.IsBbVramReclaim();
@@ -1041,7 +1042,9 @@ void BufferCache::GarbageCollectResidentMemory() {
         // The graphics queue is shared with the presenter (and frame generation): queue
         // operations must be serialized like every other submission.
         std::scoped_lock submit_lock{Vulkan::Scheduler::submit_mutex};
+        Common::Crumbs::Add("buffer eviction: sparse unbind (ranges)", buffer_binds.size());
         result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+        Common::Crumbs::Add("buffer eviction: sparse unbind done");
     }
     const double unbind_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - unbind_start)
@@ -1283,7 +1286,9 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
 
     info.AddWait(signal_sema, signal_tick);
     const auto bind_start = std::chrono::steady_clock::now();
+    Common::Crumbs::Add("buffer memory: sparse bind (ranges)", buffer_binds.size());
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+    Common::Crumbs::Add("buffer memory: sparse bind done");
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     if (vram_reclaim) {
         // Buffer eviction makes binding more frequent (evicted ranges come back): report slow

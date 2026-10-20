@@ -200,12 +200,23 @@ struct Info : InfoPersistent {
 
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
-        T data;
+        T data{};
         const auto ud = UserData();
         const u32* base = ud.data();
         if (ptr_index != IR::NumScalarRegs) {
+            if (ptr_index >= ud.size() || ud.size() - ptr_index < 2) {
+                return data;
+            }
             std::memcpy(&base, &ud[ptr_index], sizeof(base));
             base = reinterpret_cast<const u32*>(VAddr(base) & 0xFFFFFFFFFFFFULL);
+            // A table the game has not set (after a failed allocation while streaming): an empty
+            // descriptor, not a read at a small address.
+            if (!base) {
+                return data;
+            }
+        } else if (dword_offset > ud.size() ||
+                   sizeof(T) > (ud.size() - dword_offset) * sizeof(u32)) {
+            return data;
         }
         std::memcpy(&data, base + dword_offset, sizeof(T));
         return data;

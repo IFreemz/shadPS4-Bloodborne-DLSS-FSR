@@ -92,6 +92,16 @@ struct MotionVectors {
     static inline bool enabled = false;         ///< set at startup when the buffers exist
 };
 
+/// Temporal upscaler jitter added to the vertex shader's clip position instead of the viewport
+/// offset. With the viewport offset, AMD's RDNA4 driver leaves out the last column/row of the
+/// image when the jitter is negative (it rounds the fractional viewport edge down), which the
+/// upscaler then smears in as a border. The per-draw offset comes through push data (0 for draws
+/// that are not jittered), so the SPIR-V does not depend on the session.
+struct ClipJitter {
+    static constexpr u8 Version = 1;    ///< bump when the jitter code changes
+    static inline bool enabled = false; ///< set at startup when an upscaler is on
+};
+
 struct HwLocalRuntimeInfo {
     u32 ls_stride;
 
@@ -112,6 +122,8 @@ struct HwVertexRuntimeInfo {
     /// MotionVectors: store/load clip positions; 0 = off, else the code version, so shaders
     /// cached with older motion code are not reused (fills padding).
     u8 motion_vectors{};
+    /// ClipJitter: 0 = off, else the code version (fills padding).
+    u8 clip_jitter{};
     u32 user_clip_plane_mask{};
 
     bool operator==(const HwVertexRuntimeInfo& other) const noexcept = default;

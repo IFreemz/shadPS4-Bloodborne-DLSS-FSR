@@ -4,6 +4,7 @@
 #include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/crash_crumbs.h"
 #include "common/decoder.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
@@ -159,6 +160,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {} ({})", code, address,
                      ModuleOffset(address));
+        Common::Crumbs::Dump();
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 

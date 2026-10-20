@@ -5,6 +5,7 @@
 #include <chrono>
 #include "common/assert.h"
 #include "common/copy_pool.h"
+#include "common/crash_crumbs.h"
 #include "common/debug.h"
 #include "common/guest_stats.h"
 #include "common/thread.h"
@@ -382,6 +383,7 @@ void Scheduler::EndSession() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    Common::Crumbs::Add("GPU submit (tick)", CurrentTick());
     if (recorder) {
         recorder->Sync();
         direct_mode = true;

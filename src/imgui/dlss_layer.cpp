@@ -12,10 +12,12 @@
 #include <vector>
 
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <imgui.h>
 
 #include "common/path_util.h"
 #include "core/bb_mouse_camera.h"
+#include "core/bb_resolution.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/bb_hdr_compat.h"
@@ -134,6 +136,27 @@ bool EnableRecommendedPatches() {
     std::ofstream file{PatchFile(), std::ios::binary | std::ios::trunc};
     file << text;
     return bool(file);
+}
+
+// Relaunches the game for a new resolution, after a confirmation: it goes back to the last
+// autosave, like quitting from the system menu.
+void RestartButton() {
+    if (Button("Apply and restart the game"))
+        OpenPopup("Restart the game?");
+    SetNextWindowPos(GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {0.5f, 0.5f});
+    SetNextWindowSize({360.0f, 0.0f});
+    if (BeginPopupModal("Restart the game?", nullptr,
+                        ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
+        TextWrapped("The game restarts with the new resolution. You continue from your last "
+                    "autosave.");
+        TextWrapped("Don't restart while the save icon is showing.");
+        if (Button("Restart"))
+            ::Core::BbResolution::RestartGame();
+        SameLine();
+        if (Button("Cancel"))
+            CloseCurrentPopup();
+        EndPopup();
+    }
 }
 
 constexpr std::array UpscalerValues{"auto", "dlss", "fsr", "fsr4"};
@@ -335,6 +358,125 @@ void DlssLayer::Draw() {
                     "parts of the world at random (with or without upscaling). Press F3, go to "
                     "Experimental and set Readbacks Mode to Relaxed, then restart the game.");
         PopStyleColor();
+    }
+
+    SeparatorText("Resolution");
+    {
+        namespace Res = ::Core::BbResolution;
+        bool res_control = settings.Get("res_control", "0") == "1";
+        if (Checkbox("Set the resolution here (restart)", &res_control))
+            settings.Set("res_control", res_control ? "1" : "0");
+        if (IsItemHovered())
+            SetTooltip("The game's output resolution (its frame, post-processing and UI) and the "
+                       "render resolution of\nthe 3D scene, which the upscaler brings up to the "
+                       "output. Patches that set the same sizes (Resolution, Decoupled,\nHD "
+                       "Motion Blur) are skipped while this is on. Bloodborne 1.09.");
+        const auto next = Res::Preview();
+        BeginDisabled(!res_control);
+        {
+            static constexpr std::array OutputValues{"auto",      "1280x720",  "1600x900",
+                                                     "1920x1080", "2560x1440", "3840x2160"};
+            const auto output = settings.Get("res_output", "auto");
+            int index = 0;
+            for (size_t i = 0; i < OutputValues.size(); ++i)
+                if (output == OutputValues[i])
+                    index = int(i);
+            const std::string window_name =
+                index == 0 ? fmt::format("Window ({}x{})", next.output_width, next.output_height)
+                           : std::string{"Window"};
+            std::array<const char*, OutputValues.size()> names{};
+            names[0] = window_name.c_str();
+            for (size_t i = 1; i < OutputValues.size(); ++i)
+                names[i] = OutputValues[i];
+            SetNextItemWidth(200.0f);
+            if (Combo("Output resolution", &index, names.data(), int(names.size())))
+                settings.Set("res_output", OutputValues[index]);
+        }
+        {
+            // Native, then the usual 16:9 sizes below the output, largest first. Above 1080p the
+            // scene needs the bigger graphics heap: more VRAM and extra dmem.
+            auto heights = Res::RenderHeights(next.output_height);
+            std::ranges::reverse(heights);
+            const auto vram = [](u32 h) { return h > Res::HeapRenderHeight ? ", more VRAM" : ""; };
+            std::vector<std::string> values{"native"}, labels;
+            labels.push_back(next.output_height > Res::HeapRenderHeight
+                                 ? "Native (DLAA / FSR Native AA, more VRAM)"
+                                 : "Native (DLAA / FSR Native AA)");
+            for (const u32 h : heights) {
+                values.push_back(std::to_string(h));
+                labels.push_back(fmt::format("{}x{} ({}%{})", h * 16 / 9, h,
+                                             h * 100 / next.output_height, vram(h)));
+            }
+            int index = 0;
+            for (size_t i = 1; i < values.size(); ++i)
+                if (std::stoul(values[i]) == next.render_height)
+                    index = int(i);
+            std::vector<const char*> names;
+            for (const auto& label : labels)
+                names.push_back(label.c_str());
+            SetNextItemWidth(200.0f);
+            if (Combo("Upscale from", &index, names.data(), int(names.size())))
+                settings.Set("res_render", values[index]);
+        }
+        {
+            // The game's graphics heap, raised for a scene above 1080p (Res::Install).
+            static constexpr std::array HeapValues{"auto", "full", "first", "smaller", "off"};
+            static constexpr std::array HeapNames{"Auto", "Full Heap Patch", "First Heap Only",
+                                                  "Smaller 2nd Heap", "Off"};
+            const auto heap = next.heap;
+            int index = 0;
+            for (size_t i = 0; i < HeapValues.size(); ++i)
+                if (heap == HeapValues[i])
+                    index = int(i);
+            SetNextItemWidth(200.0f);
+            if (Combo("Graphics Heap Size", &index, HeapNames.data(), int(HeapNames.size())))
+                settings.Set("res_heap", HeapValues[index]);
+            if (IsItemHovered())
+                SetTooltip(
+                    "Memory the game sets aside for graphics. A scene above 1080p needs "
+                    "more than its own.\nAuto: raised above 1080p, the second heap a "
+                    "little less than the full patch, which can\ncause missing textures "
+                    "and flicker.\nFull Heap Patch: the Increased Graphics Heap Sizes "
+                    "patch. First Heap Only: only the first heap raised.\nSmaller 2nd "
+                    "Heap: Auto's sizes at any resolution.\nOff: the game's own sizes, unless a "
+                    "heap size patch is enabled in the patch file.");
+        }
+        EndDisabled();
+        const auto& now = Res::Applied();
+        if (res_control) {
+            Text("%ux%u -> %ux%u", next.render_width, next.render_height, next.output_width,
+                 next.output_height);
+            SameLine();
+            const bool in_use = now.enabled && now.output_width == next.output_width &&
+                                now.output_height == next.output_height &&
+                                now.render_width == next.render_width &&
+                                now.render_height == next.render_height && now.heap == next.heap;
+            if (in_use)
+                TextDisabled("(in use)");
+            else if (now.problem.empty())
+                RestartButton();
+            else
+                TextDisabled("(restart the game to apply)");
+            if (!now.problem.empty())
+                TextDisabled("%s", now.problem.c_str());
+            // A scene above 1080p raises the game's graphics heap: it needs extra dmem.
+            if (next.render_height > Res::HeapRenderHeight &&
+                EmulatorSettings.GetExtraDmemInMBytes() < 4000)
+                TextColored({1.0f, 0.75f, 0.3f, 1.0f},
+                            "Above 1080p needs extra dmem of 4000 MB or more (game settings).");
+            // Patches from the patch file or launcher that set the same sizes: not applied.
+            if (now.enabled && !Res::SkippedPatches().empty())
+                TextWrapped("Ignored while this is on: %s",
+                            fmt::format("{}", fmt::join(Res::SkippedPatches(), ", ")).c_str());
+        } else {
+            if (now.enabled) {
+                TextDisabled("Restart the game to use the patch file's resolution again.");
+                SameLine();
+                RestartButton();
+            }
+            TextWrapped("Off: the render resolution comes from the Resolution Patch you enable "
+                        "for Bloodborne (shadPS4 patches or BBLauncher), upscaled to your window.");
+        }
     }
 
     SeparatorText("Settings");
@@ -606,13 +748,6 @@ void DlssLayer::Draw() {
     }
     if (!kbm_message.empty())
         TextWrapped("%s", kbm_message.c_str());
-
-    SeparatorText("Resolution");
-    TextWrapped("The game's render resolution is upscaled to your shadPS4 window size. The "
-                "render resolution comes from the Resolution Patch you enable for Bloodborne "
-                "(shadPS4 patches or BBLauncher): for a 4K window, the 1440p patch is Quality "
-                "mode and the 1080p patch is Performance mode (faster, softer). A render "
-                "resolution equal to the window only anti-aliases (DLAA / FSR Native AA).");
 
     SeparatorText("Recommended game patches");
     if (!patches.file_found) {

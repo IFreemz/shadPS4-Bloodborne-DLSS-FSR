@@ -367,6 +367,11 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     cmdbuf.dispatch(dim_x, 1, 1);
 
+    // The staging copy is read by the tiling shader: a later write to that staging memory (it is
+    // handed out again) waits for it.
+    runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
+                         vk::PipelineStageFlagBits2::eComputeShader,
+                         vk::AccessFlagBits2::eShaderRead);
     runtime.AccessBuffer(out_buffer, out_offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,
                          vk::AccessFlagBits2::eShaderWrite);

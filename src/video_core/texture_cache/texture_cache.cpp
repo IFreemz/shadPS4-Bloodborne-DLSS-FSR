@@ -8,6 +8,7 @@
 #include <xxhash.h>
 
 #include "common/assert.h"
+#include "common/crash_crumbs.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/guest_stats.h"
@@ -721,8 +722,12 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
         src_image.binding.needs_rebind = 1u;
     }
 
-    FreeImage(image_id);
     TrackImage(new_image_id);
+    // The new image holds the old one's contents now, GPU-written ones included: the VRAM cleanup
+    // must write them back before freeing it, not reload stale guest memory.
+    new_image.flags &= ~ImageFlagBits::Dirty;
+    new_image.flags |= src_image.flags & ImageFlagBits::GpuModified;
+    FreeImage(image_id);
     return new_image_id;
 }
 
@@ -1041,6 +1046,8 @@ bool TextureCache::PrepareRefresh(Image& image,
 }
 
 void TextureCache::RefreshImage(Image& image) {
+    Common::Crumbs::Add("image upload (address, size)", image.info.guest_address,
+                        image.info.guest_size);
     SmallVector<vk::BufferImageCopy, 14> image_copies;
     if (!PrepareRefresh(image, image_copies)) {
         return;
@@ -1208,7 +1215,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     registry_generation.fetch_add(1, std::memory_order_acq_rel);
-    total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+    image.memory_usage_counter = &total_used_memory;
+    total_used_memory += Common::AlignUp(image.SizeBytes(), 1024);
     image_lru_cache.Insert(image, gc_tick);
     const auto& info = image.info;
     ASSERT_MSG((info.guest_address & 0xff) == 0, "Trying to register an unaligned image");
@@ -1229,7 +1237,8 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ClearCleanTick(image);
     registry_generation.fetch_add(1, std::memory_order_acq_rel);
     image_lru_cache.Free(image);
-    total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    image.memory_usage_counter = nullptr;
+    total_used_memory -= Common::AlignUp(image.SizeBytes(), 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         ASSERT_MSG(page_it, "Unregistering unregistered page={:#x}", page << Traits::PAGE_BITS);
@@ -1603,6 +1612,8 @@ void TextureCache::RunGarbageCollector() {
 
 void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
+    Common::Crumbs::Add("image deleted (address, size)", image.info.guest_address,
+                        image.info.guest_size);
     ASSERT_MSG(image.IsUntracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
 
