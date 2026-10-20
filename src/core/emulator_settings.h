@@ -452,6 +452,9 @@ struct GPUSettings {
     Setting<bool> bb_streaming{true};
     // Copy shader batches in one compute dispatch, merged within 64 KiB.
     Setting<bool> bb_merged_copies{true};
+    // Test (issue #25, white dots): the merged copy batches as GPU copy commands instead of the
+    // multi-copy compute shader. Off: the compute shader.
+    Setting<bool> bb_merged_copy_commands{false};
     // Faster Windows locks and sleeps (applies at game start).
     Setting<bool> bb_fast_locks{true};
     // Flip a frame as soon as it's ready (between vblanks), evenly paced, instead of on the
@@ -551,6 +554,8 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_anisotropy", &GPUSettings::bb_anisotropy),
             make_override<GPUSettings>("bb_draw_data_memory", &GPUSettings::bb_draw_data_memory),
             make_override<GPUSettings>("bb_exact_protection", &GPUSettings::bb_exact_protection),
+            make_override<GPUSettings>("bb_merged_copy_commands",
+                                       &GPUSettings::bb_merged_copy_commands),
             make_override<GPUSettings>("bb_batched_uploads", &GPUSettings::bb_batched_uploads),
             make_override<GPUSettings>("bb_texture_set_memo", &GPUSettings::bb_texture_set_memo),
             make_override<GPUSettings>("bb_ring_geometry", &GPUSettings::bb_ring_geometry),
@@ -570,7 +575,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
     bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place, bb_skip_empty_draws,
     bb_background_pipelines, bb_anisotropy, bb_exact_protection, bb_batched_uploads,
-    bb_texture_set_memo, bb_ring_geometry, bb_submit_overlap, bb_stutter_detail, bb_defaults)
+    bb_texture_set_memo, bb_ring_geometry, bb_submit_overlap, bb_stutter_detail, bb_defaults,
+    bb_merged_copy_commands)
 
 // -------------------------------
 // Vulkan settings
@@ -883,6 +889,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbSkipEmptyDraws, bb_skip_empty_draws)
     SETTING_FORWARD_BOOL(m_gpu, BbBackgroundPipelines, bb_background_pipelines)
     SETTING_FORWARD_BOOL(m_gpu, BbExactProtection, bb_exact_protection)
+    SETTING_FORWARD_BOOL(m_gpu, BbMergedCopyCommands, bb_merged_copy_commands)
     SETTING_FORWARD_BOOL(m_gpu, BbBatchedUploads, bb_batched_uploads)
     SETTING_FORWARD_BOOL(m_gpu, BbTextureSetMemo, bb_texture_set_memo)
     SETTING_FORWARD_BOOL(m_gpu, BbRingGeometry, bb_ring_geometry)

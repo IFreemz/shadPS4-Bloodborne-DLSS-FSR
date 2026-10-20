@@ -1163,6 +1163,8 @@ void Rasterizer::OnSubmit() {
                             std::memory_order_relaxed);
         BB::merged_copies.store(pipe_enabled && EmulatorSettings.IsBbMergedCopies(),
                                 std::memory_order_relaxed);
+        BB::merged_copy_commands.store(EmulatorSettings.IsBbMergedCopyCommands(),
+                                       std::memory_order_relaxed);
         BB::readback_queue.store(pipe_enabled && EmulatorSettings.IsBbReadbackQueue(),
                                  std::memory_order_relaxed);
         scheduler.SetGpuTiming(diag);

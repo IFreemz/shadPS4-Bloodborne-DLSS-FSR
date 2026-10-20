@@ -828,6 +828,11 @@ void Instance::CollectPhysicalMemoryInfo() {
         // If memory budget is not supported, use the size of the heap as the budget.
         total_memory_budget += memory_props.memoryHeaps[i].size;
     }
+    // The graphics card's own memory, for the graphics heap F1's Auto picks (BbResolution).
+    // The VRAM budget test setting stands in for it.
+    const int test_mb = EmulatorSettings.GetBbVramBudgetTestMb();
+    Common::BbTuning::vram_bytes.store(test_mb > 0 ? u64(test_mb) << 20 : local_memory,
+                                       std::memory_order_relaxed);
     if (!IsIntegrated()) {
         // We reserve some memory for the system.
         const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);

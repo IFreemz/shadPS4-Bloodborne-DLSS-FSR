@@ -80,6 +80,8 @@ constexpr std::array RecommendedPatches{"Disable AA", "Disable Chromatic Aberrat
                                         "Disable DoF"};
 // Removes the depth and motion data the upscaler needs; the full name ends in "(Perf Increase)".
 constexpr char MotionBlurPatch[] = "Disable Motion Blur[^\"]*";
+// Left out while an upscaler is installed (memory_patcher.cpp): it breaks DLSS and FSR.
+constexpr char PerformancePatch[] = "Performance Patch[^\"]*";
 
 // With RenoDX HDR, Disable AA turns skin blue: its HDR output expects what the game's AA pass
 // leaves in the image.
@@ -108,6 +110,7 @@ struct PatchState {
     bool file_found{};
     std::array<bool, RecommendedPatches.size()> enabled{};
     bool motion_blur_disabled{};
+    bool performance_patch{};
 };
 
 PatchState ReadPatches() {
@@ -122,6 +125,8 @@ PatchState ReadPatches() {
     std::smatch match;
     state.motion_blur_disabled =
         std::regex_search(text, match, PatchPattern(MotionBlurPatch)) && match[2] == "true";
+    state.performance_patch =
+        std::regex_search(text, match, PatchPattern(PerformancePatch)) && match[2] == "true";
     return state;
 }
 
@@ -343,6 +348,10 @@ void DlssLayer::Draw() {
                     "motion blur, leave Game motion blur (at the bottom) unticked instead.");
         PopStyleColor();
     }
+    if (patches.performance_patch) {
+        TextDisabled("The Performance Patch is on but left out: it changes the game's render "
+                     "formats and fixes some sizes at 1080p, which breaks DLSS and FSR.");
+    }
 
     if (!Wanted(0) && patches.enabled[0] &&
         !::Core::FileSys::BbHdrCompat::ShouldSkipPatch(RecommendedPatches[0])) {
@@ -434,11 +443,15 @@ void DlssLayer::Draw() {
             if (IsItemHovered())
                 SetTooltip(
                     "Memory the game sets aside for graphics. A scene above 1080p needs "
-                    "more than its own.\nAuto: raised above 1080p, the second heap a "
-                    "little less than the full patch, which can\ncause missing textures "
-                    "and flicker.\nFull Heap Patch: the Increased Graphics Heap Sizes "
+                    "more than its own.\nAuto: raised above 1080p, when a heap size patch is "
+                    "on in the patch file, or with big mods (BB PC Remaster);\nboth heaps (as "
+                    "Smaller 2nd "
+                    "Heap) on cards with 8 GB or more, otherwise the first heap only.\nFull Heap "
+                    "Patch: the Increased Graphics Heap Sizes "
                     "patch. First Heap Only: only the first heap raised.\nSmaller 2nd "
-                    "Heap: Auto's sizes at any resolution.\nOff: the game's own sizes, unless a "
+                    "Heap: the second heap a little less than the full patch (the full patch can "
+                    "cause missing "
+                    "textures\nand flicker on some cards).\nOff: the game's own sizes, unless a "
                     "heap size patch is enabled in the patch file.");
         }
         EndDisabled();

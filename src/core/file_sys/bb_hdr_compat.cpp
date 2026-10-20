@@ -49,6 +49,7 @@ constexpr size_t MaxFileSize = 2 * 1024 * 1024;
 std::atomic_bool enabled{false};
 std::atomic_bool restore_moon{false};
 std::atomic_bool remaster_detected{false};
+std::atomic_bool remaster_present{false}; // ProbeRemaster: found whatever the HDR settings
 
 struct CachedFile {
     Hash source_hash;
@@ -328,6 +329,48 @@ std::unique_ptr<IFile> Open(std::unique_ptr<IFile> source, std::string_view path
     LOG_INFO(Common_Filesystem, "[HDR-COMPAT] {}: {}", path,
              profile->moon ? "moon brightness restored" : "remaster HDR parameters restored");
     return std::make_unique<CorrectedFile>(std::move(source), std::move(result));
+}
+
+void ProbeRemaster(std::unique_ptr<IFile> file, std::string_view path) {
+    remaster_present.store(false, std::memory_order_relaxed);
+    const auto profile = std::ranges::find_if(Profiles, [path](const Profile& candidate) {
+        return candidate.path == path && !candidate.moon;
+    });
+    if (profile == Profiles.end() || !file || !file->IsOpen()) {
+        return;
+    }
+    const auto file_size = file->Size();
+    if (file_size <= HeaderSize || file_size > MaxFileSize) {
+        return;
+    }
+    std::vector<u8> compressed(file_size);
+    size_t read{};
+    while (read < compressed.size()) {
+        const auto count = file->Read(compressed.data() + read, compressed.size() - read);
+        if (count <= 0 || u64(count) > compressed.size() - read) {
+            break;
+        }
+        read += count;
+    }
+    if (read != compressed.size() || !ValidHeader(compressed, *profile)) {
+        return;
+    }
+    std::vector<u8> raw(profile->size);
+    uLongf size = raw.size();
+    uLong compressed_size = compressed.size() - HeaderSize;
+    if (uncompress2(raw.data(), &size, compressed.data() + HeaderSize, &compressed_size) != Z_OK ||
+        size != raw.size()) {
+        return;
+    }
+    const auto raw_hash = Sha256(raw);
+    if (raw_hash && (*raw_hash == profile->original || *raw_hash == profile->corrected)) {
+        remaster_present.store(true, std::memory_order_relaxed);
+        LOG_INFO(Common_Filesystem, "BB PC Remaster found ({})", path);
+    }
+}
+
+bool RemasterPresent() {
+    return remaster_present.load(std::memory_order_relaxed);
 }
 
 } // namespace Core::FileSys::BbHdrCompat

@@ -20,6 +20,7 @@
 #include "core/file_sys/bb_hdr_compat.h"
 #include "input/bb_kbm.h"
 #include "memory_patcher.h"
+#include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 
 namespace MemoryPatcher {
 
@@ -362,6 +363,16 @@ void ApplyPendingPatches() {
 void PatchMemory(const patchInfo& patch) {
     if (Core::FileSys::BbHdrCompat::ShouldSkipPatch(patch.modNameStr)) {
         LOG_INFO(Loader, "[HDR-COMPAT] Skipped conflicting patch: {}", patch.modNameStr);
+        return;
+    }
+    // Kyo's Performance Patch bundles about 190 changes, among them lower precision render
+    // formats in place of the game's 16-bit float ones (as its "rgba8f color space" patch) and
+    // fixed 1080p sizes (the 1080p light grid among them), which break DLSS and FSR. Left out
+    // while an upscaler is installed; F1 says so.
+    if (patch.modNameStr.starts_with("Performance Patch") && Vulkan::BbTemporalDlssRequested()) {
+        static bool logged = false;
+        if (!std::exchange(logged, true))
+            LOG_INFO(Loader, "Skipped patch {}: it breaks the upscalers", patch.modNameStr);
         return;
     }
     if (Core::BbResolution::ShouldSkipPatch(patch.modNameStr)) {

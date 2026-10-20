@@ -28,6 +28,7 @@
 #include "core/bb_resolution.h"
 #include "core/emulator_settings.h"
 #include "core/file_format/psf.h"
+#include "core/file_sys/bb_hdr_compat.h"
 #include "core/file_sys/fs.h"
 #include "emulator.h"
 
@@ -142,6 +143,9 @@ constexpr std::array<std::pair<const char*, float>, 4> RenderScales{{
 Choice applied;
 bool deciding{};
 std::vector<std::string> conflicting; // enabled patches that set sizes F1 sets
+bool heap_patch_on{}; // an enabled patch raises the graphics heap (Auto then raises it too)
+// Mods in the mods folder from this size on are texture mods that need a bigger heap.
+constexpr u64 ModsHeapBytes = 4ull << 30;
 
 // What a patch must not change while F1 sets the resolution, from the templates: the bytes
 // holding a size, and the code bytes around them (the same in every size). The cave holding the
@@ -331,6 +335,7 @@ void Prepare() {
     applied = Preview();
     deciding = applied.enabled;
     conflicting.clear();
+    heap_patch_on = false;
     if (!applied.enabled)
         return;
     auto* param_sfo = Common::Singleton<PSF>::Instance();
@@ -354,12 +359,13 @@ void CheckPatch(std::string_view name, u64 address, std::span<const u8> bytes) {
         if (owned.sizes.contains(at))
             conflict = true;
         // The heap sizes too, unless F1 leaves the heap to the patch file (Off).
-        else if (applied.heap != "off" && std::ranges::any_of(HeapLines, [at](const auto& line) {
+        else if (std::ranges::any_of(HeapLines, [at](const auto& line) {
                      return at >= line.address && at < line.address + 2;
-                 }))
-            conflict = true;
-        else if (const auto it = owned.code.find(at);
-                 it != owned.code.end() && it->second != bytes[i])
+                 })) {
+            heap_patch_on = true;
+            conflict |= applied.heap != "off";
+        } else if (const auto it = owned.code.find(at);
+                   it != owned.code.end() && it->second != bytes[i])
             conflict = true;
     }
     if (conflict && std::ranges::find(conflicting, name) == conflicting.end()) {
@@ -389,13 +395,36 @@ void Install() {
     // Auto raises the second to 0x90000000 instead, which fits. F1 can also pick the full patch,
     // the first heap only, the smaller second heap at any size, or off: the game's own heaps,
     // unless a heap patch in the patch file changes them.
-    const auto& mode = applied.heap;
-    const bool heap = mode == "full" || mode == "first" || mode == "smaller" ||
-                      (mode == "auto" && rh > HeapRenderHeight);
+    // Auto raises it too for a heap patch the player turned on in the patch file (F1 skips that
+    // patch) and for BB PC Remaster or other big mods in the mods folder, whose bigger assets
+    // overflow the game's own heap (a crash in heavy areas). Any version: a merged install is
+    // only known by its hash (the version our HDR fix knows), but the mod asks for the heap
+    // patch anyway. How far, by the card's memory: 8 GB cards (a little under 8 GiB
+    // reported) both heaps, the second a little less than the full patch so it still fits below
+    // the driver's page (see above); smaller cards only the first heap, unless the scene is
+    // above 1080p, which needs both.
+    std::string mode = applied.heap;
+    std::string reason;
+    if (mode == "auto") {
+        if (rh > HeapRenderHeight)
+            reason = "scene above 1080p";
+        else if (heap_patch_on)
+            reason = "a heap patch is on in the patch file";
+        else if (Core::FileSys::BbHdrCompat::RemasterPresent())
+            reason = "BB PC Remaster";
+        else if (const u64 mods = Common::BbTuning::mods_bytes.load(); mods >= ModsHeapBytes)
+            reason = fmt::format("{} MiB of mods in the mods folder", mods >> 20);
+        if (!reason.empty()) {
+            const u64 vram = Common::BbTuning::vram_bytes.load(std::memory_order_relaxed);
+            mode = vram >= (15ull << 29) || rh > HeapRenderHeight ? "smaller" : "first";
+            reason = fmt::format("auto: {}, {} MiB of VRAM", reason, vram >> 20);
+        }
+    }
+    const bool heap = mode == "full" || mode == "first" || mode == "smaller";
     if (heap) {
         constexpr PatchLine first[] = {HeapLines[0]};
         lines += Write(first, 0, 0, 0, 0);
-        if (mode == "auto" || mode == "smaller") {
+        if (mode == "smaller") {
             constexpr PatchLine second[] = {{0x04B36DE2, "0090"}};
             lines += Write(second, 0, 0, 0, 0);
         } else if (mode == "full") {
@@ -403,11 +432,11 @@ void Install() {
             lines += Write(second, 0, 0, 0, 0);
         }
     }
-    LOG_INFO(Loader, "Resolution: graphics heap {} ({})",
+    LOG_INFO(Loader, "Resolution: graphics heap {} ({}{}{})",
              heap            ? "raised"
              : mode == "off" ? "left to the patch file"
                              : "the game's own",
-             mode);
+             mode, reason.empty() ? "" : "; ", reason);
     // 1080p is the game's own frame size: nothing to change there.
     if (ow != 1920 || oh != 1080)
         lines += Write(ResolutionLines, TemplateOutputWidth, TemplateOutputHeight, ow, oh);

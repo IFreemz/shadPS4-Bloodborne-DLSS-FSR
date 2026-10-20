@@ -563,14 +563,14 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
              "Bloodborne threadedRenderer: {} streaming: {} readbackQueue: {} mergedCopies: {} "
              "fastLocks: {} flipWhenReady: {} geometryInPlace: {} backgroundCopies: {} "
              "skipEmptyDraws: {} backgroundShaderCompiles: {} textureSetMemo: {} "
-             "ringGeometry: {} submitOverlap: {}",
+             "ringGeometry: {} submitOverlap: {} mergedCopyCommands: {}",
              EmulatorSettings.IsThreadedRenderer(), EmulatorSettings.IsBbStreaming(),
              EmulatorSettings.IsBbReadbackQueue(), EmulatorSettings.IsBbMergedCopies(),
              EmulatorSettings.IsBbFastLocks(), EmulatorSettings.IsBbFlipWhenReady(),
              EmulatorSettings.IsBbGeometryInPlace(), EmulatorSettings.IsBbBackgroundTextureCopies(),
              EmulatorSettings.IsBbSkipEmptyDraws(), EmulatorSettings.IsBbBackgroundPipelines(),
              EmulatorSettings.IsBbTextureSetMemo(), EmulatorSettings.IsBbRingGeometry(),
-             EmulatorSettings.IsBbSubmitOverlap());
+             EmulatorSettings.IsBbSubmitOverlap(), EmulatorSettings.IsBbMergedCopyCommands());
     LOG_INFO(Config,
              "Bloodborne anisotropy: {} resizableBar: {} exactProtection: {} batchedUploads: {} "
              "vramCleanup: {} bufferEviction: {}",
@@ -621,8 +621,27 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     const auto mods_folder = FileSys::OverlayPath(game_folder, "-mods");
 
+    Common::BbTuning::mods_bytes.store(0);
     if (std::filesystem::exists(mods_folder) && !std::filesystem::is_empty(mods_folder)) {
-        LOG_INFO(Loader, "Files found in game mods folder");
+        // Its size: texture mods (BB PC Remaster and the like) need a bigger graphics heap,
+        // whichever version they are (BbResolution::Install).
+        u64 bytes = 0;
+        u64 files = 0;
+        std::error_code error;
+        for (auto it = std::filesystem::recursive_directory_iterator(
+                 mods_folder, std::filesystem::directory_options::skip_permission_denied, error);
+             !error && it != std::filesystem::recursive_directory_iterator(); it.increment(error)) {
+            std::error_code file_error;
+            if (it->is_regular_file(file_error)) {
+                const auto size = it->file_size(file_error);
+                if (!file_error) {
+                    bytes += size;
+                    ++files;
+                }
+            }
+        }
+        Common::BbTuning::mods_bytes.store(bytes);
+        LOG_INFO(Loader, "Files found in game mods folder ({} files, {} MiB)", files, bytes >> 20);
     }
 
 #ifdef _WIN32
@@ -775,6 +794,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     FileSys::BbHdrCompat::Initialize(IsBloodborne(id) && app_version == "01.09" &&
                                          EmulatorSettings.IsHdrAllowed(),
                                      Vulkan::BbDlssSettingsPath());
+    // The graphics heap is raised for the remaster's bigger assets (BbResolution::Install).
+    if (IsBloodborne(id) && app_version == "01.09") {
+        FileSys::BbHdrCompat::ProbeRemaster(
+            mnt->Open("/app0/dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx", false),
+            "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx");
+    }
     if (FileSys::BbHdrCompat::IsCandidate(
             "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx")) {
         // Recognize the remaster before executable patches can disable RenoDX's shader passes.

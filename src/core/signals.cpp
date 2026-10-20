@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/crash_crumbs.h"
 #include "common/decoder.h"
+#include "common/memory_patcher.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/libraries/kernel/kernel.h"
@@ -30,7 +31,15 @@ namespace Core {
 #if defined(_WIN32)
 
 // "name.dll+0x1234" for a crash address in a loaded module, so crash reports name the module.
+// The game's own code is not a Windows module: "eboot.bin+0x1234", with the address patch files
+// use for it.
 static std::string ModuleOffset(PVOID address) {
+    const auto at = reinterpret_cast<uintptr_t>(address);
+    if (MemoryPatcher::g_eboot_address != 0 && at >= MemoryPatcher::g_eboot_address &&
+        at < MemoryPatcher::g_eboot_address + MemoryPatcher::g_eboot_image_size) {
+        const uintptr_t offset = at - MemoryPatcher::g_eboot_address;
+        return fmt::format("eboot.bin+{:#x}, patch address {:#x}", offset, offset + 0x400000);
+    }
     HMODULE module{};
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -160,6 +169,39 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     if (report_unhandled) {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {} ({})", code, address,
                      ModuleOffset(address));
+        if (code == EXCEPTION_ACCESS_VIOLATION && pExp->ExceptionRecord->NumberParameters >= 2) {
+            const auto kind = pExp->ExceptionRecord->ExceptionInformation[0];
+            LOG_CRITICAL(Debug, "  {} address {:#x}",
+                         kind == 0   ? "reading"
+                         : kind == 1 ? "writing"
+                         : kind == 8 ? "executing"
+                                     : "accessing",
+                         pExp->ExceptionRecord->ExceptionInformation[1]);
+        }
+        if (const auto* c = pExp->ContextRecord) {
+            LOG_CRITICAL(Debug,
+                         "  rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rbp {:#x} "
+                         "rsp {:#x}",
+                         c->Rax, c->Rbx, c->Rcx, c->Rdx, c->Rsi, c->Rdi, c->Rbp, c->Rsp);
+            LOG_CRITICAL(Debug,
+                         "  r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} "
+                         "r15 {:#x}",
+                         c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15);
+            // The instruction, when its bytes can be read.
+            ZydisDecodedInstruction instruction;
+            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(address, &info, sizeof(info)) == sizeof(info) &&
+                info.State == MEM_COMMIT &&
+                (info.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_READONLY |
+                                 PAGE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0 &&
+                ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(instruction, operands,
+                                                                            address))) {
+                LOG_CRITICAL(Debug, "  instruction: {}",
+                             Common::Decoder::Instance()->disassembleInst(
+                                 instruction, operands, reinterpret_cast<u64>(address)));
+            }
+        }
         Common::Crumbs::Dump();
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }

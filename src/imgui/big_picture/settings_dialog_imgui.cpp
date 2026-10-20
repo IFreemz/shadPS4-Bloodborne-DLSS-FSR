@@ -72,6 +72,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbReadbackQueueSetting = EmulatorSettings.IsBbReadbackQueue();
     bbStreamingSetting = EmulatorSettings.IsBbStreaming();
     bbMergedCopiesSetting = EmulatorSettings.IsBbMergedCopies();
+    bbMergedCopyCommandsSetting = EmulatorSettings.IsBbMergedCopyCommands();
     bbFastLocksSetting = EmulatorSettings.IsBbFastLocks();
     bbFlipWhenReadySetting = EmulatorSettings.IsBbFlipWhenReady();
     bbVramReclaimSetting = EmulatorSettings.IsBbVramReclaim();
@@ -160,6 +161,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbReadbackQueue(bbReadbackQueueSetting, isSpecific);
     EmulatorSettings.SetBbStreaming(bbStreamingSetting, isSpecific);
     EmulatorSettings.SetBbMergedCopies(bbMergedCopiesSetting, isSpecific);
+    EmulatorSettings.SetBbMergedCopyCommands(bbMergedCopyCommandsSetting, isSpecific);
     EmulatorSettings.SetBbFastLocks(bbFastLocksSetting, isSpecific);
     EmulatorSettings.SetBbFlipWhenReady(bbFlipWhenReadySetting, isSpecific);
     EmulatorSettings.SetBbVramReclaim(bbVramReclaimSetting, isSpecific);
@@ -810,6 +812,12 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Fewer small stutters (turning on needs a restart)");
                 AddSettingCheckbox("    Merged copy shaders", bbMergedCopiesSetting,
                                    "Less GPU copy work");
+                if (bbMergedCopiesSetting) {
+                    AddSettingCheckbox("        As copy commands (testing)",
+                                       bbMergedCopyCommandsSetting,
+                                       "White dots test: GPU copy commands instead of the "
+                                       "copy shader");
+                }
                 AddSettingCheckbox("    Faster Windows locks and sleeps", bbFastLocksSetting,
                                    "Less CPU overhead (needs a restart)");
                 AddSettingCheckbox("    Show frames when ready", bbFlipWhenReadySetting,

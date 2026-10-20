@@ -444,7 +444,8 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             }
             const auto group = batch_copies(first, last);
             if (CopiesIndependent(src, dst, group)) {
-                record(src, dst, group, ranges, true);
+                // Test (issue #25): one copy command for the group instead of the compute shader.
+                record(src, dst, group, ranges, !Common::BbTuning::MergedCopyCommands());
             } else {
                 if (diagnostics) {
                     Count(copy_stats.overlapping);
