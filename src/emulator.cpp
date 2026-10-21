@@ -622,6 +622,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     const auto mods_folder = FileSys::OverlayPath(game_folder, "-mods");
 
     Common::BbTuning::mods_bytes.store(0);
+    Common::BbTuning::bigger_map_textures.store(0);
     if (std::filesystem::exists(mods_folder) && !std::filesystem::is_empty(mods_folder)) {
         // Its size: texture mods (BB PC Remaster and the like) need a bigger graphics heap,
         // whichever version they are (BbResolution::Install).
@@ -799,6 +800,38 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         FileSys::BbHdrCompat::ProbeRemaster(
             mnt->Open("/app0/dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx", false),
             "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx");
+        // Texture packs replace the map textures with bigger ones, also when merged into the
+        // game folder (any version): a few of the biggest, at least a quarter bigger than the
+        // game's own 1.09 files.
+        struct MapTexture {
+            std::string_view path;
+            u64 size;
+        };
+        static constexpr MapTexture MapTextures[] = {
+            {"/app0/dvdroot_ps4/map/m24/m24_0000.tpfbdt", 184005548},
+            {"/app0/dvdroot_ps4/map/m24/m24_0001.tpfbdt", 191139900},
+            {"/app0/dvdroot_ps4/map/m34/m34_0000.tpfbdt", 127588925},
+            {"/app0/dvdroot_ps4/map/m23/m23_0000.tpfbdt", 132185799},
+            {"/app0/dvdroot_ps4/map/m36/m36_0003.tpfbdt", 64461105},
+            {"/app0/dvdroot_ps4/map/m25/m25_0001.tpfbdt", 52182314},
+        };
+        u32 bigger = 0;
+        for (const auto& texture : MapTextures) {
+            const auto file = mnt->Open(texture.path, false);
+            if (file && file->IsOpen() && file->Size() >= texture.size + texture.size / 4)
+                ++bigger;
+        }
+        Common::BbTuning::bigger_map_textures.store(bigger);
+        if (bigger >= 2)
+            LOG_INFO(Loader,
+                     "BB PC Remaster mod detected (or another texture pack): {} of {} map "
+                     "textures bigger than the game's own",
+                     bigger, std::size(MapTextures));
+        else
+            LOG_INFO(Loader,
+                     "No texture pack found ({} of {} map textures bigger than the "
+                     "game's own)",
+                     bigger, std::size(MapTextures));
     }
     if (FileSys::BbHdrCompat::IsCandidate(
             "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx")) {

@@ -396,13 +396,13 @@ void Install() {
     // the first heap only, the smaller second heap at any size, or off: the game's own heaps,
     // unless a heap patch in the patch file changes them.
     // Auto raises it too for a heap patch the player turned on in the patch file (F1 skips that
-    // patch) and for BB PC Remaster or other big mods in the mods folder, whose bigger assets
-    // overflow the game's own heap (a crash in heavy areas). Any version: a merged install is
-    // only known by its hash (the version our HDR fix knows), but the mod asks for the heap
-    // patch anyway. How far, by the card's memory: 8 GB cards (a little under 8 GiB
-    // reported) both heaps, the second a little less than the full patch so it still fits below
-    // the driver's page (see above); smaller cards only the first heap, unless the scene is
-    // above 1080p, which needs both.
+    // patch) and for BB PC Remaster or other texture packs, whose bigger assets overflow the
+    // game's own heap (a crash in heavy areas, invisible enemies): known by its hash (the version
+    // our HDR fix knows), by map textures bigger than the game's own (any version, also merged
+    // into the game folder), or by a big mods folder. How far, by the card's memory: 8 GB cards (a
+    // little under 8 GiB reported) both heaps, the second a little less than the full patch so it
+    // still fits below the driver's page (see above); smaller cards only the first heap, unless the
+    // scene is above 1080p, which needs both.
     std::string mode = applied.heap;
     std::string reason;
     if (mode == "auto") {
@@ -411,7 +411,9 @@ void Install() {
         else if (heap_patch_on)
             reason = "a heap patch is on in the patch file";
         else if (Core::FileSys::BbHdrCompat::RemasterPresent())
-            reason = "BB PC Remaster";
+            reason = "BB PC Remaster mod detected";
+        else if (Common::BbTuning::bigger_map_textures.load() >= 2)
+            reason = "BB PC Remaster mod detected (or another texture pack)";
         else if (const u64 mods = Common::BbTuning::mods_bytes.load(); mods >= ModsHeapBytes)
             reason = fmt::format("{} MiB of mods in the mods folder", mods >> 20);
         if (!reason.empty()) {

@@ -444,7 +444,7 @@ void DlssLayer::Draw() {
                 SetTooltip(
                     "Memory the game sets aside for graphics. A scene above 1080p needs "
                     "more than its own.\nAuto: raised above 1080p, when a heap size patch is "
-                    "on in the patch file, or with big mods (BB PC Remaster);\nboth heaps (as "
+                    "on in the patch file, or with texture packs (BB PC Remaster);\nboth heaps (as "
                     "Smaller 2nd "
                     "Heap) on cards with 8 GB or more, otherwise the first heap only.\nFull Heap "
                     "Patch: the Increased Graphics Heap Sizes "

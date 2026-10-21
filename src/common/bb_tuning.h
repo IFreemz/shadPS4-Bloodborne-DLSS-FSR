@@ -37,6 +37,9 @@ inline std::atomic<unsigned long long> vram_bytes{0};
 /// The size of the game's mods folder in bytes (texture mods such as BB PC Remaster), measured
 /// at game start: big ones need a bigger graphics heap.
 inline std::atomic<unsigned long long> mods_bytes{0};
+/// How many of the game's biggest map textures are much bigger than the game's own (a texture
+/// pack such as BB PC Remaster, merged into the game folder or in the mods folder).
+inline std::atomic<unsigned> bigger_map_textures{0};
 
 inline bool FastLocks() {
     return fast_locks.load(std::memory_order_relaxed);
