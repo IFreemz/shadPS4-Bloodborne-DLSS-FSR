@@ -1108,7 +1108,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         Frame hudless_frame = *frame;
         hudless_frame.image = frame->hudless_image;
         hudless_frame.image_view = frame->hudless_view;
-        pp_pass.Render(cmdbuf, hudless_view, source_size, hudless_frame, pp_settings);
+        // With the real frame's alpha: drawn see-through, FSR would take all of it for HUD.
+        pp_pass.Render(cmdbuf, hudless_view, source_size, hudless_frame, pp_settings, image_view);
         const auto hudless_read = vk::ImageMemoryBarrier2{
             .srcStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
             .srcAccessMask = vk::AccessFlagBits2::eShaderRead,

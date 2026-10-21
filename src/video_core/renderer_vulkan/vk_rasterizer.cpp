@@ -522,6 +522,7 @@ void Rasterizer::TemporalDlssDraw(const GraphicsPipeline* pipeline, bool indirec
         .ps_hash = ps ? ps->pgm_hash : 0,
         .color = std::popcount(pipeline->GetGraphicsKey().mrt_mask) >= 1 ? cb_descs[0].image_id
                                                                          : VideoCore::ImageId{},
+        .color_view_format = cb_descs[0].desc.view_info.format,
         .depth = db_desc.image_id,
         .num_indices = regs.num_indices,
         .num_instances = regs.num_instances.NumInstances(),

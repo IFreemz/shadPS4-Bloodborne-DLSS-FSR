@@ -68,6 +68,7 @@ public:
         u64 vs_hash;
         u64 ps_hash;
         VideoCore::ImageId color;
+        vk::Format color_view_format; // the format the draw writes its color target as
         VideoCore::ImageId depth;
         u32 num_indices;
         u32 num_instances;

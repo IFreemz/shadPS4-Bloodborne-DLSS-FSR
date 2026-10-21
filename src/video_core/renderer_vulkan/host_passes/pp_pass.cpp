@@ -23,6 +23,12 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eFragment,
         },
+        {
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        },
     };
 
     const vk::DescriptorSetLayoutCreateInfo desc_layout_ci{
@@ -182,7 +188,8 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
 }
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
-                                vk::Extent2D input_size, Frame& frame, Settings settings) {
+                                vk::Extent2D input_size, Frame& frame, Settings settings,
+                                vk::ImageView reference) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -220,6 +227,13 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
 
+    settings.hudless = reference ? 1u : 0u;
+    vk::DescriptorImageInfo reference_info{
+        .sampler = *sampler,
+        .imageView = reference ? reference : input,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
+
     const std::array set_writes{
         vk::WriteDescriptorSet{
             .dstSet = VK_NULL_HANDLE,
@@ -228,6 +242,14 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &image_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &reference_info,
         },
     };
 

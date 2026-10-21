@@ -7,6 +7,8 @@ layout (location = 0) in vec2 uv;
 layout (location = 0) out vec4 color;
 
 layout (binding = 0) uniform sampler2D texSampler;
+// FSR frame generation's HUD-less frame: the real frame, for its alpha.
+layout (binding = 1) uniform sampler2D refSampler;
 
 layout (push_constant) uniform settings {
     float gamma;
@@ -16,6 +18,7 @@ layout (push_constant) uniform settings {
     float retro_brightness;
     float retro_sdr_white;
     uint retro_pq;
+    bool hudless; // the HUD-less frame: the real frame's alpha
 } pp;
 
 const uint RETRO_OFF = 1u, RETRO_ON = 2u;
@@ -87,6 +90,9 @@ vec3 scrgb_to_hdr10(vec3 scrgb) {
 
 void main() {
     vec4 color_linear = texture(texSampler, uv);
+    // The game frame is drawn blended by its alpha: the HUD-less frame's (the UI target's before
+    // the HUD with Decoupled UI) must not show it see-through.
+    if (pp.hudless) color_linear.a = texture(refSampler, uv).a;
     if (pp.hdr) {
         color = color_linear;
     } else {

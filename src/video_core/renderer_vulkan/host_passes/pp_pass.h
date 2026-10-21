@@ -22,12 +22,14 @@ public:
         float retro_brightness = 1.0f;
         float retro_sdr_white = 1.0f;
         u32 retro_pq = 0;
+        u32 hudless = 0; // set by Render when given `reference`
     };
 
     void Create(vk::Device device, vk::Format surface_format);
 
+    // With `reference` (FSR frame generation's HUD-less frame): its alpha is the reference's.
     void Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
-                Frame& output, Settings settings);
+                Frame& output, Settings settings, vk::ImageView reference = {});
 
 private:
     vk::UniquePipeline pipeline{};

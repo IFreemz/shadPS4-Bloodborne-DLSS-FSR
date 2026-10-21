@@ -223,6 +223,25 @@ struct OwnedImage {
             bgr_view = make_view({S::eB, S::eG, S::eR, S::eOne});
         }
     }
+    // Decoupled UI HUD-less frames: written as the game writes its frame. The VideoOut buffers
+    // are not all the same format (UNORM and sRGB), and the game writes them all as UNORM: an
+    // sRGB one written as sRGB is encoded twice (washed out, every other frame).
+    vk::UniqueImageView target_view;
+    vk::Format target_view_format{};
+    vk::ImageView TargetView(vk::Format view_format) {
+        if (view_format == format || view_format == vk::Format::eUndefined)
+            return *view;
+        if (!target_view || target_view_format != view_format) {
+            target_view = Make(device.createImageViewUnique(
+                                   vk::ImageViewCreateInfo{.image = image.image,
+                                                           .viewType = vk::ImageViewType::e2D,
+                                                           .format = view_format,
+                                                           .subresourceRange = Range}),
+                               "temporal DLSS target view");
+            target_view_format = view_format;
+        }
+        return *target_view;
+    }
     // Opaque view as `view_format`, like the presenter's view of the game's own frame (the
     // image needs eMutableFormat).
     vk::ImageView FrameView(vk::Format view_format) {
@@ -425,6 +444,9 @@ struct BbTemporalDlss::Impl {
     // and the game's display copy of it per VideoOut buffer (the frame without the HUD).
     std::optional<VideoCore::ImageId> last_copy_source;
     vk::Format last_copy_format{};
+    // The display copy's whole view of its source (format and swizzle: Bloodborne's swaps red
+    // and blue), for the Decoupled UI HUD-less snapshot.
+    std::optional<VideoCore::ImageViewInfo> last_copy_view;
     std::unique_ptr<OwnedImage> hud_snapshot, hud_dimmed;
     bool hud_snapshot_taken{};
     std::unordered_map<VAddr, std::unique_ptr<OwnedImage>> decoupled_hudless;
@@ -963,9 +985,15 @@ struct BbTemporalDlss::Impl {
                                                       size, U::eSampled | U::eStorage);
         }
         const auto command = scheduler.CommandBuffer(); // after Finish(), see RunDlss
+        // Read as the display copy reads it, swizzle included: the replay feeds this to the
+        // display copy in place of its source, and the dimming pass compares it with that view.
         VideoCore::ImageViewInfo view_info{};
-        view_info.format = last_copy_format != vk::Format::eUndefined ? last_copy_format
-                                                                      : target.info.pixel_format;
+        if (last_copy_view)
+            view_info = *last_copy_view;
+        else
+            view_info.format = last_copy_format != vk::Format::eUndefined
+                                   ? last_copy_format
+                                   : target.info.pixel_format;
         const auto& view = target.FindView(view_info);
         runtime.Transit(&target, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eComputeShader,
@@ -1003,7 +1031,8 @@ struct BbTemporalDlss::Impl {
 
     // At a Decoupled UI display copy: draw it again from the HUD-less snapshot.
     void ReplayHudless(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
-                       VideoCore::TextureCache& cache, VideoCore::Image& target) {
+                       VideoCore::TextureCache& cache, VideoCore::Image& target,
+                       vk::Format target_view_format) {
         auto& slot = decoupled_hudless[target.info.guest_address];
         const vk::Extent2D size{target.info.size.width, target.info.size.height};
         scheduler.EndRendering();
@@ -1096,10 +1125,11 @@ struct BbTemporalDlss::Impl {
         slot->Transit(command, vk::ImageLayout::eColorAttachmentOptimal,
                       vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                       vk::AccessFlagBits2::eColorAttachmentWrite);
-        display_copy_replay = DisplayCopyReplay{.shader_hash = DisplayCopy,
-                                                .extent = size,
-                                                .hudless_input = *hud_dimmed->view,
-                                                .hudless_output = *slot->view};
+        display_copy_replay = DisplayCopyReplay{
+            .shader_hash = DisplayCopy,
+            .extent = size,
+            .hudless_input = *hud_dimmed->view,
+            .hudless_output = renodx ? *slot->view : slot->TargetView(target_view_format)};
         replay_hudless = slot.get();
         slot->fresh = true;
         scheduler.GetDynamicState().Invalidate();
@@ -2000,12 +2030,14 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
                 if (s.hud_snapshot_taken && s.hud_snapshot &&
                     s.hud_snapshot->extent ==
                         vk::Extent2D{color->info.size.width, color->info.size.height})
-                    s.ReplayHudless(instance, runtime, scheduler, cache, *color);
+                    s.ReplayHudless(instance, runtime, scheduler, cache, *color,
+                                    draw.color_view_format);
             } else {
                 s.decoupled_frame_gen.erase(color->info.guest_address);
             }
             s.last_copy_source = s.copy_source->id;
             s.last_copy_format = s.copy_source->view.format;
+            s.last_copy_view = s.copy_source->view;
             s.hud_snapshot_taken = false;
             s.DisplayCopyDone();
             return {};
