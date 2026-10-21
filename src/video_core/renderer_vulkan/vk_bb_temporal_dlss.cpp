@@ -345,8 +345,8 @@ motion_blur=0
 # Turning it on or off completely needs a restart.
 character_motion=1
 
-# Full-screen menus (inventory, pause) show the game's own image instead of the upscaled one,
-# so the scene does not shimmer behind them: 1 = on, 0 = off
+# Menus and dialogue (inventory, pause, NPCs) stop the camera jitter, so the scene does not
+# shimmer through their see-through panels; the scene stays upscaled: 1 = on, 0 = off
 menu_fix=1
 
 # -1 = automatic, 0 = DLAA, 1 = Quality, 2 = Balanced, 3 = Performance, 4 = Ultra Performance
@@ -499,8 +499,9 @@ struct BbTemporalDlss::Impl {
         sharpen_pass, hudless_dim_pass, motion_debug_pass;
     vk::UniqueSampler nearest, linear;
     Backend backend{};
-    // Menus cover most of the screen; while one is open the scene is not jittered and the game's
-    // own frame is shown, so the render-size scene cannot shimmer through the menu panels.
+    // Menus cover much of the screen; while one is open the scene is not jittered, so the
+    // render-size scene seen through the see-through menu panels cannot shimmer. The scene stays
+    // upscaled (it is the jitter that shimmered, not the upscale).
     std::unique_ptr<VideoCore::Buffer> coverage, dimming;
     bool menu{};
     std::unique_ptr<FsrUpscaler> fsr;
@@ -1776,8 +1777,8 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
                  .descriptorType = vk::DescriptorType::eStorageBuffer,
                  .pBufferInfo = &dimming_info};
     const u32 flags = (dlss_pre_hud && tune.hud ? 1u : 0u) | (replay ? 32u : 2u) |
-                      (tune.debug_motion ? 4u : 0u) | (menu && dlss_pre_hud ? 8u : 0u) |
-                      (upscaled_linear ? 16u : 0u) | (upscaled_tone_mapped ? 128u : 0u);
+                      (tune.debug_motion ? 4u : 0u) | (upscaled_linear ? 16u : 0u) |
+                      (upscaled_tone_mapped ? 128u : 0u);
     const auto& pass = replay ? *composite_hdr_pass : *composite_pass;
     command.bindPipeline(vk::PipelineBindPoint::eCompute, *pass.pipeline);
     command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pass.layout, 0, writes);
@@ -1798,7 +1799,7 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
             {}, *written_hudless->view, vk::ImageLayout::eGeneral};
         writes[4].pImageInfo = &hudless_image;
         command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pass.layout, 0, writes);
-        push.flags = (flags & ~1u) | 64u; // keeps 8: in menus, the game's own scene
+        push.flags = (flags & ~1u) | 64u;
         command.pushConstants(*pass.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
                               &push);
         command.dispatch((output.width + 7) / 8, (output.height + 7) / 8, 1);

@@ -613,9 +613,10 @@ void DlssLayer::Draw() {
     if (Checkbox("Menu fix", &menu_fix))
         settings.Set("menu_fix", menu_fix ? "1" : "0");
     if (IsItemHovered())
-        SetTooltip("While a menu covers most of the screen (inventory, pause menu), show the "
-                   "game's own image\nso the scene behind it doesn't shimmer. Large popups can "
-                   "trigger it too.\nThe game's performance is the same either way.");
+        SetTooltip("While a menu or dialogue covers much of the screen (inventory, pause menu, "
+                   "NPCs), the camera jitter\nstops so the scene doesn't shimmer through the "
+                   "see-through panels. The scene stays upscaled.\nThe game's performance is the "
+                   "same either way.");
     SameLine();
     TextDisabled("(steady menu backgrounds)");
 
