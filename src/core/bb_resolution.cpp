@@ -461,6 +461,9 @@ void Install() {
     // a restart (a switch from the main menu left that part at the old size).
     if (rw != ow || rh != oh)
         lines += Write(DecoupledLines, TemplateRenderWidth, TemplateRenderHeight, rw, rh);
+    // The whole frame is ow x oh: at the native render size (no decoupled scene) the upscaler
+    // works on it as in Regular mode and must keep that size, not grow it to the window's.
+    Common::BbTuning::upscale_output.store((u64{ow} << 32) | oh);
     LOG_INFO(Loader, "Resolution: {}x{} render, {}x{} output ({} patch runs)", rw, rh, ow, oh,
              lines);
 }
