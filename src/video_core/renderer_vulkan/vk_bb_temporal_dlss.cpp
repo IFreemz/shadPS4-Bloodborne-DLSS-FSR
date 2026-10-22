@@ -144,6 +144,8 @@ constexpr u64 AlphaVelocityB = 0xb25e4fae;
 // Motion blur: two full-screen passes, each blurring the HDR scene (slot 0) along the half-size
 // motion buffer (slot 1) that the DepthProducer pass builds. Skipping them keeps that data.
 constexpr u64 MotionBlur = 0xe0305cef;
+// The same blur in some areas (Forbidden Woods): another pixel shader, same passes and slots.
+constexpr u64 MotionBlurAlt = 0x29e06868;
 // Copies the HDR scene (slot 0) into the target post-processing runs on. With the Decoupled UI
 // patches the scene is smaller than that target and this pass is the game's upscale.
 constexpr u64 HdrSceneCopy = 0xccbf44a6;
@@ -1997,7 +1999,7 @@ void BbTemporalDlss::ObserveTexture(const VideoCore::Image& image, VideoCore::Im
         impl->copy_source = Impl::Bound{id, view};
     else if (hash == DisplayCopy && slot == 1)
         impl->copy_lut = Impl::Bound{id, view};
-    else if (hash == MotionBlur && slot == 0)
+    else if ((hash == MotionBlur || hash == MotionBlurAlt) && slot == 0)
         impl->blur_source = Impl::Bound{id, view};
     else if (hash == HdrSceneCopy && slot == 0)
         impl->hdr_copy_source = Impl::Bound{id, view};
@@ -2074,7 +2076,7 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
         return {};
     auto* color = draw.color ? &cache.GetImage(draw.color) : nullptr;
     try {
-        if (draw.ps_hash == MotionBlur) {
+        if (draw.ps_hash == MotionBlur || draw.ps_hash == MotionBlurAlt) {
             const auto source = std::exchange(s.blur_source, std::nullopt);
             if (s.tune.motion_blur || !color || !source || source->id == draw.color)
                 return {};
