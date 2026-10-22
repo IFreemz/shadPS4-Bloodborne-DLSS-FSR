@@ -471,7 +471,10 @@ private:
         std::array<std::array<u64, 4>, MaxImages> sharps{};
         std::array<TextureSetEntry, MaxImages> entries{};
     };
-    static constexpr u32 TextureSetCount = 4096;
+    // Direct-mapped by key: with ~2300 sets a frame (4700 draws, BB PC Remaster) 4096 slots lost
+    // ~40% to two sets sharing a slot (71% reused); 16384 keep collisions near 13%. Only the
+    // slots in use are touched, so the larger table costs memory (~21 MiB), not cache.
+    static constexpr u32 TextureSetCount = 16384;
     std::unique_ptr<std::array<TextureSet, TextureSetCount>> texture_sets;
     std::atomic<u64> texture_set_hits{};
     std::atomic<u64> texture_set_misses{};
