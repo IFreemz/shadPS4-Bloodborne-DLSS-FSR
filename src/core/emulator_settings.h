@@ -510,6 +510,10 @@ struct GPUSettings {
     // Threaded renderer: the game's constant copies (constant RAM dumps) written at once when no
     // queued draw reads that memory later. Off: every one waits for the queued draws first.
     Setting<bool> bb_constants_no_wait{true};
+    // NVIDIA: pixel shader inputs interpolated by the GPU where the shader can't tell the
+    // difference (less shader code); applies after a restart and rebuilds the shader cache when
+    // changed. Off: every input by GCN's exact formula.
+    Setting<bool> bb_hardware_interpolation{true};
     // Diagnostics: every draw timed, and where the draw recorder's time went shown for each
     // stutter (slower: for finding stutter causes).
     Setting<bool> bb_stutter_detail{false};
@@ -573,6 +577,8 @@ struct GPUSettings {
                                        &GPUSettings::bb_occlusion_in_order),
             make_override<GPUSettings>("bb_fast_pixel_math", &GPUSettings::bb_fast_pixel_math),
             make_override<GPUSettings>("bb_constants_no_wait", &GPUSettings::bb_constants_no_wait),
+            make_override<GPUSettings>("bb_hardware_interpolation",
+                                       &GPUSettings::bb_hardware_interpolation),
             make_override<GPUSettings>("bb_stutter_detail", &GPUSettings::bb_stutter_detail),
             make_override<GPUSettings>("bb_defaults", &GPUSettings::bb_defaults),
         };
@@ -589,7 +595,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place, bb_skip_empty_draws,
     bb_background_pipelines, bb_anisotropy, bb_exact_protection, bb_batched_uploads,
     bb_texture_set_memo, bb_ring_geometry, bb_submit_overlap, bb_stutter_detail, bb_defaults,
-    bb_merged_copy_commands, bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait)
+    bb_merged_copy_commands, bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait,
+    bb_hardware_interpolation)
 
 // -------------------------------
 // Vulkan settings
@@ -910,6 +917,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbOcclusionInOrder, bb_occlusion_in_order)
     SETTING_FORWARD_BOOL(m_gpu, BbFastPixelMath, bb_fast_pixel_math)
     SETTING_FORWARD_BOOL(m_gpu, BbConstantsNoWait, bb_constants_no_wait)
+    SETTING_FORWARD_BOOL(m_gpu, BbHardwareInterpolation, bb_hardware_interpolation)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
     SETTING_FORWARD(m_gpu, BbAnisotropy, bb_anisotropy)

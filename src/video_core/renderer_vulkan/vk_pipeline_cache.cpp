@@ -356,10 +356,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
         .fragment_fp_contraction = EmulatorSettings.IsBbFastPixelMath(),
+        .hardware_interpolation = EmulatorSettings.IsBbHardwareInterpolation(),
     };
     LOG_INFO(Render_Vulkan, "Pixel shader float math: {}",
              profile.fragment_fp_contraction ? "fused by the driver (fast pixel math)"
                                              : "unfused, as the PS4");
+    if (profile.needs_manual_interpolation) {
+        LOG_INFO(Render_Vulkan, "Pixel shader inputs: {}",
+                 profile.hardware_interpolation
+                     ? "interpolated by the GPU unless a shader needs GCN's exact formula"
+                     : "all interpolated by GCN's formula");
+    }
     // The driver's own cache from the last session first: the warm-up builds every cached
     // pipeline with it, much faster when the driver has compiled them before.
     pipeline_cache = CreateDriverCache();

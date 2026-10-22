@@ -96,6 +96,12 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     }
     Shader::Optimization::SsaRewritePass(program);
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+    // After constant propagation, which folds the bit casts between the interpolation's steps
+    // (a GCN register holds bits).
+    if (info.hw_stage == HwStage::Fragment && profile.needs_manual_interpolation &&
+        profile.hardware_interpolation) {
+        Shader::Optimization::HardwareInterpolationPass(program, runtime_info);
+    }
     Shader::Optimization::ReadLaneEliminationPass(program);
     if (info.sw_stage == SwStage::TessellationControl) {
         Shader::Optimization::TessellationPreprocess(program, runtime_info);
