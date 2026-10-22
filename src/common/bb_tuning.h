@@ -40,6 +40,9 @@ inline std::atomic<unsigned long long> mods_bytes{0};
 /// How many of the game's biggest map textures are much bigger than the game's own (a texture
 /// pack such as BB PC Remaster, merged into the game folder or in the mods folder).
 inline std::atomic<unsigned> bigger_map_textures{0};
+/// F1's output size when the whole frame renders at the lower size (Regular resolution mode):
+/// the upscaler's target, width << 32 | height (0: the window).
+inline std::atomic<unsigned long long> upscale_output{0};
 
 inline bool FastLocks() {
     return fast_locks.load(std::memory_order_relaxed);

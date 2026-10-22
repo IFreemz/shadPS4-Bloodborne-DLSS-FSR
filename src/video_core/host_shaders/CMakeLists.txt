@@ -56,6 +56,7 @@ add_host_shader(bb_dlss_linearize.comp bb_dlss_linearize_comp)
 add_host_shader(bb_dlss_sharpen_hdr.comp bb_dlss_sharpen_hdr_comp)
 add_host_shader(hdr_meter.comp hdr_meter_comp)
 add_host_shader(bb_hudless_dim.comp bb_hudless_dim_comp)
+add_host_shader(bb_hud_layer.comp bb_hud_layer_comp)
 add_host_shader(bb_mirror_seed.frag bb_mirror_seed_depth_frag)
 add_host_shader(bb_mirror_seed.frag bb_mirror_seed_stencil_frag STENCIL=1)
 

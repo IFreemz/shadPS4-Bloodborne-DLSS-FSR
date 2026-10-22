@@ -322,6 +322,7 @@ Choice Preview() {
     const auto [w, h] = WindowSize();
     auto choice = Resolve(Setting(lines, "res_control", "0"), Setting(lines, "res_output", "auto"),
                           Setting(lines, "res_render", "quality"), w, h);
+    choice.regular = Setting(lines, "res_mode", "decoupled") == "regular";
     choice.heap = Setting(lines, "res_heap", "auto");
     if (choice.heap == "on")
         choice.heap = "full";
@@ -332,6 +333,7 @@ Choice Preview() {
 }
 
 void Prepare() {
+    Common::BbTuning::upscale_output.store(0);
     applied = Preview();
     deciding = applied.enabled;
     conflicting.clear();
@@ -439,6 +441,18 @@ void Install() {
              : mode == "off" ? "left to the patch file"
                              : "the game's own",
              mode, reason.empty() ? "" : "; ", reason);
+    if (applied.regular) {
+        // As a Resolution Patch: the whole frame at the render size, which the upscaler brings
+        // up to the output size (the same as the window unless F1 picked another).
+        if (rw != 1920 || rh != 1080)
+            lines += Write(ResolutionLines, TemplateOutputWidth, TemplateOutputHeight, rw, rh);
+        Common::BbTuning::upscale_output.store((u64{ow} << 32) | oh);
+        LOG_INFO(Loader,
+                 "Resolution: {}x{} render, upscaled to {}x{} (Regular: UI at the render size, "
+                 "{} patch runs)",
+                 rw, rh, ow, oh, lines);
+        return;
+    }
     // 1080p is the game's own frame size: nothing to change there.
     if (ow != 1920 || oh != 1080)
         lines += Write(ResolutionLines, TemplateOutputWidth, TemplateOutputHeight, ow, oh);

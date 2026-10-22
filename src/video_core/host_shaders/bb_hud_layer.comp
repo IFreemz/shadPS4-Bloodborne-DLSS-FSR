@@ -1,0 +1,121 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 460
+// The game's HUD as its own layer, at the render size, for the upscaler's composite: per pixel,
+// how much of the scene shows through the HUD (k) and the HUD's own colour (final - k * scene).
+// The composite then draws it over the upscaled scene: k * upscaled + hud.
+//
+// A see-through HUD (text outlines, bar backgrounds, menu panels) is final = k * scene + hud. The
+// HUD hardly changes from one frame to the next while the scene behind it does (jitter, camera),
+// so between two frames final changes by k times what the scene changes: k is measured there,
+// and kept while the scene stands still. Where there is no HUD (final = scene) the scene is the
+// upscaled one. HUD not measured yet, or changing (a bar's moving end), is the game's own pixel.
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D final_frame; // game frame with the HUD
+layout(binding=1) uniform sampler2D scene_frame; // the same before the HUD
+layout(binding=2) uniform sampler2D last_final;  // last frame's: rgb, a = k
+layout(binding=3) uniform sampler2D last_scene;  // last frame's: rgb, a = confidence in k
+layout(binding=4, rgba16f) uniform writeonly image2D next_final;
+layout(binding=5, rgba16f) uniform writeonly image2D next_scene;
+layout(binding=6, rgba16f) uniform writeonly image2D hud_layer; // rgb = HUD, a = k
+// Menus and fades darken the whole scene evenly: a histogram of the darkening (t), count and
+// sum of t * 256 per bin, built by a first dispatch (flag 4) and read by the second.
+layout(binding=7, std430) buffer Dimming {
+    uint dim_count[64];
+    uint dim_sum[64];
+};
+layout(push_constant) uniform Push {
+    uint flags; // 1: last_final and last_scene hold the frame before this one,
+                // 4: only count the darkening
+} pc;
+
+shared uint group_count[64], group_sum[64];
+shared float group_dimming;
+
+void main() {
+    uint local = gl_LocalInvocationIndex;
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    bool inside = all(lessThan(pixel, imageSize(hud_layer)));
+    vec3 f = inside ? texelFetch(final_frame, pixel, 0).rgb : vec3(0);
+    vec3 s = inside ? texelFetch(scene_frame, pixel, 0).rgb : vec3(0);
+    vec3 ratio = (f + 1.0 / 512.0) / (s + 1.0 / 512.0);
+    float t = clamp(min(ratio.r, min(ratio.g, ratio.b)), 0, 1);
+    bool lit = max(s.r, max(s.g, s.b)) > 0.06;
+    if ((pc.flags & 4u) != 0) {
+        group_count[local] = 0;
+        group_sum[local] = 0;
+        barrier();
+        if (inside && lit) {
+            uint bin = min(uint(t * 63.0 + 0.5), 63u);
+            atomicAdd(group_count[bin], 1u);
+            atomicAdd(group_sum[bin], uint(t * 256.0 + 0.5));
+        }
+        barrier();
+        if (group_count[local] != 0) {
+            atomicAdd(dim_count[local], group_count[local]);
+            atomicAdd(dim_sum[local], group_sum[local]);
+        }
+        return;
+    }
+    if (local == 0) {
+        uint best = 0, best_bin = 63;
+        for (uint i = 0; i < 64; ++i) {
+            if (dim_count[i] > best) {
+                best = dim_count[i];
+                best_bin = i;
+            }
+        }
+        group_dimming = best == 0 ? 1.0 : float(dim_sum[best_bin]) / (256.0 * float(best));
+    }
+    barrier();
+    if (!inside)
+        return;
+    float k = 1, confidence = 0;
+    if ((pc.flags & 1u) != 0) {
+        vec4 last_f = texelFetch(last_final, pixel, 0);
+        vec4 last_s = texelFetch(last_scene, pixel, 0);
+        k = last_f.a;
+        confidence = last_s.a;
+        // A channel the HUD pushed to white (a bar over a bright scene) no longer follows the
+        // scene: it is left out of the measurement.
+        vec3 open = step(f, vec3(0.97)) * step(last_f.rgb, vec3(0.97));
+        vec3 df = (f - last_f.rgb) * open, ds = (s - last_s.rgb) * open;
+        float scene_change = dot(ds, ds);
+        if (scene_change > (open.r + open.g + open.b) * (4.0 / 255.0) * (4.0 / 255.0) &&
+            scene_change > 0) {
+            float measured = clamp(dot(df, ds) / scene_change, 0, 1);
+            // What k doesn't explain is the HUD itself changing (a counter, a fade).
+            float residual = length(df - measured * ds);
+            if (residual < 0.03 + 0.25 * sqrt(scene_change)) {
+                k = confidence > 0 ? mix(k, measured, 0.3) : measured;
+                confidence = min(confidence + 0.25, 1);
+            } else {
+                confidence = max(confidence - 0.5, 0);
+            }
+        } else if (length(df) > 8.0 / 255.0) {
+            confidence = max(confidence - 0.5, 0); // the HUD changed over a still scene
+        }
+    }
+    vec3 difference = abs(f - s);
+    vec4 layer;
+    vec3 off = abs(ratio - group_dimming);
+    if (max(difference.r, max(difference.g, difference.b)) <= 3.0 / 255.0) {
+        // No HUD here: the upscaled scene as it is (no measuring noise).
+        layer = vec4(0, 0, 0, 1);
+    } else if (group_dimming < 0.98 &&
+               (lit ? max(off.r, max(off.g, off.b)) < 0.04
+                    : max(difference.r, max(difference.g, difference.b)) < 6.0 / 255.0)) {
+        // Only the even darkening of a menu or fade: the upscaled scene, darkened the same.
+        layer = vec4(0, 0, 0, group_dimming);
+    } else {
+        // Measured: the HUD over the upscaled scene. Not (yet): the game's own pixel.
+        // The HUD only adds light, so no more of the scene shows through than this frame's own
+        // ratio allows (t). A k measured from noise (a fade to a loading screen: the scene
+        // barely moves while the screen goes black) would otherwise show the scene through it.
+        float shown = min(k, t * 1.15 + 0.01);
+        layer = mix(vec4(f, 0), vec4(max(f - shown * s, 0), shown), confidence);
+    }
+    imageStore(next_final, pixel, vec4(f, k));
+    imageStore(next_scene, pixel, vec4(s, confidence));
+    imageStore(hud_layer, pixel, layer);
+}

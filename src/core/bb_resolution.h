@@ -23,6 +23,9 @@ struct Choice {
     u32 render_width{}, render_height{}; // the 3D scene
     std::string problem;                 // why nothing was applied, if nothing was
     std::string heap{"auto"};            // graphics heap size: auto, full, first, smaller or off
+    // The whole frame (post-processing and UI too) at the render size, as a Resolution Patch:
+    // faster, a softer UI. Off: Decoupled, the frame at the output size and the scene lower.
+    bool regular{};
 };
 
 // Above this render height the graphics heap is raised (more VRAM, extra dmem needed).

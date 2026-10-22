@@ -74,6 +74,7 @@ public:
         u32 num_instances;
         bool indirect;
         bool depth_test, depth_write;
+        bool stencil;
     };
     // Called after resources are bound and before the guest render pass begins. Returns the
     // viewport offset (render pixels) for this draw.

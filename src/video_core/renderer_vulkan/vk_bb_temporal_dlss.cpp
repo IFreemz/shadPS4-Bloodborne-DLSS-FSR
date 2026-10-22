@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <utility>
 #include <fmt/format.h>
+#include "common/bb_tuning.h"
 #include "common/crash_crumbs.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -25,6 +26,7 @@
 #include "video_core/host_shaders/bb_dlss_motion_comp.h"
 #include "video_core/host_shaders/bb_dlss_motion_debug_comp.h"
 #include "video_core/host_shaders/bb_dlss_sharpen_hdr_comp.h"
+#include "video_core/host_shaders/bb_hud_layer_comp.h"
 #include "video_core/host_shaders/bb_hudless_dim_comp.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_resolution.h"
@@ -345,8 +347,8 @@ motion_blur=0
 # Turning it on or off completely needs a restart.
 character_motion=1
 
-# Menus and dialogue (inventory, pause, NPCs) stop the camera jitter, so the scene does not
-# shimmer through their see-through panels; the scene stays upscaled: 1 = on, 0 = off
+# The HUD, menus and dialogue drawn as their own layer over the upscaled scene, so the scene
+# does not shimmer through their see-through parts: 1 = on, 0 = off
 menu_fix=1
 
 # -1 = automatic, 0 = DLAA, 1 = Quality, 2 = Balanced, 3 = Performance, 4 = Ultra Performance
@@ -383,6 +385,8 @@ struct Tune {
     int upscaler = 0;      // 0 automatic, 1 DLSS, 2 FSR 3.1, 3 FSR 4
     bool motion_blur = false;
     bool character_motion = true; // skinned meshes' own motion vectors (vk_bb_object_motion)
+    // The HUD as its own layer, as see-through as measured between frames (see
+    // bb_hud_layer.comp), over the upscaled scene.
     bool menu_fix = true;
     bool auto_exposure = true;    // HDR input (decoupled UI): FSR computes the exposure
     bool texture_lod_bias = true; // sharper scene textures while upscaling (BbSceneMipBias)
@@ -479,6 +483,14 @@ struct BbTemporalDlss::Impl {
     std::vector<FrameCamera> frame_cameras;
     u64 scene_camera_frames{};
     std::unique_ptr<OwnedImage> snapshot, motion, upscaled;
+    // The HUD as its own layer (render size): this frame's and the last frame's game frame and
+    // scene (with k and its confidence), alternating, and the layer itself.
+    std::array<std::unique_ptr<OwnedImage>, 2> hud_finals, hud_scenes;
+    std::unique_ptr<OwnedImage> hud_layer_image;
+    std::unique_ptr<VideoCore::Buffer> hud_dimming; // its histogram of the even darkening
+    u32 hud_last{};
+    bool hud_history{};
+    bool hud_layer_on{};                      // the last composite drew the HUD layer
     std::unique_ptr<OwnedImage> linear_color; // FSR 4 input
     std::unique_ptr<OwnedImage> sharpened;    // decoupled UI: the upscaled scene, sharpened
     // Frame generation reads depth and motion when the frame is presented, after later frames
@@ -496,12 +508,12 @@ struct BbTemporalDlss::Impl {
     u32 producer_constants{}, producer_depths{}, velocity_draw_constants{};
     std::unordered_map<VAddr, std::unique_ptr<OwnedImage>> outputs;
     std::unique_ptr<ComputePass> motion_pass, composite_pass, composite_hdr_pass, linearize_pass,
-        sharpen_pass, hudless_dim_pass, motion_debug_pass;
+        sharpen_pass, hudless_dim_pass, motion_debug_pass, hud_layer_pass;
     vk::UniqueSampler nearest, linear;
     Backend backend{};
-    // Menus cover much of the screen; while one is open the scene is not jittered, so the
-    // render-size scene seen through the see-through menu panels cannot shimmer. The scene stays
-    // upscaled (it is the jitter that shimmered, not the upscale).
+    // Menus cover much of the screen. Where the HUD layer can't be drawn (RenoDX), the scene is
+    // not jittered while one is open, so the render-size scene seen through the see-through menu
+    // panels cannot shimmer. The scene stays upscaled.
     std::unique_ptr<VideoCore::Buffer> coverage, dimming;
     bool menu{};
     std::unique_ptr<FsrUpscaler> fsr;
@@ -632,7 +644,7 @@ struct BbTemporalDlss::Impl {
         static constexpr std::array composite_types{
             T::eCombinedImageSampler, T::eCombinedImageSampler, T::eCombinedImageSampler,
             T::eCombinedImageSampler, T::eStorageImage,         T::eCombinedImageSampler,
-            T::eStorageBuffer,        T::eStorageBuffer};
+            T::eStorageBuffer,        T::eStorageBuffer,        T::eCombinedImageSampler};
         motion_pass = std::make_unique<ComputePass>(device, motion_types, BB_DLSS_MOTION_COMP, 96);
         composite_pass =
             std::make_unique<ComputePass>(device, composite_types, BB_DLSS_COMPOSITE_COMP, 8);
@@ -652,6 +664,12 @@ struct BbTemporalDlss::Impl {
                                                       T::eStorageBuffer};
         hudless_dim_pass =
             std::make_unique<ComputePass>(device, hudless_dim_types, BB_HUDLESS_DIM_COMP, 4);
+        static constexpr std::array hud_layer_types{
+            T::eCombinedImageSampler, T::eCombinedImageSampler, T::eCombinedImageSampler,
+            T::eCombinedImageSampler, T::eStorageImage,         T::eStorageImage,
+            T::eStorageImage,         T::eStorageBuffer};
+        hud_layer_pass =
+            std::make_unique<ComputePass>(device, hud_layer_types, BB_HUD_LAYER_COMP, 4);
         const auto sampler = [&](vk::Filter filter) {
             return Make(device.createSamplerUnique(vk::SamplerCreateInfo{
                             .magFilter = filter,
@@ -670,6 +688,9 @@ struct BbTemporalDlss::Impl {
     vk::Extent2D OutputFor(vk::Extent2D in) const {
         if (tune.output.width && tune.output.height)
             return BbUpscaleOutput(in, tune.output, true);
+        // F1's Regular resolution mode: its output size.
+        if (const u64 f1 = Common::BbTuning::upscale_output.load(std::memory_order_relaxed))
+            return BbUpscaleOutput(in, {u32(f1 >> 32), u32(f1)}, true);
         const auto window = display.load();
         return BbUpscaleOutput(in, {u32(window >> 32), u32(window)});
     }
@@ -1691,6 +1712,28 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
             pre_lut_hudless = std::make_unique<OwnedImage>(instance, pre_lut_format, output,
                                                            U::eSampled | U::eStorage);
     }
+    // The HUD as its own layer (see bb_hud_layer.comp): its images at the render size.
+    const bool hud_layer =
+        tune.menu_fix && dlss_pre_hud && tune.hud && !replay && !upscaled_tone_mapped;
+    hud_layer_on = hud_layer;
+    if (hud_layer && (!hud_layer_image || hud_layer_image->extent != render)) {
+        if (hud_layer_image)
+            scheduler.Finish();
+        using U = vk::ImageUsageFlagBits;
+        const auto make = [&] {
+            return std::make_unique<OwnedImage>(instance, vk::Format::eR16G16B16A16Sfloat, render,
+                                                U::eSampled | U::eStorage);
+        };
+        for (u32 i = 0; i < 2; ++i) {
+            hud_finals[i] = make();
+            hud_scenes[i] = make();
+        }
+        hud_layer_image = make();
+        hud_history = false;
+    }
+    if (hud_layer && !hud_dimming)
+        hud_dimming = std::make_unique<VideoCore::Buffer>(instance, 0, DimmingBytes,
+                                                          VideoCore::MemoryType::DeviceLocal);
     auto& written = replay ? *pre_lut : *outputs_slot;
     auto* written_hudless = !hudless ? nullptr
                             : replay ? pre_lut_hudless.get()
@@ -1753,13 +1796,83 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
     const std::array clear_barriers{coverage_barrier, dimming_barrier};
     command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 2,
                                                 .pBufferMemoryBarriers = clear_barriers.data()});
+    // The HUD as its own layer, measured at the render size before the composite.
+    if (hud_layer) {
+        const vk::Extent2D size{render.width, render.height};
+        const u32 last = hud_last, next = hud_last ^ 1;
+        for (auto* image : {hud_finals[last].get(), hud_scenes[last].get()})
+            image->Transit(command, ro, vk::PipelineStageFlagBits2::eComputeShader,
+                           vk::AccessFlagBits2::eShaderRead);
+        for (auto* image : {hud_finals[next].get(), hud_scenes[next].get(), hud_layer_image.get()})
+            image->Transit(command, vk::ImageLayout::eGeneral,
+                           vk::PipelineStageFlagBits2::eComputeShader,
+                           vk::AccessFlagBits2::eShaderWrite);
+        const std::array layer_images{
+            vk::DescriptorImageInfo{*nearest, *source_view.image_view, ro},
+            vk::DescriptorImageInfo{*nearest, *snapshot->view, ro},
+            vk::DescriptorImageInfo{*nearest, *hud_finals[last]->view, ro},
+            vk::DescriptorImageInfo{*nearest, *hud_scenes[last]->view, ro},
+            vk::DescriptorImageInfo{{}, *hud_finals[next]->view, vk::ImageLayout::eGeneral},
+            vk::DescriptorImageInfo{{}, *hud_scenes[next]->view, vk::ImageLayout::eGeneral},
+            vk::DescriptorImageInfo{{}, *hud_layer_image->view, vk::ImageLayout::eGeneral}};
+        std::array<vk::WriteDescriptorSet, 8> layer_writes;
+        for (u32 i = 0; i < layer_images.size(); ++i)
+            layer_writes[i] = {.dstBinding = i,
+                               .descriptorCount = 1,
+                               .descriptorType = i >= 4 ? vk::DescriptorType::eStorageImage
+                                                        : vk::DescriptorType::eCombinedImageSampler,
+                               .pImageInfo = &layer_images[i]};
+        const vk::DescriptorBufferInfo layer_dimming{hud_dimming->Handle(), 0, DimmingBytes};
+        layer_writes[7] = {.dstBinding = 7,
+                           .descriptorCount = 1,
+                           .descriptorType = vk::DescriptorType::eStorageBuffer,
+                           .pBufferInfo = &layer_dimming};
+        // First the histogram of the even darkening, then the layer.
+        auto histogram_barrier = dimming_barrier;
+        histogram_barrier.buffer = hud_dimming->Handle();
+        histogram_barrier.dstStageMask = vk::PipelineStageFlagBits2::eTransfer;
+        histogram_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
+                                                    .pBufferMemoryBarriers = &histogram_barrier});
+        command.fillBuffer(hud_dimming->Handle(), 0, DimmingBytes, 0);
+        histogram_barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+        histogram_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        histogram_barrier.dstStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+        histogram_barrier.dstAccessMask =
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+        command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
+                                                    .pBufferMemoryBarriers = &histogram_barrier});
+        command.bindPipeline(vk::PipelineBindPoint::eCompute, *hud_layer_pass->pipeline);
+        command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *hud_layer_pass->layout, 0,
+                                     layer_writes);
+        const u32 layer_push = hud_history ? 1u : 0u;
+        const u32 count_push = layer_push | 4u;
+        command.pushConstants(*hud_layer_pass->layout, vk::ShaderStageFlagBits::eCompute, 0,
+                              sizeof(count_push), &count_push);
+        command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+        histogram_barrier.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+        histogram_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+        command.pipelineBarrier2(vk::DependencyInfo{.bufferMemoryBarrierCount = 1,
+                                                    .pBufferMemoryBarriers = &histogram_barrier});
+        command.pushConstants(*hud_layer_pass->layout, vk::ShaderStageFlagBits::eCompute, 0,
+                              sizeof(layer_push), &layer_push);
+        command.dispatch((size.width + 7) / 8, (size.height + 7) / 8, 1);
+        hud_layer_image->Transit(command, ro, vk::PipelineStageFlagBits2::eComputeShader,
+                                 vk::AccessFlagBits2::eShaderRead);
+        hud_last = next;
+        hud_history = true;
+    } else {
+        hud_history = false;
+    }
     const std::array images{vk::DescriptorImageInfo{*nearest, *upscaled->view, ro},
                             vk::DescriptorImageInfo{*linear, *source_view.image_view, ro},
                             vk::DescriptorImageInfo{*linear, *snapshot->view, ro},
                             vk::DescriptorImageInfo{*linear, *lut_view.image_view, ro},
                             vk::DescriptorImageInfo{{}, *written.view, vk::ImageLayout::eGeneral},
                             vk::DescriptorImageInfo{*linear, *motion->view, ro}};
-    std::array<vk::WriteDescriptorSet, 8> writes;
+    const vk::DescriptorImageInfo layer_info{
+        *linear, hud_layer ? *hud_layer_image->view : *snapshot->view, ro};
+    std::array<vk::WriteDescriptorSet, 9> writes;
     for (u32 i = 0; i < images.size(); ++i)
         writes[i] = {.dstBinding = i,
                      .descriptorCount = 1,
@@ -1776,9 +1889,13 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
                  .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eStorageBuffer,
                  .pBufferInfo = &dimming_info};
+    writes[8] = {.dstBinding = 8,
+                 .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                 .pImageInfo = &layer_info};
     const u32 flags = (dlss_pre_hud && tune.hud ? 1u : 0u) | (replay ? 32u : 2u) |
                       (tune.debug_motion ? 4u : 0u) | (upscaled_linear ? 16u : 0u) |
-                      (upscaled_tone_mapped ? 128u : 0u);
+                      (upscaled_tone_mapped ? 128u : 0u) | (hud_layer ? 512u : 0u);
     const auto& pass = replay ? *composite_hdr_pass : *composite_pass;
     command.bindPipeline(vk::PipelineBindPoint::eCompute, *pass.pipeline);
     command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pass.layout, 0, writes);
@@ -2100,7 +2217,13 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
         // HUD draws share the scene depth for stencil; anything into the HUD target stays put.
         if (s.ui_target && draw.color == *s.ui_target)
             return {};
-        if (s.tune.enabled && s.tune.jitter && !s.menu && s.scene_depth &&
+        // The HUD's stencil masks (no colour, no depth test) share the scene depth too: a
+        // jittered mask moves the edge of what it masks (the stamina bar's end line).
+        if (s.ui_phase && !color && draw.stencil && !draw.depth_test)
+            return {};
+        // In menus the jitter stops where the HUD layer can't be drawn; the HUD layer measures
+        // the HUD against the moving scene, so there it keeps running.
+        if (s.tune.enabled && s.tune.jitter && !(s.menu && !s.hud_layer_on) && s.scene_depth &&
             draw.depth == s.scene_depth->id &&
             cache.GetImage(draw.depth).image_uid == s.scene_depth->uid) {
             const bool small = !draw.indirect && draw.num_indices <= 6 && draw.num_instances <= 1;

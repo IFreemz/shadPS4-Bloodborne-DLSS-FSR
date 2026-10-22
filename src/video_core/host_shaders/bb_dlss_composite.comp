@@ -20,13 +20,16 @@ layout(binding=7, std430) buffer Dimming {
     uint dim_count[64];
     uint dim_sum[64];
 };
+// The HUD as its own layer (render size, bb_hud_layer.comp): rgb = HUD, a = scene shown.
+layout(binding=8) uniform sampler2D hud_layer;
 layout(push_constant) uniform Push {
     uint flags;      // 1: add HUD, 2: apply LUT, 4: motion debug view, 8: menu (game frame only),
                      // 16: upscaled is linear light (encode it to sRGB),
                      // 32: keep the game frame's alpha (RenoDX keeps HDR data there),
                      // 64: HUD-less copy for frame generation (scene alpha, not counted),
                      // 128: RenoDX HDR, upscaled holds reversibly tone-mapped linear light and
-                     //      the scene and result may exceed 1
+                     //      the scene and result may exceed 1,
+                     // 512: the HUD from its own layer (hud_layer) over the upscaled scene
     float sharpness; // 0 off .. 1 strongest (robust contrast-adaptive sharpening)
 } pc;
 
@@ -90,6 +93,14 @@ bool Shade(ivec2 pixel, ivec2 extent) {
     } else if ((pc.flags & 8u) != 0) {
         // A menu covers the screen: show the game's own frame.
         color = final_rgb;
+    } else if ((pc.flags & 513u) == 513u && (pc.flags & 128u) == 0) {
+        // The HUD over the upscaled scene, as see-through as measured: steady where something
+        // detailed or moving is behind it.
+        vec4 layer = texture(hud_layer, uv);
+        color = clamp(layer.a * color + layer.rgb, 0, 1);
+        // Where the HUD is white (clipped) in the game's frame, it stays white: over a bright
+        // scene a clipped channel doesn't hold the HUD's part apart from the scene's.
+        color = mix(color, final_rgb, step(vec3(0.98), final_rgb) * (1.0 - layer.a));
     } else if ((pc.flags & 1u) != 0) {
         color = t * color + max(final_rgb - t * scene_rgb, 0);
         if ((pc.flags & 128u) == 0)

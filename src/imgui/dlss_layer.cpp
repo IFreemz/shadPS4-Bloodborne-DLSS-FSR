@@ -428,6 +428,24 @@ void DlssLayer::Draw() {
                 settings.Set("res_render", values[index]);
         }
         {
+            // Decoupled: the game's frame (post-processing, UI) at the output size, only the 3D
+            // scene lower. Regular: all of it lower, as a Resolution Patch: faster.
+            static constexpr std::array ModeValues{"decoupled", "regular"};
+            static constexpr std::array ModeNames{"Output (sharp UI)",
+                                                  "Render resolution (faster)"};
+            int index = next.regular ? 1 : 0;
+            SetNextItemWidth(200.0f);
+            if (Combo("UI and effects at", &index, ModeNames.data(), int(ModeNames.size())))
+                settings.Set("res_mode", ModeValues[index]);
+            if (IsItemHovered())
+                SetTooltip("Output: only the 3D scene renders at the lower resolution; the game's "
+                           "post-processing and UI\nstay at the output resolution (Decoupled UI). "
+                           "Sharpest.\nRender resolution: the whole frame renders at the lower "
+                           "resolution, as a regular Resolution Patch,\nand the upscaler brings "
+                           "it up to the output. Faster on slower GPUs, the UI is a little "
+                           "softer.");
+        }
+        {
             // The game's graphics heap, raised for a scene above 1080p (Res::Install).
             static constexpr std::array HeapValues{"auto", "full", "first", "smaller", "off"};
             static constexpr std::array HeapNames{"Auto", "Full Heap Patch", "First Heap Only",
@@ -463,7 +481,8 @@ void DlssLayer::Draw() {
             const bool in_use = now.enabled && now.output_width == next.output_width &&
                                 now.output_height == next.output_height &&
                                 now.render_width == next.render_width &&
-                                now.render_height == next.render_height && now.heap == next.heap;
+                                now.render_height == next.render_height && now.heap == next.heap &&
+                                now.regular == next.regular;
             if (in_use)
                 TextDisabled("(in use)");
             else if (now.problem.empty())
@@ -613,12 +632,12 @@ void DlssLayer::Draw() {
     if (Checkbox("Menu fix", &menu_fix))
         settings.Set("menu_fix", menu_fix ? "1" : "0");
     if (IsItemHovered())
-        SetTooltip("While a menu or dialogue covers much of the screen (inventory, pause menu, "
-                   "NPCs), the camera jitter\nstops so the scene doesn't shimmer through the "
-                   "see-through panels. The scene stays upscaled.\nThe game's performance is the "
-                   "same either way.");
+        SetTooltip("Draws the HUD, menus and dialogue (health bar, blood echoes, inventory, "
+                   "NPCs) as their own layer\nover the upscaled scene, so the scene doesn't "
+                   "flicker or shimmer through their see-through parts.\nThe scene stays "
+                   "upscaled. Upscaled to a higher resolution or DLAA; not with Decoupled UI.");
     SameLine();
-    TextDisabled("(steady menu backgrounds)");
+    TextDisabled("(steady HUD and menus)");
 
     bool texture_lod_bias = settings.Get("texture_lod_bias", "1") != "0";
     if (Checkbox("Sharper textures", &texture_lod_bias))
