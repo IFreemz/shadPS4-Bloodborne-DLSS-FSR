@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 name: Build
+# Manual runs show the title typed in when starting them (e.g. what the build is for).
+run-name: ${{ inputs.title || github.event.head_commit.message || github.event.pull_request.title || format('Build {0}', github.ref_name) }}
 
 on:
   push:
@@ -16,6 +18,11 @@ on:
       - "**/*.md"
 
   workflow_dispatch:
+    inputs:
+      title:
+        description: "What this build is for (shown as the run's name)"
+        required: false
+        type: string
 
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
