@@ -688,6 +688,20 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     if (vram_reclaim) {
         MakeResidentPooled(arena, bind_ranges, resident_blocks);
         MarkResidentUse(first_block << block_shift, (last_block - first_block + 1) << block_shift);
+        // Pooled memory comes back holding another range's bytes (space an eviction unbound),
+        // and only the part a binding names was uploaded at its use. The GPU also reads the rest
+        // of the block: vertex fetch past a binding's end, shaders through the page table. Garbage
+        // there (indices, draw counts) hung the GPU after loading screens with buffer eviction on.
+        // So the whole range bound now is filled from guest memory (evicted ranges were marked
+        // CPU-modified, so all of it uploads).
+        for (const auto& range : bind_ranges) {
+            const VAddr address = range.start << block_shift;
+            const u64 size = (range.end - range.start) << block_shift;
+            for (u64 offset = 0; offset < size; offset += 1_GB) {
+                SynchronizeMemory(arena, address + offset, u32(std::min<u64>(size - offset, 1_GB)),
+                                  false, false);
+            }
+        }
         return;
     }
 
