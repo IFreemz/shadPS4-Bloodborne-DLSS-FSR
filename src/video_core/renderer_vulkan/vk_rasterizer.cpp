@@ -3501,6 +3501,9 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
     if (const_ring && pipeline && (kind == PacketKind::Draw || kind == PacketKind::DrawIndirect)) {
         PrefetchBuffers(pipeline);
     }
+    if (pipeline) {
+        NoteQueuedReads(pipeline);
+    }
     ALap(ASection::Prefetch);
     const u32 num_prefetch = static_cast<u32>(prefetch_scratch.size());
     const bool vertex_prepared =
@@ -3846,6 +3849,62 @@ void Rasterizer::PrefetchBuffers(const Pipeline* pipeline) {
     if (!prefetch_scratch.empty()) {
         ring_prefetches.fetch_add(prefetch_scratch.size(), std::memory_order_relaxed);
     }
+}
+
+void Rasterizer::NoteQueuedReads(const Pipeline* pipeline) {
+    const u64 consumed = draw_pipe->ConsumedPackets();
+    while (!queued_later_reads.empty() && queued_later_reads.front().packet <= consumed) {
+        queued_later_reads.pop_front();
+    }
+    if (queued_later_reads.empty()) {
+        queued_reads_overflow = false;
+    }
+    const u64 packet = draw_pipe->packets + 1;
+    u32 ordinal = 0;
+    for (const auto* info : pipeline->GetStages()) {
+        if (!info) {
+            continue;
+        }
+        const u32 stage = ordinal++;
+        for (u32 index = 0; index < info->buffers.size(); ++index) {
+            const auto& desc = info->buffers[index];
+            if (desc.IsSpecial() || desc.is_written) {
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(*info);
+            if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+                continue;
+            }
+            const bool copied = std::ranges::any_of(prefetch_scratch, [&](const auto& entry) {
+                return entry.stage == stage && entry.buffer == index;
+            });
+            if (copied) {
+                continue; // read from the constant ring, not the guest's memory
+            }
+            auto& reads = queued_later_reads;
+            if (reads.size() >= 16384) {
+                queued_reads_overflow = true;
+                continue;
+            }
+            reads.push_back({packet, vsharp.base_address, vsharp.base_address + vsharp.GetSize()});
+        }
+    }
+}
+
+Rasterizer::QueuedUse Rasterizer::CheckQueuedUse(VAddr address, u64 size) {
+    if (!UseDrawPipe() || !draw_pipe) {
+        return {true, true}; // not tracked: wait as before
+    }
+    const u64 consumed = draw_pipe->ConsumedPackets();
+    const auto overlaps = [&](const std::deque<PendingWrite>& ranges) {
+        return std::ranges::any_of(ranges, [&](const auto& range) {
+            return range.packet > consumed && address < range.end && range.begin < address + size;
+        });
+    };
+    return {
+        .read_later = queued_reads_overflow || overlaps(queued_later_reads),
+        .written = overlaps(pending_writes),
+    };
 }
 
 const Rasterizer::PrefetchedBuffer* Rasterizer::FindPrefetched(u32 buffer_index) {

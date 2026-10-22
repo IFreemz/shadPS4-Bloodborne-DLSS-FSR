@@ -355,7 +355,11 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .fragment_fp_contraction = EmulatorSettings.IsBbFastPixelMath(),
     };
+    LOG_INFO(Render_Vulkan, "Pixel shader float math: {}",
+             profile.fragment_fp_contraction ? "fused by the driver (fast pixel math)"
+                                             : "unfused, as the PS4");
     // The driver's own cache from the last session first: the warm-up builds every cached
     // pipeline with it, much faster when the driver has compiled them before.
     pipeline_cache = CreateDriverCache();

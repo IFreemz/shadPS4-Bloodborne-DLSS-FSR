@@ -7,6 +7,11 @@
 namespace Shader::Backend::SPIRV {
 
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
+    // A pixel shader's arithmetic is the driver's to fuse unless it writes depth
+    // (Profile::fragment_fp_contraction).
+    if (ctx.fp_contraction) {
+        return op;
+    }
     ctx.Decorate(op, spv::Decoration::NoContraction);
     return op;
 }

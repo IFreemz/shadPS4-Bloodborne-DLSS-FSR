@@ -501,6 +501,15 @@ struct GPUSettings {
     // Threaded renderer: the next GPU submission is decoded while the draw recorder still
     // records the last one. Off: waits for the recorder after each submission.
     Setting<bool> bb_submit_overlap{true};
+    // Threaded renderer: occlusion query results written in order with the queued draws. Off:
+    // the decoding thread waits for every queued draw first, as before.
+    Setting<bool> bb_occlusion_in_order{true};
+    // Pixel shader float math the driver may fuse (less shader code); applies after a restart
+    // and rebuilds the shader cache when changed. Off: unfused, as the PS4.
+    Setting<bool> bb_fast_pixel_math{true};
+    // Threaded renderer: the game's constant copies (constant RAM dumps) written at once when no
+    // queued draw reads that memory later. Off: every one waits for the queued draws first.
+    Setting<bool> bb_constants_no_wait{true};
     // Diagnostics: every draw timed, and where the draw recorder's time went shown for each
     // stutter (slower: for finding stutter causes).
     Setting<bool> bb_stutter_detail{false};
@@ -560,6 +569,10 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_texture_set_memo", &GPUSettings::bb_texture_set_memo),
             make_override<GPUSettings>("bb_ring_geometry", &GPUSettings::bb_ring_geometry),
             make_override<GPUSettings>("bb_submit_overlap", &GPUSettings::bb_submit_overlap),
+            make_override<GPUSettings>("bb_occlusion_in_order",
+                                       &GPUSettings::bb_occlusion_in_order),
+            make_override<GPUSettings>("bb_fast_pixel_math", &GPUSettings::bb_fast_pixel_math),
+            make_override<GPUSettings>("bb_constants_no_wait", &GPUSettings::bb_constants_no_wait),
             make_override<GPUSettings>("bb_stutter_detail", &GPUSettings::bb_stutter_detail),
             make_override<GPUSettings>("bb_defaults", &GPUSettings::bb_defaults),
         };
@@ -576,7 +589,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place, bb_skip_empty_draws,
     bb_background_pipelines, bb_anisotropy, bb_exact_protection, bb_batched_uploads,
     bb_texture_set_memo, bb_ring_geometry, bb_submit_overlap, bb_stutter_detail, bb_defaults,
-    bb_merged_copy_commands)
+    bb_merged_copy_commands, bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait)
 
 // -------------------------------
 // Vulkan settings
@@ -894,6 +907,9 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbTextureSetMemo, bb_texture_set_memo)
     SETTING_FORWARD_BOOL(m_gpu, BbRingGeometry, bb_ring_geometry)
     SETTING_FORWARD_BOOL(m_gpu, BbSubmitOverlap, bb_submit_overlap)
+    SETTING_FORWARD_BOOL(m_gpu, BbOcclusionInOrder, bb_occlusion_in_order)
+    SETTING_FORWARD_BOOL(m_gpu, BbFastPixelMath, bb_fast_pixel_math)
+    SETTING_FORWARD_BOOL(m_gpu, BbConstantsNoWait, bb_constants_no_wait)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
     SETTING_FORWARD(m_gpu, BbAnisotropy, bb_anisotropy)

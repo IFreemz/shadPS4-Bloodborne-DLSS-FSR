@@ -86,6 +86,9 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbTextureSetMemoSetting = EmulatorSettings.IsBbTextureSetMemo();
     bbRingGeometrySetting = EmulatorSettings.IsBbRingGeometry();
     bbSubmitOverlapSetting = EmulatorSettings.IsBbSubmitOverlap();
+    bbOcclusionInOrderSetting = EmulatorSettings.IsBbOcclusionInOrder();
+    bbFastPixelMathSetting = EmulatorSettings.IsBbFastPixelMath();
+    bbConstantsNoWaitSetting = EmulatorSettings.IsBbConstantsNoWait();
     {
         // 0 (the game's own), 2, 4, 8, 16 -> 0..4
         const int samples = EmulatorSettings.GetBbAnisotropy();
@@ -175,6 +178,9 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbTextureSetMemo(bbTextureSetMemoSetting, isSpecific);
     EmulatorSettings.SetBbRingGeometry(bbRingGeometrySetting, isSpecific);
     EmulatorSettings.SetBbSubmitOverlap(bbSubmitOverlapSetting, isSpecific);
+    EmulatorSettings.SetBbOcclusionInOrder(bbOcclusionInOrderSetting, isSpecific);
+    EmulatorSettings.SetBbFastPixelMath(bbFastPixelMathSetting, isSpecific);
+    EmulatorSettings.SetBbConstantsNoWait(bbConstantsNoWaitSetting, isSpecific);
     EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
                                      isSpecific);
     EmulatorSettings.SetBbDrawDataMemory(bbDrawDataMemorySetting, isSpecific);
@@ -836,6 +842,15 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Small vertex/index data copied by the decoding thread");
                 AddSettingCheckbox("    Overlap GPU submissions (testing)", bbSubmitOverlapSetting,
                                    "Next submission decoded while the last is recorded");
+                AddSettingCheckbox("    Occlusion results in order (testing)",
+                                   bbOcclusionInOrderSetting,
+                                   "Occlusion results queued behind the draws, no wait");
+                AddSettingCheckbox("    Fast pixel shader math (testing, restart)",
+                                   bbFastPixelMathSetting,
+                                   "Driver fuses multiply-adds; shaders rebuilt after a change");
+                AddSettingCheckbox("    Constant copies without waiting (testing)",
+                                   bbConstantsNoWaitSetting,
+                                   "Game's constant copies don't wait for queued draws");
             }
             // Sharper ground and stairs at an angle; applies after a restart.
             AddSettingCombo("Anisotropic filtering", bbAnisotropySetting, anisotropyOptions);

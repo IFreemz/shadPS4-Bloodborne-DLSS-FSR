@@ -315,9 +315,15 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::DumpConstRam: {
             const auto* dump_const = reinterpret_cast<const PM4DumpConstRam*>(header);
-            // Queued draws may still read the memory the dump overwrites.
+            // Queued draws may still read the memory the dump overwrites, or queued tasks (DMA,
+            // fences) write it after. The draws copy what they read when they are queued, so
+            // without either the dump is written now, without waiting for them.
             if (rasterizer) {
-                rasterizer->DrainDrawPipe();
+                const auto use =
+                    rasterizer->CheckQueuedUse(dump_const->Address<VAddr>(), dump_const->Size());
+                if (!EmulatorSettings.IsBbConstantsNoWait() || use.read_later || use.written) {
+                    rasterizer->DrainDrawPipe();
+                }
             }
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
@@ -866,17 +872,41 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     MarkRegWritten(regs.cp_strmout_cntl);
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-                        // Writes guest memory: in order with the queued draws.
-                        if (rasterizer) {
-                            rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
-                        }
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
-                        u64* results = event->Address<u64*>();
-                        for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
-                        }
+                        // Writes guest memory in order with the queued draws (the game clears
+                        // each query's block with a DMA before the dump): run by the draw
+                        // recorder after them, instead of waiting here for all of them.
+                        struct Dump {
+                            u64* results;
+                            u64 value;
+                            u32 pairs;
+                        };
+                        const Dump dump{event->Address<u64*>(),
+                                        pixel_counter | OcclusionCounterValidMask,
+                                        num_counter_pairs};
                         pixel_counter += OcclusionCounterStep;
+                        const auto write = [](Vulkan::Rasterizer&, const u8* data) {
+                            const auto& d = *reinterpret_cast<const Dump*>(data);
+                            u64* results = d.results;
+                            for (u32 i = 0; i < d.pairs; ++i, results += 2) {
+                                *results = d.value;
+                            }
+                        };
+                        if (rasterizer && EmulatorSettings.IsBbOcclusionInOrder()) {
+                            rasterizer->RunInOrder(write, &dump, sizeof(dump),
+                                                   reinterpret_cast<VAddr>(dump.results),
+                                                   u64(dump.pairs) * 2 * sizeof(u64));
+                        } else {
+                            // Off: wait here for every queued draw, then write (as before).
+                            if (rasterizer) {
+                                rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                            }
+                            u64* results = dump.results;
+                            for (u32 i = 0; i < dump.pairs; ++i, results += 2) {
+                                *results = dump.value;
+                            }
+                        }
                     }
                 }
                 break;

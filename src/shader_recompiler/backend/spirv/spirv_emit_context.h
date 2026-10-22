@@ -195,6 +195,8 @@ public:
     const Profile& profile;
     HwStage hw_stage;
     SwStage sw_stage{};
+    /// Float arithmetic without NoContraction (Profile::fragment_fp_contraction).
+    bool fp_contraction{};
 
     Id last_label{};
 

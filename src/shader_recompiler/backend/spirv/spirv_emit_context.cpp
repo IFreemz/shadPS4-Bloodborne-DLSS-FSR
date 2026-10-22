@@ -72,7 +72,10 @@ void Name(EmitContext& ctx, Id object, std::string_view format_str, Args&&... ar
 EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_info_, Info& info_,
                          Bindings& binding_)
     : Sirit::Module(profile_.supported_spirv), info{info_}, runtime_info{runtime_info_},
-      profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage}, binding{binding_} {
+      profile{profile_}, hw_stage{info.hw_stage}, sw_stage{info.sw_stage},
+      fp_contraction{info.hw_stage == HwStage::Fragment && profile_.fragment_fp_contraction &&
+                     !info.stores.Get(IR::Attribute::Depth)},
+      binding{binding_} {
     if (info.uses_dma || VertexMotion()) {
         SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
     } else {

@@ -135,6 +135,13 @@ public:
     /// Returns the number of the queued packet, or 0 when the task ran here.
     u64 RunInOrder(OrderedTask task, const void* data, u32 size, VAddr write_addr = 0,
                    u64 write_size = 0);
+    /// Constant RAM dumps: what queued, not yet recorded work does with a guest range. Stage A
+    /// only.
+    struct QueuedUse {
+        bool read_later; ///< a queued draw or dispatch reads a buffer there when recorded
+        bool written;    ///< a queued task (DMA, fence) writes there
+    };
+    QueuedUse CheckQueuedUse(VAddr address, u64 size);
     /// Whether the draw recording thread has run the packet with this number.
     [[nodiscard]] bool DrawPipeRan(u64 packet) const {
         return !draw_pipe || draw_pipe->ConsumedPackets() >= packet;
@@ -538,6 +545,10 @@ private:
         VAddr end;
     };
     std::deque<PendingWrite> pending_writes;
+    /// Guest ranges queued packets read buffers from when recorded (not copied ahead).
+    std::deque<PendingWrite> queued_later_reads;
+    bool queued_reads_overflow{};
+    void NoteQueuedReads(const Pipeline* pipeline);
     std::vector<PrefetchedBuffer> prefetch_scratch;
     alignas(64) const PrefetchedBuffer* packet_prefetch{}; ///< stage B: the current packet's
     u32 packet_num_prefetch{};

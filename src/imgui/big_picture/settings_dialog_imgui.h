@@ -162,6 +162,9 @@ private:
     bool bbTextureSetMemoSetting;
     bool bbRingGeometrySetting;
     bool bbSubmitOverlapSetting;
+    bool bbOcclusionInOrderSetting;
+    bool bbFastPixelMathSetting;
+    bool bbConstantsNoWaitSetting;
     bool bbStutterDetailSetting;
     int bbVramBudgetTestSetting;
     bool rcasEnabledSetting;
