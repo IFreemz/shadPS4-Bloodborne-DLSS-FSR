@@ -565,8 +565,25 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         ASSERT_MSG(payload[20] == 0xc0001000,
                                    "NOP hint is missing in DB setup sequence");
                         last_db_extent.raw = payload[21];
-                    } else {
-                        last_db_extent.raw = 0;
+                        const u64 address = regs.depth_buffer.DepthAddress();
+                        const auto found = std::ranges::find(db_hints, address, &DbHint::address);
+                        auto& slot = found != db_hints.end()
+                                         ? *found
+                                         : db_hints[db_hint_next++ % db_hints.size()];
+                        slot = {address, last_db_extent};
+                        break;
+                    }
+                    last_db_extent.raw = 0;
+                    if (EmulatorSettings.IsBbRealOcclusion()) {
+                        // A depth buffer set up again without the size hint (the game's
+                        // occlusion test boxes): the size it was last given, so the boxes test
+                        // against the scene's depth and not a new, empty image of the whole
+                        // allocation.
+                        const u64 address = regs.depth_buffer.DepthAddress();
+                        const auto found = std::ranges::find(db_hints, address, &DbHint::address);
+                        if (address != 0 && found != db_hints.end()) {
+                            last_db_extent = found->extent;
+                        }
                     }
                     break;
                 }
@@ -893,7 +910,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 *results = d.value;
                             }
                         };
-                        if (rasterizer && EmulatorSettings.IsBbOcclusionInOrder()) {
+                        if (rasterizer && EmulatorSettings.IsBbRealOcclusion()) {
+                            // Real occlusion tests: written by the draw recorder with the GPU's
+                            // count once the GPU has run the test (until then: not ready).
+                            rasterizer->OcclusionDump(dump.results, dump.value, dump.pairs);
+                        } else if (rasterizer && EmulatorSettings.IsBbOcclusionInOrder()) {
                             rasterizer->RunInOrder(write, &dump, sizeof(dump),
                                                    reinterpret_cast<VAddr>(dump.results),
                                                    u64(dump.pairs) * 2 * sizeof(u64));

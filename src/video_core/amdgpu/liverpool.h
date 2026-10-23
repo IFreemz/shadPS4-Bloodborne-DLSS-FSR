@@ -273,6 +273,13 @@ private:
     bool MetByPendingFence(const PM4CmdWaitRegMem& wait);
     u32 num_counter_pairs{};
     u64 pixel_counter{};
+    // Real occlusion tests: the last size hint each recent depth buffer was set up with.
+    struct DbHint {
+        u64 address;
+        CbDbExtent extent;
+    };
+    std::array<DbHint, 8> db_hints{};
+    u32 db_hint_next{};
 
     struct ConstantEngine {
         void Reset() {

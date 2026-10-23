@@ -507,6 +507,82 @@ private:
     u64 stat_frames{};                           ///< stage A: submissions done (one per game frame)
     u64 pipe_stats_draws{};
     u64 pipe_stats_frames{};
+
+public:
+    /// Real occlusion tests (GPU command thread): a counter dump the game asked for.
+    void OcclusionDump(u64* results, u64 value, u32 pairs);
+
+private:
+    struct OcclusionTask {
+        u64* results;
+        u64 begin_value;
+        u32 pairs;
+        u32 stage_a_draws;
+        bool begin;
+    };
+    struct {
+        VAddr begin_address{};
+        u64 begin_value{};
+        u32 draws{};
+        bool open{};
+    } occlusion_a; ///< GPU command thread
+    struct {
+        bool open{};
+        bool dropped{};
+        u32 pairs{};
+        u32 draws_seen{};
+        u64* results{};
+        u64 begin_value{};
+        boost::container::small_vector<u32, 4> queries;
+    } occlusion_b; ///< draw recorder
+    struct PendingOcclusion {
+        u64* results;
+        u64 begin_value;
+        u32 pairs;
+        u64 tick;
+        boost::container::small_vector<u32, 4> queries;
+        bool known;
+    };
+    std::deque<PendingOcclusion> occlusion_pending;
+    static constexpr u32 OcclusionPoolSize = 4096;
+    static constexpr u32 NoOcclusionQuery = ~0u;
+    vk::UniqueQueryPool occlusion_pool;
+    std::vector<bool> occlusion_busy;
+    u32 occlusion_next{};
+    std::atomic<u64> occlusion_tests{};
+    std::atomic<u64> occlusion_answered{};
+    std::atomic<u64> occlusion_hidden{};
+    std::atomic<u64> occlusion_unknown{};
+    u32 occlusion_poll_counter{};
+    std::array<u64, 5> pipe_stats_occlusion{};
+    void OcclusionTaskRun(const OcclusionTask& task);
+    bool OcclusionRedirectBegin();
+    void OcclusionRedirectEnd();
+    void OcclusionMarkRedirected();
+    struct {
+        bool valid{};
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthView depth_view{};
+        AmdGpu::Address htile{};
+        AmdGpu::CbDbExtent extent{};
+    } scene_depth; ///< GPU command thread
+    struct {
+        AmdGpu::DepthBuffer depth_buffer{};
+        AmdGpu::DepthView depth_view{};
+        AmdGpu::Address htile{};
+        AmdGpu::CbDbExtent extent{};
+        std::array<AmdGpu::ViewportBounds, AmdGpu::NUM_VIEWPORTS> viewports{};
+        AmdGpu::Scissor screen_scissor{};
+        AmdGpu::ViewportScissor window_scissor{};
+        AmdGpu::ViewportScissor generic_scissor{};
+        std::array<AmdGpu::ViewportScissor, AmdGpu::NUM_VIEWPORTS> viewport_scissors{};
+    } occlusion_saved;
+    std::atomic<u64> occlusion_redirects{};
+    void OcclusionClose(u32 stage_a_draws);
+    u32 OcclusionQueryBegin();
+    void OcclusionQueryEnd(u32 query);
+    void PollOcclusion();
+
     u64 pipe_stats_faults{};
     alignas(64) std::atomic<u64> image_memo_hits{}; ///< draw recorder
     std::atomic<u64> image_memo_misses{};

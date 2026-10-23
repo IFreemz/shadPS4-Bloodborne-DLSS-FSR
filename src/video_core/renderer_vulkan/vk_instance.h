@@ -155,6 +155,11 @@ public:
         return maintenance_5;
     }
 
+    /// Occlusion queries can count exact samples (enabled when supported).
+    bool IsOcclusionQueryPrecise() const {
+        return features.occlusionQueryPrecise;
+    }
+
     bool IsMaintenance6Supported() const {
         return maintenance_6;
     }

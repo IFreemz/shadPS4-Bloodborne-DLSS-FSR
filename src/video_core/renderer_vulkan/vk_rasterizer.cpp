@@ -13,6 +13,8 @@
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/guest_stats.h"
+#include "common/scope_exit.h"
+#include "core/bb_resolution.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -744,6 +746,13 @@ void Rasterizer::RecordIndexBinding() {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
     ++stat_draws;
+    occlusion_a.draws += occlusion_a.open ? 1 : 0;
+    const bool redirected = OcclusionRedirectBegin();
+    SCOPE_EXIT {
+        if (redirected) {
+            OcclusionRedirectEnd();
+        }
+    };
 
     // Threaded renderer: stage A selects the pipeline and queues the rest of the draw. Draws
     // FilterDraw handles itself (fast clear elimination, resolve, depth copy, skips) run here.
@@ -791,6 +800,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset) {
     const u64 mirror_flushes = velocity_mirror.Flushes();
     mirror_rebind = false;
+    occlusion_b.draws_seen += occlusion_b.open ? 1 : 0;
     if (DrawPipe::OnStageB()) {
         scheduler.PopPendingOperations();
         if (target_memo_enabled.load(std::memory_order_relaxed)) {
@@ -873,7 +883,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     const auto draw = [&] { record_draw(scheduler.CommandBuffer()); };
     ReplayVelocityMirror(pipeline, state, is_indexed, [&] { scheduler.Record(record_draw); });
     RebindAfterMirror(pipeline, state, is_indexed, mirror_flushes);
+    const u32 query = occlusion_b.open ? OcclusionQueryBegin() : NoOcclusionQuery;
     scheduler.Record(record_draw);
+    OcclusionQueryEnd(query);
     ReplayDisplayCopy(pipeline, state, draw);
     DebugState.IncDrawCall();
     draw_jitter = {};
@@ -888,6 +900,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
     ++stat_draws;
+    occlusion_a.draws += occlusion_a.open ? 1 : 0;
 
     const DrawIndirectParams params = {
         .vertex_sgpr_offset = vertex_sgpr_offset,
@@ -926,6 +939,7 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                                     const IndirectArgs& args) {
     const u64 mirror_flushes = velocity_mirror.Flushes();
     mirror_rebind = false;
+    occlusion_b.dropped |= occlusion_b.open; // not counted: the test answers "visible"
     if (DrawPipe::OnStageB()) {
         scheduler.PopPendingOperations();
         if (target_memo_enabled.load(std::memory_order_relaxed)) {
@@ -3920,6 +3934,260 @@ Rasterizer::QueuedUse Rasterizer::CheckQueuedUse(VAddr address, u64 size) {
     };
 }
 
+// ---------------------------------------------------------------------------------------------
+// Real occlusion tests (bb_real_occlusion)
+// ---------------------------------------------------------------------------------------------
+// The game tests whole areas: between two counter dumps (ZPASS_DONE, the second 8 bytes after
+// the first) it draws a box against the scene depth, and skips the area while no pixel of the
+// box is visible. The GPU counts the box's visible samples with a Vulkan occlusion query; the
+// count goes into the game's result block when that submission has finished.
+
+namespace {
+constexpr u64 OcclusionValidBit = 0x8000000000000000ULL;
+constexpr u64 OcclusionVisibleCount = 0x2FFFFFFULL;
+} // Anonymous namespace
+
+void Rasterizer::OcclusionDump(u64* results, u64 value, u32 pairs) {
+    const auto address = reinterpret_cast<VAddr>(results);
+    OcclusionTask task{};
+    if (occlusion_a.open && address == occlusion_a.begin_address + sizeof(u64)) {
+        task = {reinterpret_cast<u64*>(occlusion_a.begin_address), occlusion_a.begin_value, pairs,
+                occlusion_a.draws, false};
+        occlusion_a.open = false;
+    } else {
+        // A new test (one left open is answered "visible" by the draw recorder).
+        occlusion_a = {address, value, 0, true};
+        task = {results, value, pairs, 0, true};
+    }
+    RunInOrder(
+        [](Rasterizer& self, const u8* data) {
+            self.OcclusionTaskRun(*reinterpret_cast<const OcclusionTask*>(data));
+        },
+        &task, sizeof(task));
+}
+
+bool Rasterizer::OcclusionRedirectBegin() {
+    // Decoupled render resolution: the 3D scene is drawn at the render size into its own depth
+    // buffer, but the game's occlusion test boxes still use the output-size depth buffer and
+    // viewport. While a test is open, its box is drawn against the scene's depth instead, with
+    // the viewport and scissors scaled to the render size.
+    if (!EmulatorSettings.IsBbRealOcclusion()) {
+        scene_depth.valid = false;
+        if (occlusion_a.open) {
+            // Turned off during a test: it ends here, answered "visible".
+            const OcclusionTask task{reinterpret_cast<u64*>(occlusion_a.begin_address),
+                                     occlusion_a.begin_value, 0, ~0u, false};
+            occlusion_a.open = false;
+            RunInOrder(
+                [](Rasterizer& self, const u8* data) {
+                    self.OcclusionTaskRun(*reinterpret_cast<const OcclusionTask*>(data));
+                },
+                &task, sizeof(task));
+        }
+        return false;
+    }
+    const auto& resolution = Core::BbResolution::Applied();
+    if (!resolution.enabled || resolution.regular ||
+        (resolution.render_width == resolution.output_width &&
+         resolution.render_height == resolution.output_height)) {
+        return false;
+    }
+    auto& regs = liverpool->regs;
+    const auto extent = liverpool->last_db_extent;
+    const bool depth = regs.depth_buffer.DepthValid() &&
+                       (regs.depth_control.depth_enable || regs.depth_control.stencil_enable);
+    if (!occlusion_a.open) {
+        // Remember the scene's depth buffer: the last one drawn with at the render size.
+        if (depth && extent.width == resolution.render_width &&
+            extent.height == resolution.render_height) {
+            scene_depth = {true, regs.depth_buffer, regs.depth_view, regs.depth_htile_data_base,
+                           extent};
+        }
+        return false;
+    }
+    if (!depth || !scene_depth.valid || extent.width != resolution.output_width ||
+        extent.height != resolution.output_height) {
+        return false;
+    }
+    auto& saved = occlusion_saved;
+    saved.depth_buffer = regs.depth_buffer;
+    saved.depth_view = regs.depth_view;
+    saved.htile = regs.depth_htile_data_base;
+    saved.extent = extent;
+    saved.viewports = regs.viewports;
+    saved.screen_scissor = regs.screen_scissor;
+    saved.window_scissor = regs.window_scissor;
+    saved.generic_scissor = regs.generic_scissor;
+    saved.viewport_scissors = regs.viewport_scissors;
+
+    regs.depth_buffer = scene_depth.depth_buffer;
+    regs.depth_view = scene_depth.depth_view;
+    regs.depth_htile_data_base = scene_depth.htile;
+    liverpool->last_db_extent = scene_depth.extent;
+    const float sx = float(resolution.render_width) / float(resolution.output_width);
+    const float sy = float(resolution.render_height) / float(resolution.output_height);
+    for (auto& vp : regs.viewports) {
+        vp.xscale *= sx;
+        vp.xoffset *= sx;
+        vp.yscale *= sy;
+        vp.yoffset *= sy;
+    }
+    const auto scale = [](auto value, float factor) {
+        return static_cast<decltype(value)>(std::ceil(float(value) * factor));
+    };
+    regs.screen_scissor.top_left_x = scale(regs.screen_scissor.top_left_x, sx);
+    regs.screen_scissor.top_left_y = scale(regs.screen_scissor.top_left_y, sy);
+    regs.screen_scissor.bottom_right_x = scale(regs.screen_scissor.bottom_right_x, sx);
+    regs.screen_scissor.bottom_right_y = scale(regs.screen_scissor.bottom_right_y, sy);
+    const auto scale_scissor = [&](AmdGpu::ViewportScissor& s) {
+        s.top_left_x = scale(u16(s.top_left_x), sx);
+        s.top_left_y = scale(u16(s.top_left_y), sy);
+        s.bottom_right_x = scale(u16(s.bottom_right_x), sx);
+        s.bottom_right_y = scale(u16(s.bottom_right_y), sy);
+    };
+    scale_scissor(regs.window_scissor);
+    scale_scissor(regs.generic_scissor);
+    for (auto& s : regs.viewport_scissors) {
+        scale_scissor(s);
+    }
+    OcclusionMarkRedirected();
+    occlusion_redirects.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void Rasterizer::OcclusionRedirectEnd() {
+    auto& regs = liverpool->regs;
+    const auto& saved = occlusion_saved;
+    regs.depth_buffer = saved.depth_buffer;
+    regs.depth_view = saved.depth_view;
+    regs.depth_htile_data_base = saved.htile;
+    liverpool->last_db_extent = saved.extent;
+    regs.viewports = saved.viewports;
+    regs.screen_scissor = saved.screen_scissor;
+    regs.window_scissor = saved.window_scissor;
+    regs.generic_scissor = saved.generic_scissor;
+    regs.viewport_scissors = saved.viewport_scissors;
+    OcclusionMarkRedirected();
+}
+
+void Rasterizer::OcclusionMarkRedirected() {
+    // The draw recorder's copy of the registers follows the changes (and their undoing).
+    auto& regs = liverpool->regs;
+    liverpool->MarkRegWritten(regs.depth_buffer);
+    liverpool->MarkRegWritten(regs.depth_view);
+    liverpool->MarkRegWritten(regs.depth_htile_data_base);
+    liverpool->MarkRegWritten(regs.viewports);
+    liverpool->MarkRegWritten(regs.screen_scissor);
+    liverpool->MarkRegWritten(regs.window_scissor);
+    liverpool->MarkRegWritten(regs.generic_scissor);
+    liverpool->MarkRegWritten(regs.viewport_scissors);
+}
+
+void Rasterizer::OcclusionTaskRun(const OcclusionTask& task) {
+    auto& b = occlusion_b;
+    if (task.begin) {
+        if (b.open) {
+            b.dropped = true;
+            OcclusionClose(0); // never ended: answered "visible"
+        }
+        b = {};
+        b.open = true;
+        b.results = task.results;
+        b.begin_value = task.begin_value;
+        b.pairs = task.pairs;
+        occlusion_tests.fetch_add(1, std::memory_order_relaxed);
+    } else if (b.open && b.results == task.results) {
+        OcclusionClose(task.stage_a_draws);
+    }
+    PollOcclusion();
+}
+
+void Rasterizer::OcclusionClose(u32 stage_a_draws) {
+    auto& b = occlusion_b;
+    PendingOcclusion test{
+        .results = b.results,
+        .begin_value = b.begin_value,
+        .pairs = b.pairs,
+        .tick = scheduler.CurrentTick(),
+        .queries = b.queries,
+        // Every draw of the test recorded with a query, or the answer is "visible".
+        .known = !b.dropped && b.draws_seen == stage_a_draws && b.queries.size() == b.draws_seen,
+    };
+    occlusion_pending.push_back(std::move(test));
+    b.open = false;
+}
+
+u32 Rasterizer::OcclusionQueryBegin() {
+    if (!occlusion_pool) {
+        occlusion_pool = instance.GetDevice()
+                             .createQueryPoolUnique(vk::QueryPoolCreateInfo{
+                                 .queryType = vk::QueryType::eOcclusion,
+                                 .queryCount = OcclusionPoolSize,
+                             })
+                             .value;
+        instance.GetDevice().resetQueryPool(*occlusion_pool, 0, OcclusionPoolSize);
+        occlusion_busy.assign(OcclusionPoolSize, false);
+    }
+    const u32 query = occlusion_next;
+    if (occlusion_busy[query]) {
+        occlusion_b.dropped = true; // every query still waiting for its answer
+        return NoOcclusionQuery;
+    }
+    occlusion_next = (query + 1) % OcclusionPoolSize;
+    occlusion_busy[query] = true;
+    // Answered and read: free on the GPU, so it can be reset from here.
+    instance.GetDevice().resetQueryPool(*occlusion_pool, query, 1);
+    const vk::QueryControlFlags flags = instance.IsOcclusionQueryPrecise()
+                                            ? vk::QueryControlFlagBits::ePrecise
+                                            : vk::QueryControlFlags{};
+    scheduler.Record([pool = *occlusion_pool, query, flags](vk::CommandBuffer cmdbuf) {
+        cmdbuf.beginQuery(pool, query, flags);
+    });
+    return query;
+}
+
+void Rasterizer::OcclusionQueryEnd(u32 query) {
+    if (query == NoOcclusionQuery) {
+        return;
+    }
+    scheduler.Record([pool = *occlusion_pool, query](vk::CommandBuffer cmdbuf) {
+        cmdbuf.endQuery(pool, query);
+    });
+    occlusion_b.queries.push_back(query);
+}
+
+void Rasterizer::PollOcclusion() {
+    while (!occlusion_pending.empty() && scheduler.IsFree(occlusion_pending.front().tick)) {
+        const auto test = std::move(occlusion_pending.front());
+        occlusion_pending.pop_front();
+        u64 count = 0;
+        bool known = test.known;
+        for (const u32 query : test.queries) {
+            u64 samples = 0;
+            const auto result = instance.GetDevice().getQueryPoolResults(
+                *occlusion_pool, query, 1, sizeof(samples), &samples, sizeof(samples),
+                vk::QueryResultFlagBits::e64);
+            known &= result == vk::Result::eSuccess;
+            count += samples;
+            occlusion_busy[query] = false;
+        }
+        if (!known) {
+            occlusion_unknown.fetch_add(1, std::memory_order_relaxed);
+            count = OcclusionVisibleCount;
+        }
+        // Begin and end of every counter pair, the whole count in the first pair; the game
+        // reads "not ready" until then (the block was cleared before the test).
+        u64* results = test.results;
+        const u64 begin = test.begin_value | OcclusionValidBit;
+        for (u32 i = test.pairs; i-- > 0;) {
+            results[i * 2] = begin;
+            results[i * 2 + 1] = i == 0 ? begin + count : begin;
+        }
+        occlusion_answered.fetch_add(1, std::memory_order_relaxed);
+        occlusion_hidden.fetch_add(count == 0 ? 1 : 0, std::memory_order_relaxed);
+    }
+}
+
 const Rasterizer::PrefetchedBuffer* Rasterizer::FindPrefetched(u32 buffer_index) {
     // PrefetchBuffers lists them in binding order (stage, then buffer index): the next one
     // is the only candidate.
@@ -3953,6 +4221,10 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
 }
 
 void Rasterizer::RunDrawPacketBody(Rasterizer& self, const u8* data, u32 size) {
+    // Occlusion answers go to the game as soon as the GPU has them, not at the next test.
+    if (!self.occlusion_pending.empty() && (++self.occlusion_poll_counter & 31) == 0) {
+        self.PollOcclusion();
+    }
     if (*data == static_cast<u8>(PacketKind::Task)) {
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
         task.task(self, data + sizeof(TaskPacket));
@@ -4156,6 +4428,23 @@ void Rasterizer::LogDrawPipeStats() {
             (depth_test_only_draws - pipe_stats_depth_test_only_draws) / seconds);
         pipe_stats_empty_draws_skipped = empty_draws_skipped;
         pipe_stats_depth_test_only_draws = depth_test_only_draws;
+        const u64 tests = occlusion_tests.load(std::memory_order_relaxed);
+        const u64 answered = occlusion_answered.load(std::memory_order_relaxed);
+        const u64 hidden = occlusion_hidden.load(std::memory_order_relaxed);
+        const u64 unknown = occlusion_unknown.load(std::memory_order_relaxed);
+        const u64 redirects = occlusion_redirects.load(std::memory_order_relaxed);
+        if (tests != pipe_stats_occlusion[0]) {
+            LOG_INFO(Render_Vulkan,
+                     "  real occlusion tests: {:.0f}/s, answered {:.0f}/s ({:.0f}/s hidden, "
+                     "{:.0f}/s visible as not every draw was counted), {:.0f}/s moved to the "
+                     "render-size scene depth",
+                     (tests - pipe_stats_occlusion[0]) / seconds,
+                     (answered - pipe_stats_occlusion[1]) / seconds,
+                     (hidden - pipe_stats_occlusion[2]) / seconds,
+                     (unknown - pipe_stats_occlusion[3]) / seconds,
+                     (redirects - pipe_stats_occlusion[4]) / seconds);
+        }
+        pipe_stats_occlusion = {tests, answered, hidden, unknown, redirects};
     }
     {
         const u64 prepared = vertex_prepared.load(std::memory_order_relaxed);

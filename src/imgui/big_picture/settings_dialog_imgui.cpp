@@ -90,6 +90,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbFastPixelMathSetting = EmulatorSettings.IsBbFastPixelMath();
     bbConstantsNoWaitSetting = EmulatorSettings.IsBbConstantsNoWait();
     bbHardwareInterpolationSetting = EmulatorSettings.IsBbHardwareInterpolation();
+    bbRealOcclusionSetting = EmulatorSettings.IsBbRealOcclusion();
     {
         // 0 (the game's own), 2, 4, 8, 16 -> 0..4
         const int samples = EmulatorSettings.GetBbAnisotropy();
@@ -183,6 +184,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbFastPixelMath(bbFastPixelMathSetting, isSpecific);
     EmulatorSettings.SetBbConstantsNoWait(bbConstantsNoWaitSetting, isSpecific);
     EmulatorSettings.SetBbHardwareInterpolation(bbHardwareInterpolationSetting, isSpecific);
+    EmulatorSettings.SetBbRealOcclusion(bbRealOcclusionSetting, isSpecific);
     EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
                                      isSpecific);
     EmulatorSettings.SetBbDrawDataMemory(bbDrawDataMemorySetting, isSpecific);
@@ -857,6 +859,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                     "    GPU interpolation where safe (testing, restart)",
                     bbHardwareInterpolationSetting,
                     "NVIDIA: less pixel shader code; shaders rebuilt after a change");
+                AddSettingCheckbox("    Real occlusion tests (testing)", bbRealOcclusionSetting,
+                                   "Areas hidden behind walls are skipped by the game");
             }
             // Sharper ground and stairs at an angle; applies after a restart.
             AddSettingCombo("Anisotropic filtering", bbAnisotropySetting, anisotropyOptions);

@@ -166,6 +166,7 @@ private:
     bool bbFastPixelMathSetting;
     bool bbConstantsNoWaitSetting;
     bool bbHardwareInterpolationSetting;
+    bool bbRealOcclusionSetting;
     bool bbStutterDetailSetting;
     int bbVramBudgetTestSetting;
     bool rcasEnabledSetting;
