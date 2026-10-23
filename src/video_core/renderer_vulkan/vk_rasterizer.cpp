@@ -106,6 +106,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         if (const_ring->mapped_data.empty()) {
             const_ring.reset();
         }
+        if (const_ring && EmulatorSettings.IsBbCopyThread()) {
+            copy_jobs = std::make_unique<CopyJob[]>(CopyJobCount);
+            copy_thread_on = true;
+            copy_thread = std::jthread([this](std::stop_token stop) { RunCopyThread(stop); });
+        }
         draw_pipe = std::make_unique<DrawPipe>(&Rasterizer::RunDrawPacket, this);
         state_sampler = std::jthread([this](std::stop_token stop) {
             Common::SetCurrentThreadName("shadPS4:StateSampler");
@@ -3405,6 +3410,7 @@ constexpr u32 AlignPacket(u32 size) {
 struct PacketHeader {
     u8 kind;
     bool is_indexed;
+    u64 copy_end; ///< copy thread: the jobs up to this one are done before the packet runs
     bool regs_reset;
     u8 num_stages;
     u32 num_blocks;
@@ -3443,6 +3449,7 @@ struct TaskPacket {
     u8 pad[3];
     u32 size;
     Rasterizer::OrderedTask task;
+    u64 copy_end; ///< as PacketHeader::copy_end
 };
 
 struct PacketStage {
@@ -3627,6 +3634,7 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
     header = PacketHeader{
         .kind = static_cast<u8>(kind),
         .is_indexed = is_indexed,
+        .copy_end = copy_head,
         .regs_reset = dirty.reset,
         .num_stages = static_cast<u8>(num_stages),
         .num_blocks = num_blocks,
@@ -3743,7 +3751,8 @@ u64 Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, VAddr w
     }
     const u32 total = sizeof(TaskPacket) + AlignPacket(size);
     u8* out = draw_pipe->Begin(total);
-    *reinterpret_cast<TaskPacket*>(out) = {static_cast<u8>(PacketKind::Task), {}, size, task};
+    *reinterpret_cast<TaskPacket*>(out) = {
+        static_cast<u8>(PacketKind::Task), {}, size, task, copy_head};
     std::memcpy(out + sizeof(TaskPacket), data, size);
     draw_pipe->Commit(total);
     return draw_pipe->packets;
@@ -3805,10 +3814,88 @@ u64 Rasterizer::RingCopyGeometry(VAddr address, u64 size) {
         ring_fallbacks.fetch_add(1, std::memory_order_relaxed);
         return NoRing;
     }
-    memory->CopySparseMemory(address, dest, size);
-    const_ring->Flush(offset, size);
+    RingCopy(address, dest, offset, size);
     geometry_ring_copies.fetch_add(1, std::memory_order_relaxed);
     return offset;
+}
+
+void Rasterizer::RingCopy(VAddr guest, u8* dest, u64 offset, u64 size) {
+    if (!copy_thread_on) {
+        memory->CopySparseMemory(guest, dest, size);
+        const_ring->Flush(offset, size);
+        return;
+    }
+    // Copy thread: made later, before the packet runs on the draw recorder.
+    while (copy_head - copy_done.load(std::memory_order_acquire) >= CopyJobCount) {
+        std::this_thread::yield();
+    }
+    copy_jobs[copy_head % CopyJobCount] = {guest, dest, offset, size};
+    ++copy_head;
+    copy_published.store(copy_head, std::memory_order_seq_cst);
+    if (copy_sleeping.load(std::memory_order_seq_cst)) {
+        copy_wake.fetch_add(1, std::memory_order_seq_cst);
+        copy_wake.notify_one();
+    }
+}
+
+void Rasterizer::RunCopyThread(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadPS4:GpuCopies");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    const std::stop_callback wake_on_stop(stop, [this] {
+        copy_wake.fetch_add(1, std::memory_order_seq_cst);
+        copy_wake.notify_all();
+    });
+    u64 at = 0;
+    while (true) {
+        u64 available = copy_published.load(std::memory_order_acquire);
+        if (available == at) {
+            const auto spin_until =
+                std::chrono::steady_clock::now() + std::chrono::microseconds(50);
+            for (u32 spins = 1; available == at; ++spins) {
+                if (stop.stop_requested()) {
+                    return;
+                }
+                if ((spins & 255) == 0 && std::chrono::steady_clock::now() >= spin_until) {
+                    const u32 seen = copy_wake.load(std::memory_order_seq_cst);
+                    copy_sleeping.store(true, std::memory_order_seq_cst);
+                    if (copy_published.load(std::memory_order_seq_cst) == at &&
+                        !stop.stop_requested()) {
+                        copy_wake.wait(seen, std::memory_order_seq_cst);
+                    }
+                    copy_sleeping.store(false, std::memory_order_relaxed);
+                }
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#endif
+                available = copy_published.load(std::memory_order_acquire);
+            }
+        }
+        const auto start = std::chrono::steady_clock::now();
+        for (; at < available; ++at) {
+            const auto& job = copy_jobs[at % CopyJobCount];
+            memory->CopySparseMemory(job.guest, job.dest, job.size);
+            const_ring->Flush(job.offset, job.size);
+            copy_done.store(at + 1, std::memory_order_release);
+        }
+        copy_busy_ns.fetch_add((std::chrono::steady_clock::now() - start).count(),
+                               std::memory_order_relaxed);
+    }
+}
+
+void Rasterizer::WaitForCopies(u64 end) {
+    const auto start = std::chrono::steady_clock::now();
+    for (u32 spins = 0; copy_done.load(std::memory_order_acquire) < end; ++spins) {
+        if (spins < 4096) {
+#if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+#endif
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    copy_waits.fetch_add(1, std::memory_order_relaxed);
+    copy_wait_ns.fetch_add((std::chrono::steady_clock::now() - start).count(),
+                           std::memory_order_relaxed);
 }
 
 void Rasterizer::PrefetchBuffers(const Pipeline* pipeline) {
@@ -3865,10 +3952,10 @@ void Rasterizer::PrefetchBuffers(const Pipeline* pipeline) {
             }
             if (source) {
                 std::memcpy(dest, source, size);
+                const_ring->Flush(offset, size);
             } else {
-                memory->CopySparseMemory(guest, dest, size);
+                RingCopy(guest, dest, offset, size);
             }
-            const_ring->Flush(offset, size);
             prefetch_scratch.push_back({static_cast<u8>(stage), static_cast<u8>(index), 0,
                                         static_cast<u32>(size), offset});
         }
@@ -3905,7 +3992,7 @@ void Rasterizer::NoteQueuedReads(const Pipeline* pipeline) {
             const bool copied = std::ranges::any_of(prefetch_scratch, [&](const auto& entry) {
                 return entry.stage == stage && entry.buffer == index;
             });
-            if (copied) {
+            if (copied && !copy_thread_on) {
                 continue; // read from the constant ring, not the guest's memory
             }
             auto& reads = queued_later_reads;
@@ -4207,6 +4294,14 @@ bool Rasterizer::HitchProfile() {
 
 void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
     auto& self = *static_cast<Rasterizer*>(context);
+    // Copy thread: this packet's constant and geometry copies (and every earlier one) are done
+    // before it runs, so the draw recorder and the GPU see them as if stage A had made them.
+    const u64 copy_end = *data == static_cast<u8>(PacketKind::Task)
+                             ? reinterpret_cast<const TaskPacket*>(data)->copy_end
+                             : reinterpret_cast<const PacketHeader*>(data)->copy_end;
+    if (self.copy_done.load(std::memory_order_acquire) < copy_end) [[unlikely]] {
+        self.WaitForCopies(copy_end);
+    }
     if (!HitchProfile() || !self.diagnostics.load(std::memory_order_relaxed)) [[likely]] {
         RunDrawPacketBody(self, data, size);
         return;
@@ -4416,6 +4511,22 @@ void Rasterizer::LogDrawPipeStats() {
         }
         pipe_stats_ring_prefetches = prefetches;
         pipe_stats_ring_fallbacks = fallbacks;
+        if (copy_thread_on) {
+            const u64 waits = copy_waits.load(std::memory_order_relaxed);
+            const s64 wait_ns = copy_wait_ns.load(std::memory_order_relaxed);
+            const s64 busy = copy_busy_ns.load(std::memory_order_relaxed);
+            LOG_INFO(Render_Vulkan,
+                     "  copy thread: {:.0f} copies/s, busy {:.1f}%; the draw recorder waited for "
+                     "it {:.0f} times/s, {:.2f} ms/s",
+                     (copy_head - pipe_stats_copy_jobs) / seconds,
+                     (busy - pipe_stats_copy_busy) / 1e7 / seconds,
+                     (waits - pipe_stats_copy_waits) / seconds,
+                     (wait_ns - pipe_stats_copy_wait_ns) / 1e6 / seconds);
+            pipe_stats_copy_jobs = copy_head;
+            pipe_stats_copy_busy = busy;
+            pipe_stats_copy_waits = waits;
+            pipe_stats_copy_wait_ns = wait_ns;
+        }
         const u64 geometry = geometry_ring_copies.load(std::memory_order_relaxed);
         LOG_INFO(Render_Vulkan, "  vertex/index data copied ahead: {:.0f}/s",
                  (geometry - pipe_stats_geometry_ring_copies) / seconds);

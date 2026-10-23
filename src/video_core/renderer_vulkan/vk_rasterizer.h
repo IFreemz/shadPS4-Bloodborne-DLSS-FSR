@@ -775,6 +775,34 @@ private:
         profile_last = now;
     }
     float scene_lod_bias{}; ///< this draw's upscaler texture LOD bias (G-buffer draws only)
+    // Copy thread (bb_copy_thread): stage A's copies of guest memory into the constant ring
+    // (small read-only buffers, vertex and index data) made on their own thread. Each packet
+    // carries the number of jobs queued before it; the draw recorder runs it once those are done.
+    struct CopyJob {
+        VAddr guest;
+        u8* dest;
+        u64 offset;
+        u64 size;
+    };
+    static constexpr u64 CopyJobCount = 1ull << 16;
+    void RingCopy(VAddr guest, u8* dest, u64 offset, u64 size);
+    void RunCopyThread(std::stop_token stop);
+    void WaitForCopies(u64 end);
+    std::unique_ptr<CopyJob[]> copy_jobs;
+    bool copy_thread_on{};
+    u64 copy_head{}; ///< stage A
+    alignas(64) std::atomic<u64> copy_published{};
+    alignas(64) std::atomic<u64> copy_done{};
+    alignas(64) std::atomic<u32> copy_wake{};
+    std::atomic<bool> copy_sleeping{};
+    std::atomic<s64> copy_busy_ns{};
+    std::atomic<u64> copy_waits{};
+    std::atomic<s64> copy_wait_ns{};
+    u64 pipe_stats_copy_jobs{};
+    s64 pipe_stats_copy_busy{};
+    u64 pipe_stats_copy_waits{};
+    s64 pipe_stats_copy_wait_ns{};
+    std::jthread copy_thread; ///< stopped after the draw recorder (below)
     // Last member: destroyed (stopped) first, while everything the draw recording thread uses
     // still exists.
     std::unique_ptr<DrawPipe> draw_pipe;

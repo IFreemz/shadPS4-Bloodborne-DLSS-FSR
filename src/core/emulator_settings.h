@@ -517,6 +517,9 @@ struct GPUSettings {
     // Threaded renderer: the game's occlusion tests (one box per area behind walls) counted by
     // the GPU, so the game skips areas that are hidden. Off: every test reads "visible".
     Setting<bool> bb_real_occlusion{false};
+    // Threaded renderer: stage A's copies of game memory (constants, small vertex and index
+    // data) made on a thread of their own; applies after a restart. Off: made by stage A.
+    Setting<bool> bb_copy_thread{false};
     // Diagnostics: every draw timed, and where the draw recorder's time went shown for each
     // stutter (slower: for finding stutter causes).
     Setting<bool> bb_stutter_detail{false};
@@ -583,6 +586,7 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_hardware_interpolation",
                                        &GPUSettings::bb_hardware_interpolation),
             make_override<GPUSettings>("bb_real_occlusion", &GPUSettings::bb_real_occlusion),
+            make_override<GPUSettings>("bb_copy_thread", &GPUSettings::bb_copy_thread),
             make_override<GPUSettings>("bb_stutter_detail", &GPUSettings::bb_stutter_detail),
             make_override<GPUSettings>("bb_defaults", &GPUSettings::bb_defaults),
         };
@@ -600,7 +604,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_background_pipelines, bb_anisotropy, bb_exact_protection, bb_batched_uploads,
     bb_texture_set_memo, bb_ring_geometry, bb_submit_overlap, bb_stutter_detail, bb_defaults,
     bb_merged_copy_commands, bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait,
-    bb_hardware_interpolation, bb_real_occlusion)
+    bb_hardware_interpolation, bb_real_occlusion, bb_copy_thread)
 
 // -------------------------------
 // Vulkan settings
@@ -923,6 +927,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbConstantsNoWait, bb_constants_no_wait)
     SETTING_FORWARD_BOOL(m_gpu, BbHardwareInterpolation, bb_hardware_interpolation)
     SETTING_FORWARD_BOOL(m_gpu, BbRealOcclusion, bb_real_occlusion)
+    SETTING_FORWARD_BOOL(m_gpu, BbCopyThread, bb_copy_thread)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
     SETTING_FORWARD(m_gpu, BbAnisotropy, bb_anisotropy)
