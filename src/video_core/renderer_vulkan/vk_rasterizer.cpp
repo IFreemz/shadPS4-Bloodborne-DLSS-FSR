@@ -34,6 +34,7 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 #include <mutex>
+#include <optional>
 #include <unordered_set>
 #include <vk_mem_alloc.h>
 #include <xxhash.h>
@@ -2217,6 +2218,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    if (stage.images.empty()) {
+        // Nothing to look up (most vertex shaders, shadow map pixel shaders without alpha test).
+        ProfileLap(Section::Textures);
+        BindSamplers(stage, binding);
+        ProfileLap(Section::Samplers);
+        return;
+    }
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
@@ -2352,7 +2360,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             return;
         }
     }
-    std::array<TextureSetEntry, TextureSet::MaxImages> resolved{};
+    // What a remembered set will hold; only built when this set can be remembered.
+    std::optional<std::array<TextureSetEntry, TextureSet::MaxImages>> resolved;
+    if (set_slot) {
+        resolved.emplace();
+    }
     bool set_ok = set_slot != nullptr;
 
     u32 num_images{};
@@ -2545,8 +2557,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
-            if (set_ok && slot < resolved.size()) {
-                resolved[slot] = {image_id, *image_view.image_view, image.backing, desc.view_info};
+            if (set_ok && slot < TextureSet::MaxImages) {
+                (*resolved)[slot] = {image_id, *image_view.image_view, image.backing,
+                                     desc.view_info};
                 set_ok = !is_storage && !binding.force_general && !binding.is_target;
             }
             ProfileLap(Section::TexLayout);
@@ -2557,7 +2570,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // Remembered: the same T#s resolve the same way while no image is (un)registered.
             set_slot->generation = texture_cache.RegistryGeneration();
             set_slot->count = set_count;
-            std::copy_n(resolved.begin(), set_count, set_slot->entries.begin());
+            std::copy_n(resolved->begin(), set_count, set_slot->entries.begin());
         } else {
             set_slot->key = 0;
         }
