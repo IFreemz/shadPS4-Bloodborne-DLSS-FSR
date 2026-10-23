@@ -397,25 +397,32 @@ void EmulatorSettingsImpl::MigrateNetworkKeys(const json& general, const json& n
 bool EmulatorSettingsImpl::UpdateBbDefaults(const json& file, bool game_specific) {
     const json gpu = file.contains("GPU") && file["GPU"].is_object() ? file["GPU"] : json::object();
     const auto saved = gpu.find("bb_defaults");
-    if (saved != gpu.end() && saved->is_number_integer() &&
-        saved->get<int>() >= BbDefaultsVersion) {
+    const int version = saved != gpu.end() && saved->is_number_integer() ? saved->get<int>() : 0;
+    if (version >= BbDefaultsVersion) {
         return false;
     }
     // Saved before these defaults: switch them on once. A game's file only overrides what it holds.
-    for (auto* setting : {&m_gpu.bb_buffer_eviction, &m_gpu.bb_background_texture_copies}) {
+    const auto switch_on = [&](Setting<bool>& setting) {
         if (!game_specific) {
-            setting->value = true;
-        } else if (setting->game_specific_value) {
-            setting->game_specific_value = true;
+            setting.value = true;
+        } else if (setting.game_specific_value) {
+            setting.game_specific_value = true;
         }
+    };
+    if (version < 1) {
+        switch_on(m_gpu.bb_buffer_eviction);
+        switch_on(m_gpu.bb_background_texture_copies);
+    }
+    if (version < 2) {
+        switch_on(m_gpu.bb_real_occlusion);
     }
     if (game_specific && m_gpu.bb_defaults.game_specific_value) {
         m_gpu.bb_defaults.game_specific_value = BbDefaultsVersion;
     }
     m_gpu.bb_defaults.value = BbDefaultsVersion;
     LOG_INFO(Config,
-             "Bloodborne settings: idle buffer freeing and background texture copies "
-             "switched on (new defaults, {} config)",
+             "Bloodborne settings: {}real occlusion tests switched on (new defaults, {} config)",
+             version < 1 ? "idle buffer freeing, background texture copies and " : "",
              game_specific ? "game" : "global");
     return true;
 }

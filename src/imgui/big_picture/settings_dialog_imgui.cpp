@@ -861,7 +861,7 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                     "    GPU interpolation where safe (testing, restart)",
                     bbHardwareInterpolationSetting,
                     "NVIDIA: less pixel shader code; shaders rebuilt after a change");
-                AddSettingCheckbox("    Real occlusion tests (testing)", bbRealOcclusionSetting,
+                AddSettingCheckbox("    Real occlusion tests", bbRealOcclusionSetting,
                                    "Areas hidden behind walls are skipped by the game");
                 AddSettingCheckbox("    Copy thread (testing, restart)", bbCopyThreadSetting,
                                    "Game memory copies for draws made on a thread of their own");

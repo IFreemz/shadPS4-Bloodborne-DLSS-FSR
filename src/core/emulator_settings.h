@@ -410,8 +410,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
 // -------------------------------
 // Bloodborne settings whose default changed to on are switched on once in configs saved before
 // (each saved config holds every value, so a new default never reached them). 1: "Also free idle
-// buffers" and "Background texture copies".
-constexpr int BbDefaultsVersion = 1;
+// buffers" and "Background texture copies". 2: "Real occlusion tests".
+constexpr int BbDefaultsVersion = 2;
 
 struct GPUSettings {
     Setting<u32> window_width{1280};
@@ -516,7 +516,7 @@ struct GPUSettings {
     Setting<bool> bb_hardware_interpolation{true};
     // Threaded renderer: the game's occlusion tests (one box per area behind walls) counted by
     // the GPU, so the game skips areas that are hidden. Off: every test reads "visible".
-    Setting<bool> bb_real_occlusion{false};
+    Setting<bool> bb_real_occlusion{true};
     // Threaded renderer: stage A's copies of game memory (constants, small vertex and index
     // data) made on a thread of their own; applies after a restart. Off: made by stage A.
     Setting<bool> bb_copy_thread{false};
