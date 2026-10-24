@@ -762,6 +762,9 @@ void Instance::CreateAllocator() {
         .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
         .physicalDevice = physical_device,
         .device = *device,
+        // 64 MiB blocks instead of 256: textures freed by the cache leave less half-empty
+        // memory behind (about 1 GB held but unused in big areas, pushing the rest out of VRAM).
+        .preferredLargeHeapBlockSize = 64_MB,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,
