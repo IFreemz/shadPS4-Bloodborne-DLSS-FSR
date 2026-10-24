@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
 # DLC start area: stutters after loading (investigation notes)
 
 Status as of 24 Oct 2026: load spikes and camera stutters fixed; the long "judder" after a
