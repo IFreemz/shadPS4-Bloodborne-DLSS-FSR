@@ -3,6 +3,8 @@
 
 #include <algorithm>
 
+#include <fmt/format.h>
+
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -97,6 +99,8 @@ void GpuProfiler::Collect(u32 which) {
     if (result != vk::Result::eSuccess) {
         return;
     }
+    std::unordered_map<u64, Total> frame_totals;
+    double frame_ms = 0;
     for (u32 i = 0; i + 1 < count; ++i) {
         if (stamps[i + 1] < stamps[i]) {
             continue;
@@ -105,8 +109,27 @@ void GpuProfiler::Collect(u32 which) {
         auto& total = totals[keys[which][i]];
         total.ms += ms;
         ++total.segments;
+        auto& in_frame = frame_totals[keys[which][i]];
+        in_frame.ms += ms;
+        ++in_frame.segments;
+        frame_ms += ms;
     }
     ++frames;
+    // A slow frame on its own (a 200 ms GPU wait after a respawn hides in the 10 s average):
+    // where its GPU time went.
+    if (frame_ms >= 50.0) {
+        std::vector<std::pair<u64, Total>> sorted(frame_totals.begin(), frame_totals.end());
+        std::ranges::sort(sorted,
+                          [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        std::string top;
+        for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); ++i) {
+            const auto& [key, total] = sorted[i];
+            top += fmt::format("{}{:.1f} ms x{} {}", i ? " | " : "", total.ms, total.segments,
+                               described[key]);
+        }
+        LOG_WARNING(Render_Vulkan, "GPU profile: slow frame, {:.1f} ms on the GPU in {} labels: {}",
+                    frame_ms, sorted.size(), top);
+    }
 }
 
 void GpuProfiler::Print() {
