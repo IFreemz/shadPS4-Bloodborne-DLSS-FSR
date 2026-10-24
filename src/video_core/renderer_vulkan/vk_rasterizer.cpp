@@ -1233,6 +1233,7 @@ void Rasterizer::OnSubmit() {
 
 void Rasterizer::OnGameFrame() {
     pipeline_cache.OnGameFrame();
+    texture_cache.OnGameFrame();
     if (draw_pipe && diagnostics.load(std::memory_order_relaxed)) {
         ReportHitch();
     } else {
@@ -1291,6 +1292,11 @@ void Rasterizer::LogVramReport() {
              images.gc_runs, images.evicted, images.written_back, images.skipped_stuck,
              images.skipped_written, mib(images.gc_used), mib(images.trigger), mib(images.pressure),
              mib(images.critical), images.loads);
+    LOG_INFO(Render,
+             "Spread loading: {} loads spread over frames, {} uploads put off to a later frame, "
+             "{} new textures shown black meanwhile ({} MiB)",
+             images.spread_loads, images.spread_deferred, images.spread_zero_filled,
+             mib(images.spread_zero_bytes));
 }
 
 void Rasterizer::ReportHitch() {
@@ -2325,7 +2331,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
                 // What FindTexture does first: returns at once for an image already found
                 // clean this GC tick, else refreshes it (as the full path would here).
-                texture_cache.UpdateImage(entry.id);
+                texture_cache.UpdateTexture(entry.id);
                 const auto& image = texture_cache.GetImage(entry.id);
                 hit = image.backing == entry.backing && !image.binding.needs_rebind &&
                       !image.binding.is_target && !image.binding.force_general &&

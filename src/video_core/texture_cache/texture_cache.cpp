@@ -857,8 +857,10 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
         }
+        UpdateImage(image_id);
+    } else {
+        UpdateTexture(image_id);
     }
-    UpdateImage(image_id);
     Common::GuestStats::DetailTimer timer{Common::GuestStats::Detail::TexView};
     return image.FindView(desc.view_info);
 }
@@ -1050,6 +1052,91 @@ bool TextureCache::PrepareRefresh(Image& image,
     return true;
 }
 
+bool TextureCache::DeferUpload(Image& image) {
+    // A load: this many uploads (and bytes) in one second; normal play stays well below (a
+    // burst of a few big textures, 280 MiB in 22, too). Then for SpreadSeconds each game
+    // frame uploads up to SpreadFrameBytes, the rest waits. A DLC respawn: ~1000 textures,
+    // ~450 MiB in one frame (130 ms) before; on the first load two more bursts follow 2-3 s
+    // later (22 textures, 280 MiB, then 180, 310 MiB): those are spread too.
+    constexpr u64 SpreadBurstUploads = 300;
+    constexpr u64 SpreadBurstBytes = 128_MB;
+    constexpr u64 SpreadSeconds = 6;
+    constexpr u64 SpreadFrameBytes = 64_MB;
+    constexpr u64 ZeroBufferBytes = 32_MB;
+    if (!spread_loads_enabled || !Common::BbTuning::Threaded() ||
+        False(image.flags & ImageFlagBits::CpuDirty) ||
+        True(image.flags & ImageFlagBits::GpuModified) || image.info.num_samples > 1 ||
+        image.info.props.is_depth || image.info.props.has_stencil || image.info.stencil_addr ||
+        image.info.guest_size > ZeroBufferBytes || !image.backing) {
+        return false;
+    }
+    namespace GS = Common::GuestStats;
+    const u64 second = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count());
+    const u64 uploads = GS::image_uploads.load(std::memory_order_relaxed);
+    const u64 bytes = GS::image_upload_bytes.load(std::memory_order_relaxed);
+    if (second != spread_window_second) {
+        spread_window_second = second;
+        spread_window_uploads = uploads;
+        spread_window_bytes = bytes;
+    }
+    if (uploads - spread_window_uploads >= SpreadBurstUploads &&
+        bytes - spread_window_bytes >= SpreadBurstBytes) {
+        if (second >= spread_until_second) {
+            ++spread_loads;
+        }
+        spread_until_second = second + SpreadSeconds;
+    }
+    if (second >= spread_until_second) {
+        return false;
+    }
+    const u64 used = spread_frame_bytes.load(std::memory_order_relaxed);
+    if (used == 0 || used + image.info.guest_size <= SpreadFrameBytes) {
+        spread_frame_bytes.store(used + image.info.guest_size, std::memory_order_relaxed);
+        return false;
+    }
+    ++spread_deferred;
+    // Never written yet (an image's first contents): zeros rather than whatever the memory held.
+    if (image.backing->state.layout == vk::ImageLayout::eUndefined &&
+        image.backing->subresource_states.empty()) {
+        if (!zero_buffer) {
+            zero_buffer = std::make_unique<Buffer>(instance, 0, ZeroBufferBytes,
+                                                   MemoryType::DeviceLocal, "SpreadLoads:Zeros");
+            runtime.FillBuffer(zero_buffer.get(), 0, ZeroBufferBytes, 0);
+        }
+        SmallVector<vk::BufferImageCopy, 14> copies;
+        for (u32 m = 0; m < image.info.resources.levels; m++) {
+            const u32 width = std::max(image.info.size.width >> m, 1u);
+            const u32 height = std::max(image.info.size.height >> m, 1u);
+            const u32 depth =
+                image.info.props.is_volume ? std::max(image.info.size.depth >> m, 1u) : 1u;
+            const auto [mip_size, mip_pitch, mip_height, mip_offset] = image.info.mips_layout[m];
+            copies.push_back({
+                .bufferOffset = 0,
+                .bufferRowLength = mip_pitch,
+                .bufferImageHeight = mip_height,
+                .imageSubresource{
+                    .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                    .mipLevel = m,
+                    .baseArrayLayer = 0,
+                    .layerCount = image.info.resources.layers,
+                },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {mip_pitch ? std::min<u32>(mip_pitch, width) : width,
+                                mip_height ? std::min<u32>(mip_height, height) : height, depth},
+            });
+        }
+        // UploadImage marks the image clean: it still needs its real upload.
+        const auto dirty = image.flags & ImageFlagBits::Dirty;
+        runtime.UploadImage(&image, zero_buffer.get(), copies);
+        image.flags |= dirty;
+        ++spread_zero_filled;
+        spread_zero_bytes += image.info.guest_size;
+    }
+    return true;
+}
+
 void TextureCache::RefreshImage(Image& image) {
     Common::Crumbs::Add("image upload (address, size)", image.info.guest_address,
                         image.info.guest_size);
@@ -1084,11 +1171,32 @@ void TextureCache::RefreshImage(Image& image) {
 }
 
 void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
+    // Spread area loading: uploads past this frame's budget wait (the image stays dirty, so a
+    // later draw binding it tries again).
+    SmallVector<ImageId, 16> deferred;
+    if (spread_loads_enabled) {
+        SmallVector<ImageId, 16> checked;
+        for (const ImageId image_id : image_ids) {
+            if (!image_id || IsClean(image_id) ||
+                std::ranges::find(checked, image_id) != checked.end()) {
+                continue;
+            }
+            checked.push_back(image_id);
+            Image& image = slot_images[image_id];
+            if (DeferUpload(image)) {
+                TouchImage(image);
+                deferred.push_back(image_id);
+            }
+        }
+    }
+    const auto is_deferred = [&](ImageId image_id) {
+        return !deferred.empty() && std::ranges::find(deferred, image_id) != deferred.end();
+    };
     // Images that need an upload; the rest go through UpdateImage as before.
     SmallVector<ImageId, 16> pending;
     if (EmulatorSettings.IsBbBatchedUploads()) {
         for (const ImageId image_id : image_ids) {
-            if (!image_id || IsClean(image_id)) {
+            if (!image_id || IsClean(image_id) || is_deferred(image_id)) {
                 continue;
             }
             Image& image = slot_images[image_id];
@@ -1104,7 +1212,7 @@ void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
     }
     if (pending.size() < 2) {
         for (const ImageId image_id : image_ids) {
-            if (image_id) {
+            if (image_id && !is_deferred(image_id)) {
                 UpdateImage(image_id);
             }
         }
@@ -1178,7 +1286,7 @@ void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
                                    std::memory_order_relaxed);
     // The usual bookkeeping (clean marking); the uploads are done.
     for (const ImageId image_id : image_ids) {
-        if (image_id) {
+        if (image_id && !is_deferred(image_id)) {
             UpdateImage(image_id);
         }
     }
@@ -1597,6 +1705,10 @@ TextureCache::MemoryReport TextureCache::TakeMemoryReport() {
     report.skipped_written = std::exchange(gc_skipped_written, 0);
     report.gc_runs = std::exchange(gc_runs, 0);
     report.loads = std::exchange(gc_loads, 0);
+    report.spread_loads = std::exchange(spread_loads, 0);
+    report.spread_deferred = std::exchange(spread_deferred, 0);
+    report.spread_zero_filled = std::exchange(spread_zero_filled, 0);
+    report.spread_zero_bytes = std::exchange(spread_zero_bytes, 0);
     return report;
 }
 
@@ -1642,6 +1754,7 @@ void TextureCache::GarbageCollectSamplers() {
 }
 
 void TextureCache::RunGarbageCollector() {
+    spread_loads_enabled = EmulatorSettings.IsBbSpreadLoads();
     SCOPE_EXIT {
         // Atomic: UpdateImage's fast path reads it without the lock.
         std::atomic_ref<u64>(gc_tick).store(gc_tick + 1, std::memory_order_release);

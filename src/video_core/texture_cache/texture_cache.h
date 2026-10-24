@@ -177,6 +177,21 @@ public:
         }
     }
 
+    /// UpdateImage for a sampled texture: while an area load is spread over frames, its upload
+    /// may wait for a later frame (it stays dirty: the next draw binding it tries again).
+    void UpdateTexture(ImageId image_id) {
+        if (spread_loads_enabled && !IsClean(image_id) && DeferUpload(slot_images[image_id])) {
+            TouchImage(slot_images[image_id]);
+            return;
+        }
+        UpdateImage(image_id);
+    }
+
+    /// Spread area loading: the per-frame upload budget starts again (each game frame).
+    void OnGameFrame() {
+        spread_frame_bytes.store(0, std::memory_order_relaxed);
+    }
+
     /// UpdateImage for the images a draw binds, with the uploads of those that need one recorded
     /// together (Batched texture uploads setting): detiles after one barrier, copies after
     /// another, one render pass break.
@@ -213,6 +228,10 @@ public:
 
     /// RefreshImage's checks and copy regions: false when there is nothing to upload.
     bool PrepareRefresh(Image& image, SmallVector<vk::BufferImageCopy, 14>& copies);
+
+    /// Spread area loading: whether this texture's upload waits for a later frame. A new
+    /// texture is filled with zeros (black) meanwhile.
+    bool DeferUpload(Image& image);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
@@ -376,6 +395,9 @@ public:
         u64 evicted{}, written_back{}, skipped_stuck{}, skipped_written{}; ///< since last report
         u64 gc_runs{};
         u64 loads{}; ///< area loads seen (upload bursts) since last report
+        u64 spread_loads{};    ///< loads spread over several frames
+        u64 spread_deferred{}; ///< uploads put off to a later frame (each try counted)
+        u64 spread_zero_filled{}, spread_zero_bytes{}; ///< new images shown black meanwhile
     };
     /// Fills a report and resets the collector counters. Call on the thread running the collector.
     MemoryReport TakeMemoryReport();
@@ -543,6 +565,12 @@ private:
     u64 load_window_bytes = 0; ///< image upload bytes at the start of this second
     u64 load_until_second = 0; ///< VRAM cleanup frees ahead of a load until this second
     u64 gc_loads = 0;
+    bool spread_loads_enabled = false;
+    std::atomic<u64> spread_frame_bytes{0}; ///< uploaded this game frame while spreading
+    u64 spread_window_second = 0, spread_window_uploads = 0, spread_window_bytes = 0;
+    u64 spread_until_second = 0;
+    std::unique_ptr<Buffer> zero_buffer; ///< zeros a new texture is filled from
+    u64 spread_loads = 0, spread_deferred = 0, spread_zero_filled = 0, spread_zero_bytes = 0;
     u64 gc_evicted = 0, gc_written_back = 0, gc_skipped_stuck = 0, gc_skipped_written = 0;
     u64 gc_runs = 0;
     Common::LRUCache<Image> image_lru_cache;

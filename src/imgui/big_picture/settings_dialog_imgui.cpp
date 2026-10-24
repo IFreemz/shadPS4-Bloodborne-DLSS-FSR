@@ -92,6 +92,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbHardwareInterpolationSetting = EmulatorSettings.IsBbHardwareInterpolation();
     bbRealOcclusionSetting = EmulatorSettings.IsBbRealOcclusion();
     bbCopyThreadSetting = EmulatorSettings.IsBbCopyThread();
+    bbSpreadLoadsSetting = EmulatorSettings.IsBbSpreadLoads();
     {
         // 0 (the game's own), 2, 4, 8, 16 -> 0..4
         const int samples = EmulatorSettings.GetBbAnisotropy();
@@ -187,6 +188,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbHardwareInterpolation(bbHardwareInterpolationSetting, isSpecific);
     EmulatorSettings.SetBbRealOcclusion(bbRealOcclusionSetting, isSpecific);
     EmulatorSettings.SetBbCopyThread(bbCopyThreadSetting, isSpecific);
+    EmulatorSettings.SetBbSpreadLoads(bbSpreadLoadsSetting, isSpecific);
     EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
                                      isSpecific);
     EmulatorSettings.SetBbDrawDataMemory(bbDrawDataMemorySetting, isSpecific);
@@ -865,6 +867,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Areas hidden behind walls are skipped by the game");
                 AddSettingCheckbox("    Copy thread (testing, restart)", bbCopyThreadSetting,
                                    "Game memory copies for draws made on a thread of their own");
+                AddSettingCheckbox("    Spread area loading (testing)", bbSpreadLoadsSetting,
+                                   "Respawns and area loads upload textures over a few frames");
             }
             // Sharper ground and stairs at an angle; applies after a restart.
             AddSettingCombo("Anisotropic filtering", bbAnisotropySetting, anisotropyOptions);
