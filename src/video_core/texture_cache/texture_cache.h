@@ -394,7 +394,7 @@ public:
         u64 trigger{}, pressure{}, critical{}, gc_used{};
         u64 evicted{}, written_back{}, skipped_stuck{}, skipped_written{}; ///< since last report
         u64 gc_runs{};
-        u64 loads{}; ///< area loads seen (upload bursts) since last report
+        u64 loads{};           ///< area loads seen (upload bursts) since last report
         u64 spread_loads{};    ///< loads spread over several frames
         u64 spread_deferred{}; ///< uploads put off to a later frame (each try counted)
         u64 spread_zero_filled{}, spread_zero_bytes{}; ///< new images shown black meanwhile

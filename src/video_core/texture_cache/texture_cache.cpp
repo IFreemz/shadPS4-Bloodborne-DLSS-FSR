@@ -1512,10 +1512,10 @@ void TextureCache::GarbageCollectImages() {
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         below_tick = gc_tick - ticks_to_destroy;
         if (vram_reclaim) {
-            const u64 idle = aggresive  ? 1
+            const u64 idle = aggresive              ? 1
                              : loading && pressured ? LoadIdleSeconds
-                             : pressured ? GcPressureIdleSeconds
-                                         : GcIdleSeconds;
+                             : pressured            ? GcPressureIdleSeconds
+                                                    : GcIdleSeconds;
             below_tick = std::min(below_tick, tick_seconds_ago(idle));
         }
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
@@ -1592,8 +1592,7 @@ void TextureCache::GarbageCollectImages() {
                     std::chrono::duration<double>(now - writeback_budget_time).count();
                 writeback_budget_time = now;
                 writeback_budget = std::min<double>(
-                    writeback_budget + elapsed * WRITEBACK_BYTES_PER_SECOND,
-                    WRITEBACK_BURST_BYTES);
+                    writeback_budget + elapsed * WRITEBACK_BYTES_PER_SECOND, WRITEBACK_BURST_BYTES);
                 if (writeback_budget <= 0.0) {
                     return false;
                 }
