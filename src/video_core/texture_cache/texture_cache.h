@@ -375,6 +375,7 @@ public:
         u64 trigger{}, pressure{}, critical{}, gc_used{};
         u64 evicted{}, written_back{}, skipped_stuck{}, skipped_written{}; ///< since last report
         u64 gc_runs{};
+        u64 loads{}; ///< area loads seen (upload bursts) since last report
     };
     /// Fills a report and resets the collector counters. Call on the thread running the collector.
     MemoryReport TakeMemoryReport();
@@ -539,6 +540,9 @@ private:
     std::chrono::steady_clock::time_point writeback_budget_time{};
     std::array<u64, 64> gc_tick_at_second{}; ///< VRAM cleanup: gc_tick at each of the last 64 s
     u64 gc_second = 0;
+    u64 load_window_bytes = 0; ///< image upload bytes at the start of this second
+    u64 load_until_second = 0; ///< VRAM cleanup frees ahead of a load until this second
+    u64 gc_loads = 0;
     u64 gc_evicted = 0, gc_written_back = 0, gc_skipped_stuck = 0, gc_skipped_written = 0;
     u64 gc_runs = 0;
     Common::LRUCache<Image> image_lru_cache;

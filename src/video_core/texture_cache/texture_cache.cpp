@@ -1351,6 +1351,14 @@ void TextureCache::GarbageCollectImages() {
     // of a second) evicted textures briefly off screen and uploaded them again.
     constexpr u64 GcIdleSeconds = 20;
     constexpr u64 GcPressureIdleSeconds = 5;
+    // Loading an area (a respawn in the DLC: 430 MiB of new textures in one frame) arrives while
+    // the old area's textures are still there, and VRAM went over budget (the driver then moved
+    // memory out: 200 ms GPU waits). So after a burst of uploads, textures unused for 2 s go
+    // from LoadHeadroom below the pressure mark, for LoadSeconds.
+    constexpr u64 LoadBurstBytes = 192_MB;
+    constexpr u64 LoadSeconds = 10;
+    constexpr u64 LoadIdleSeconds = 2;
+    constexpr u64 LoadHeadroom = 512_MB;
     const u64 second = static_cast<u64>(std::chrono::duration_cast<std::chrono::seconds>(
                                             std::chrono::steady_clock::now().time_since_epoch())
                                             .count());
@@ -1360,7 +1368,17 @@ void TextureCache::GarbageCollectImages() {
         }
         gc_second = second;
         gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+        load_window_bytes = Common::GuestStats::image_upload_bytes.load(std::memory_order_relaxed);
     }
+    if (vram_reclaim && Common::GuestStats::image_upload_bytes.load(std::memory_order_relaxed) -
+                                load_window_bytes >=
+                            LoadBurstBytes) {
+        if (second >= load_until_second) {
+            ++gc_loads;
+        }
+        load_until_second = second + LoadSeconds;
+    }
+    const bool loading = vram_reclaim && second < load_until_second;
     const auto tick_seconds_ago = [&](u64 seconds) {
         return gc_tick_at_second[(second - seconds) % gc_tick_at_second.size()];
     };
@@ -1379,13 +1397,17 @@ void TextureCache::GarbageCollectImages() {
     const u64 observed_usage = total_used_memory;
 
     const auto configure = [&](bool allow_aggressive) {
-        pressured = total_used_memory >= pressure_gc_memory;
+        pressured = total_used_memory >= pressure_gc_memory ||
+                    (loading && total_used_memory + LoadHeadroom >= pressure_gc_memory);
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         below_tick = gc_tick - ticks_to_destroy;
         if (vram_reclaim) {
-            const u64 idle = aggresive ? 1 : pressured ? GcPressureIdleSeconds : GcIdleSeconds;
+            const u64 idle = aggresive  ? 1
+                             : loading && pressured ? LoadIdleSeconds
+                             : pressured ? GcPressureIdleSeconds
+                                         : GcIdleSeconds;
             below_tick = std::min(below_tick, tick_seconds_ago(idle));
         }
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
@@ -1498,7 +1520,8 @@ void TextureCache::GarbageCollectImages() {
                 aggresive = false;
                 return vram_reclaim && num_deletions == 0;
             }
-            if (pressured && total_used_memory < pressure_gc_memory) {
+            if (pressured && total_used_memory < pressure_gc_memory &&
+                (!loading || total_used_memory + LoadHeadroom < pressure_gc_memory)) {
                 num_deletions >>= 1;
                 pressured = false;
             }
@@ -1573,6 +1596,7 @@ TextureCache::MemoryReport TextureCache::TakeMemoryReport() {
     report.skipped_stuck = std::exchange(gc_skipped_stuck, 0);
     report.skipped_written = std::exchange(gc_skipped_written, 0);
     report.gc_runs = std::exchange(gc_runs, 0);
+    report.loads = std::exchange(gc_loads, 0);
     return report;
 }
 

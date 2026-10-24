@@ -1286,10 +1286,11 @@ void Rasterizer::LogVramReport() {
              images.stuck.stale_count, mib(images.extra_backing_bytes));
     LOG_INFO(Render,
              "VRAM collector: {} runs, {} images freed ({} written back), skipped {} tiled and {} "
-             "GPU-written | measures {} MiB, starts at {}, pressure {}, critical {}",
+             "GPU-written | measures {} MiB, starts at {}, pressure {}, critical {} | {} area "
+             "loads (freeing ahead)",
              images.gc_runs, images.evicted, images.written_back, images.skipped_stuck,
              images.skipped_written, mib(images.gc_used), mib(images.trigger), mib(images.pressure),
-             mib(images.critical));
+             mib(images.critical), images.loads);
 }
 
 void Rasterizer::ReportHitch() {
