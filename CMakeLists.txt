@@ -41,6 +41,47 @@ option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
 
+# Profile-guided optimisation (clang / clang-cl). BB_PGO=generate: an instrumented build that
+# writes user/pgo/shadps4-<pid>.profraw when the emulator exits (play it to train the profile).
+# BB_PGO=<path of a .profdata>: built with that profile. Empty: off.
+set(BB_PGO "" CACHE STRING "PGO: empty (off), generate, or the path of a .profdata file")
+if (NOT BB_PGO STREQUAL "")
+    if (NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        message(FATAL_ERROR "BB_PGO needs clang or clang-cl")
+    endif()
+    if (BB_PGO STREQUAL "generate")
+        add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-generate>)
+        add_compile_definitions(BB_PGO_GENERATE)
+        if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+            # lld-link / link.exe take the profile runtime as a library.
+            execute_process(COMMAND ${CMAKE_CXX_COMPILER} /clang:-print-resource-dir
+                            OUTPUT_VARIABLE BB_CLANG_RESOURCE_DIR
+                            OUTPUT_STRIP_TRAILING_WHITESPACE)
+            file(GLOB_RECURSE BB_PROFILE_RUNTIME "${BB_CLANG_RESOURCE_DIR}/lib/*clang_rt.profile*.lib")
+            list(FILTER BB_PROFILE_RUNTIME INCLUDE REGEX "x86_64|x86_64-pc-windows-msvc")
+            if (NOT BB_PROFILE_RUNTIME)
+                message(FATAL_ERROR "BB_PGO=generate: clang_rt.profile not found in ${BB_CLANG_RESOURCE_DIR}")
+            endif()
+            list(GET BB_PROFILE_RUNTIME 0 BB_PROFILE_RUNTIME)
+            message(STATUS "PGO: instrumented build, profile runtime ${BB_PROFILE_RUNTIME}")
+            link_libraries("${BB_PROFILE_RUNTIME}")
+        else()
+            add_link_options(-fprofile-instr-generate)
+            message(STATUS "PGO: instrumented build")
+        endif()
+    else()
+        if (NOT EXISTS "${BB_PGO}")
+            message(FATAL_ERROR "BB_PGO: profile ${BB_PGO} not found")
+        endif()
+        message(STATUS "PGO: using ${BB_PGO}")
+        add_compile_options(
+            "$<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-use=${BB_PGO}>"
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-unprofiled>
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-out-of-date>
+            $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-profile-instr-missing>)
+    endif()
+endif()
+
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
 if (APPLE AND CMAKE_OSX_ARCHITECTURES)
     set(BASE_ARCHITECTURE "${CMAKE_OSX_ARCHITECTURES}")

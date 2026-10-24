@@ -23,6 +23,12 @@ on:
         description: "What this build is for (shown as the run's name)"
         required: false
         type: string
+      pgo:
+        description: "PGO: auto (use the profiles in pgo/ if any), off, or generate (a training build)"
+        required: false
+        default: auto
+        type: choice
+        options: [auto, off, generate]
 
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
@@ -112,8 +118,38 @@ jobs:
         path: streamline-sdk
         sparse-checkout: include
 
+    # PGO: a training build (generate), or the profiles committed in pgo/ (.profraw from a
+    # training build, or .profdata) merged with this runner's llvm-profdata and used.
+    - name: PGO profile
+      id: pgo
+      shell: pwsh
+      run: |
+        $mode = "${{ inputs.pgo }}"
+        if (-not $mode) { $mode = "auto" }
+        $flag = ""
+        $suffix = ""
+        if ($mode -eq "generate") {
+          $flag = "-DBB_PGO=generate"
+          $suffix = "-pgo-training"
+        } elseif ($mode -eq "auto") {
+          $profiles = @(Get-ChildItem -Path pgo -Recurse -File -Include *.profraw,*.profdata -ErrorAction SilentlyContinue)
+          if ($profiles.Count -gt 0) {
+            $bin = Split-Path (Get-Command clang-cl).Source
+            & "$bin\llvm-profdata.exe" merge "-output=${{github.workspace}}\bb.profdata" $profiles.FullName
+            if ($LASTEXITCODE -eq 0) {
+              $flag = "-DBB_PGO=${{github.workspace}}/bb.profdata"
+              $suffix = "-pgo"
+              Write-Host "PGO: $($profiles.Count) profile(s) merged"
+            } else {
+              Write-Host "PGO: merging failed, building without a profile"
+            }
+          }
+        }
+        "flag=$flag" >> $env:GITHUB_OUTPUT
+        "suffix=$suffix" >> $env:GITHUB_OUTPUT
+
     - name: Configure CMake
-      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DBB_STREAMLINE_DIR=${{github.workspace}}/streamline-sdk
+      run: cmake --fresh -G Ninja -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DBB_STREAMLINE_DIR=${{github.workspace}}/streamline-sdk ${{ steps.pgo.outputs.flag }}
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $env:NUMBER_OF_PROCESSORS
@@ -121,5 +157,5 @@ jobs:
     - name: Upload Windows SDL artifact
       uses: actions/upload-artifact@v7
       with:
-        name: shadPS4-exe-only-win64-${{ needs.get-info.outputs.shorthash }}
+        name: shadPS4-exe-only-win64-${{ needs.get-info.outputs.shorthash }}${{ steps.pgo.outputs.suffix }}
         path: ${{github.workspace}}/build/shadPS4.exe

@@ -106,6 +106,13 @@ void ShutdownDlss() {
 
 std::mutex exit_mutex{};
 
+#ifdef BB_PGO_GENERATE
+// PGO training build: the profile runtime writes its counters at exit, but the emulator ends
+// with quick_exit (no atexit), so they are written from the quick_exit handler.
+extern "C" int __llvm_profile_write_file(void);
+extern "C" void __llvm_profile_set_filename(const char*);
+#endif
+
 Emulator::Emulator() {
     // Initialize NT API functions, set high priority and disable WER
 #ifdef _WIN32
@@ -117,7 +124,19 @@ Emulator::Emulator() {
     WSADATA wsaData;
     WSAStartup(versionWanted, &wsaData);
 #endif
+#ifdef BB_PGO_GENERATE
+    {
+        const auto dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "pgo";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        static const std::string profile_file = (dir / "shadps4-%p.profraw").string();
+        __llvm_profile_set_filename(profile_file.c_str());
+    }
+#endif
     std::at_quick_exit([]() {
+#ifdef BB_PGO_GENERATE
+        __llvm_profile_write_file();
+#endif
         const bool restarting = Core::BbResolution::restarting;
         // A restart ends the process below without the DLLs' own shutdown, so NGX needs no
         // release first (it waits for the GPU thread, which once took 12 s and stuttered sound).

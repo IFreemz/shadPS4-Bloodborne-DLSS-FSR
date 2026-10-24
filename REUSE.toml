@@ -44,6 +44,12 @@ SPDX-FileCopyrightText = "shadPS4 Emulator Project"
 SPDX-License-Identifier = "GPL-2.0-or-later"
 
 [[annotations]]
+path = ["pgo/*.profraw", "pgo/*.profdata"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "shadPS4 Emulator Project"
+SPDX-License-Identifier = "GPL-2.0-or-later"
+
+[[annotations]]
 path = "documents/dlss/*"
 precedence = "aggregate"
 SPDX-FileCopyrightText = [
