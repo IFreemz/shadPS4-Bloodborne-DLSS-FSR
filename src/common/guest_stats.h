@@ -57,6 +57,19 @@ inline std::atomic<u64> staging_allocation_ns{0};
 inline std::atomic<u64> resident_ns{0};
 /// Background texture copies: started, and time spent waiting for them (submission, fences).
 inline std::atomic<u64> async_copies{0};
+/// Presentation (the swap thread): time in acquiring a window image, in presenting it, and
+/// waiting for a free presentation frame (its previous present done), and frames presented.
+inline std::atomic<u64> present_acquire_ns{0};
+inline std::atomic<u64> present_queue_ns{0};
+inline std::atomic<u64> present_frame_wait_ns{0};
+inline std::atomic<u64> presents{0};
+/// GPU timeline of the draw scheduler's submissions (diagnostics; results come in a frame or
+/// two late): time executing them and the gaps between them, and submissions measured.
+inline std::atomic<u64> gpu_timeline_busy_ns{0};
+inline std::atomic<u64> gpu_timeline_idle_ns{0};
+inline std::atomic<u64> gpu_timeline_submits{0};
+/// Time the CPU spent in the queue submit call itself (the driver can block there).
+inline std::atomic<u64> queue_submit_ns{0};
 inline std::atomic<u64> async_copy_wait_ns{0};
 /// Diagnostics setting is on (the rasterizer sets it): extra bookkeeping for the reports.
 inline std::atomic<bool> diagnostics{false};

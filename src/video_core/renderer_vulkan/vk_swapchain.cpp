@@ -60,6 +60,8 @@ void Swapchain::Create(u32 width_, u32 height_) {
     const vk::SharingMode sharing_mode =
         exclusive ? vk::SharingMode::eExclusive : vk::SharingMode::eConcurrent;
     const auto format = needs_hdr ? SURFACE_FORMAT_HDR : surface_format;
+    LOG_INFO(Render_Vulkan, "Swapchain: {}x{}, present mode {} (setting {}), {} images", width,
+             height, vk::to_string(present_mode), EmulatorSettings.GetPresentMode(), image_count);
     const vk::SwapchainCreateInfoKHR swapchain_info = {
         .surface = surface,
         .minImageCount = image_count,

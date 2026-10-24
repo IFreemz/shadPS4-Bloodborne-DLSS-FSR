@@ -6,9 +6,11 @@
 #include "common/crash_crumbs.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "common/guest_stats.h"
 #include "common/io_file.h"
 #include "common/number_utils.h"
 #include "common/path_util.h"
+#include "common/scope_exit.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -1265,7 +1267,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     const auto acquire_image = [&] {
         FrameGen::TimingScope timing{"acquire"};
-        return swapchain.AcquireNextImage();
+        const auto start = std::chrono::steady_clock::now();
+        const bool acquired = swapchain.AcquireNextImage();
+        Common::GuestStats::present_acquire_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 start)
+                .count(),
+            std::memory_order_relaxed);
+        return acquired;
     };
     if (!acquire_image()) {
         {
@@ -1530,7 +1539,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         bool presented;
         {
             FrameGen::TimingScope timing{"queue_present"};
+            const auto start = std::chrono::steady_clock::now();
             presented = swapchain.Present();
+            Common::GuestStats::present_queue_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count(),
+                std::memory_order_relaxed);
+            Common::GuestStats::presents.fetch_add(1, std::memory_order_relaxed);
             FrameGen::ReplayPresentStall(true);
         }
         if (is_game_frame && !is_reusing_frame) {
@@ -1557,6 +1573,14 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 }
 
 Frame* Presenter::GetRenderFrame() {
+    const auto wait_start = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        Common::GuestStats::present_frame_wait_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 wait_start)
+                .count(),
+            std::memory_order_relaxed);
+    };
     // Wait for free presentation frames
     Frame* frame;
     {

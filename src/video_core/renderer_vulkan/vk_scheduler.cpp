@@ -469,7 +469,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     };
 
     ImGui::Core::TextureManager::Submit();
+    const auto submit_start = std::chrono::steady_clock::now();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    Common::GuestStats::queue_submit_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             submit_start)
+            .count(),
+        std::memory_order_relaxed);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     work_semaphore.Refresh();
@@ -491,11 +497,14 @@ void Scheduler::CollectGpuTiming() {
         if (result != vk::Result::eSuccess || stamps[1] < stamps[0]) {
             continue;
         }
-        gpu_busy_ns.fetch_add(static_cast<u64>((stamps[1] - stamps[0]) * timer_period_ns),
-                              std::memory_order_relaxed);
+        const u64 busy = static_cast<u64>((stamps[1] - stamps[0]) * timer_period_ns);
+        gpu_busy_ns.fetch_add(busy, std::memory_order_relaxed);
+        Common::GuestStats::gpu_timeline_busy_ns.fetch_add(busy, std::memory_order_relaxed);
+        Common::GuestStats::gpu_timeline_submits.fetch_add(1, std::memory_order_relaxed);
         if (timer_last_end != 0 && stamps[0] > timer_last_end) {
-            gpu_idle_ns.fetch_add(static_cast<u64>((stamps[0] - timer_last_end) * timer_period_ns),
-                                  std::memory_order_relaxed);
+            const u64 idle = static_cast<u64>((stamps[0] - timer_last_end) * timer_period_ns);
+            gpu_idle_ns.fetch_add(idle, std::memory_order_relaxed);
+            Common::GuestStats::gpu_timeline_idle_ns.fetch_add(idle, std::memory_order_relaxed);
         }
         timer_last_end = stamps[1];
         gpu_submits.fetch_add(1, std::memory_order_relaxed);
