@@ -89,6 +89,7 @@ private:
     std::array<Ring, NUM_TYPES> rings;
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
     u64 frame = 0;
+    size_t min_upload_blocks = 0;
     std::chrono::steady_clock::time_point frame_time{};
 };
 

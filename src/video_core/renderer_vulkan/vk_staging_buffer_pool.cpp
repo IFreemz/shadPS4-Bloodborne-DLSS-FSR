@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstring>
 
+#include <SDL3/SDL_cpuinfo.h>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/bb_tuning.h"
@@ -34,7 +36,10 @@ constexpr auto FRAME_PERIOD = std::chrono::milliseconds(16);
 // Upload blocks (16 MiB each) allocated at startup and always kept: streaming a new area uploads
 // 200-450 MiB in one frame, and allocating pinned memory mid-game once took 176 ms for 144 MiB
 // (and copies into fresh pages are slower). Large dedicated uploads are kept ~10 s.
-constexpr size_t MIN_UPLOAD_BLOCKS = 24;
+// Entering a big area (the DLC) still needed ~1 GiB: 67 more blocks in that one frame, 66 ms.
+// So with 16 GB of RAM or more, 1 GiB is kept ready (384 MiB below that).
+constexpr size_t MIN_UPLOAD_BLOCKS_SMALL = 24;
+constexpr size_t MIN_UPLOAD_BLOCKS_LARGE = 64;
 constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
 constexpr u64 BLOCK_SIZE = 16_MB;
 
@@ -53,8 +58,10 @@ StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& sched
         return;
     }
     // Allocated and touched now, so the pages are committed before the game streams.
+    min_upload_blocks =
+        SDL_GetSystemRAM() >= 15 * 1024 ? MIN_UPLOAD_BLOCKS_LARGE : MIN_UPLOAD_BLOCKS_SMALL;
     auto& ring = rings[u32(MemoryType::HostUncached)];
-    for (size_t i = 0; i < MIN_UPLOAD_BLOCKS; ++i) {
+    for (size_t i = 0; i < min_upload_blocks; ++i) {
         auto& block = ring.blocks.emplace_back(Block{
             .buffer = std::make_unique<VideoCore::StreamBuffer>(
                 instance, scheduler, MemoryType::HostUncached, BLOCK_SIZE),
@@ -203,7 +210,7 @@ void StagingBufferPool::TickFrame() {
     }
     ++frame;
     for (size_t type = 0; type < rings.size(); ++type) {
-        TrimRing(rings[type], streaming && type == u32(MemoryType::HostUncached) ? MIN_UPLOAD_BLOCKS
+        TrimRing(rings[type], streaming && type == u32(MemoryType::HostUncached) ? min_upload_blocks
                                                                                  : size_t{0});
     }
     for (auto& cache : large_caches) {
