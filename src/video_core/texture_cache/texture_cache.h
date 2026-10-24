@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -534,6 +535,8 @@ private:
         Vulkan::StagingBufferRef download;
     };
     std::vector<PendingWriteBack> pending_writebacks;
+    double writeback_budget = 0.0;
+    std::chrono::steady_clock::time_point writeback_budget_time{};
     std::array<u64, 64> gc_tick_at_second{}; ///< VRAM cleanup: gc_tick at each of the last 64 s
     u64 gc_second = 0;
     u64 gc_evicted = 0, gc_written_back = 0, gc_skipped_stuck = 0, gc_skipped_written = 0;

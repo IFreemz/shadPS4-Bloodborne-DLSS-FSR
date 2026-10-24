@@ -36,6 +36,11 @@ static constexpr size_t MAX_GC_WRITEBACKS = 4;
 static constexpr u64 WRITEBACK_RETRY_TICKS = 600;
 // Write-back copies in flight at once (each holds a staging buffer the size of its image).
 static constexpr size_t MAX_PENDING_WRITEBACKS = 8;
+// Write-backs are GPU copies into system memory: started together (a cleanup pass over the
+// pressure mark) they showed as 30-75 ms GPU waits while turning the camera. So they are paced:
+// about 128 MiB a second, at most 16 MiB at once (an image larger than that goes on its own).
+static constexpr u64 WRITEBACK_BYTES_PER_SECOND = 128_MB;
+static constexpr u64 WRITEBACK_BURST_BYTES = 16_MB;
 static constexpr u32 MAX_SAMPLERS = std::numeric_limits<u16>::max();
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -1452,13 +1457,25 @@ void TextureCache::GarbageCollectImages() {
                     pending_writebacks.size() >= MAX_PENDING_WRITEBACKS) {
                     return false;
                 }
+                const auto now = std::chrono::steady_clock::now();
+                const double elapsed =
+                    std::chrono::duration<double>(now - writeback_budget_time).count();
+                writeback_budget_time = now;
+                writeback_budget = std::min<double>(
+                    writeback_budget + elapsed * WRITEBACK_BYTES_PER_SECOND,
+                    WRITEBACK_BURST_BYTES);
+                if (writeback_budget <= 0.0) {
+                    return false;
+                }
                 // A failed write-back is likely to fail again.
                 const auto retry = writeback_retry.find(image_id.index);
                 if (retry != writeback_retry.end() && gc_tick < retry->second) {
                     return false;
                 }
                 ++writebacks;
+                writeback_budget -= static_cast<double>(image.info.guest_size);
                 if (!BeginWriteBack(image_id)) {
+                    writeback_budget += static_cast<double>(image.info.guest_size);
                     writeback_retry[image_id.index] = gc_tick + WRITEBACK_RETRY_TICKS;
                     ++failed_writebacks;
                     return false;
