@@ -116,8 +116,12 @@ void GpuProfiler::Collect(u32 which) {
     }
     ++frames;
     // A slow frame on its own (a 200 ms GPU wait after a respawn hides in the 10 s average):
-    // where its GPU time went.
-    if (frame_ms >= 50.0) {
+    // where its GPU time went. Slow: 50 ms, or twice the recent usual (seconds of 30 ms frames
+    // after a respawn, with 12 ms usual).
+    const bool slow =
+        frame_ms >= 50.0 || (usual_ms > 0.0 && frame_ms >= 2.0 * usual_ms && frame_ms >= 20.0);
+    usual_ms = usual_ms == 0.0 ? frame_ms : usual_ms * 0.95 + std::min(frame_ms, 50.0) * 0.05;
+    if (slow) {
         std::vector<std::pair<u64, Total>> sorted(frame_totals.begin(), frame_totals.end());
         std::ranges::sort(sorted,
                           [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
@@ -127,8 +131,9 @@ void GpuProfiler::Collect(u32 which) {
             top += fmt::format("{}{:.1f} ms x{} {}", i ? " | " : "", total.ms, total.segments,
                                described[key]);
         }
-        LOG_WARNING(Render_Vulkan, "GPU profile: slow frame, {:.1f} ms on the GPU in {} labels: {}",
-                    frame_ms, sorted.size(), top);
+        LOG_WARNING(Render_Vulkan,
+                    "GPU profile: slow frame, {:.1f} ms on the GPU (usual {:.1f}) in {} labels: {}",
+                    frame_ms, usual_ms, sorted.size(), top);
     }
 }
 

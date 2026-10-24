@@ -74,6 +74,7 @@ private:
     };
     std::unordered_map<u64, Total> totals;
     u64 frames = 0;
+    double usual_ms = 0.0; ///< recent GPU time per frame (slow frames logged against it)
     std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
 };
 
