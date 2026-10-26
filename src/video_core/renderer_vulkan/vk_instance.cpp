@@ -221,6 +221,30 @@ std::string Instance::GetDriverVersionName() {
     return GetReadableVersion(version);
 }
 
+vk::SampleCountFlags Instance::GetImageSampleCounts(
+    const vk::PhysicalDeviceImageFormatInfo2& info) const {
+    const u64 key = (u64(static_cast<u32>(info.format)) << 40) ^
+                    (u64(static_cast<u32>(info.type)) << 36) ^
+                    (u64(static_cast<u32>(info.tiling)) << 34) ^
+                    (u64(static_cast<VkImageUsageFlags>(info.usage)) << 12) ^
+                    u64(static_cast<VkImageCreateFlags>(info.flags));
+    std::scoped_lock lock{image_sample_counts_mutex};
+    if (const auto it = image_sample_counts.find(key); it != image_sample_counts.end()) {
+        return it->second;
+    }
+    const auto properties = physical_device.getImageFormatProperties2(info);
+    if (properties.result == vk::Result::eErrorFormatNotSupported) {
+        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
+                  vk::to_string(info.format), vk::to_string(info.type), vk::to_string(info.flags),
+                  vk::to_string(info.usage));
+    }
+    const vk::SampleCountFlags counts = properties.result == vk::Result::eSuccess
+                                            ? properties.value.imageFormatProperties.sampleCounts
+                                            : vk::SampleCountFlagBits::e1;
+    image_sample_counts.emplace(key, counts);
+    return counts;
+}
+
 bool Instance::CreateDevice() {
     const vk::StructureChain feature_chain = physical_device.getFeatures2<
         vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,

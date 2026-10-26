@@ -1375,6 +1375,10 @@ void Rasterizer::ReportHitch() {
     now.queue_ops_behind_present = GS::queue_ops_behind_present.load(std::memory_order_relaxed);
     now.skipped_bytes = GS::image_skipped_bytes.load(std::memory_order_relaxed);
     now.direct_bytes = GS::image_direct_bytes.load(std::memory_order_relaxed);
+    now.allocs = GS::image_allocs.load(std::memory_order_relaxed);
+    now.alloc_ns = GS::image_alloc_ns.load(std::memory_order_relaxed);
+    now.slow_allocs = GS::image_slow_allocs.load(std::memory_order_relaxed);
+    now.slow_alloc_ns = GS::image_slow_alloc_ns.load(std::memory_order_relaxed);
     for (size_t i = 0; i < now.upload_ages.size(); ++i) {
         now.upload_ages[i] = GS::upload_age_bytes[i].load(std::memory_order_relaxed);
     }
@@ -1606,13 +1610,17 @@ void Rasterizer::ReportHitch() {
             LOG_WARNING(
                 Render_Vulkan,
                 "Stutter detail: new textures: protect {:.1f}, data to staging {:.1f}, detile "
-                "{:.1f}, upload record {:.1f}, views {:.1f}, create {:.1f} ms | buffers: find, "
+                "{:.1f}, upload record {:.1f}, views {:.1f}, create {:.1f} ms (texture memory "
+                "{:.1f} ms for {}, {} of them new memory blocks taking {:.1f} ms) | buffers: find, "
                 "mark and protect {:.1f}, staging and copy {:.1f} ms | page protection on the "
                 "draw recorder: {} calls, {:.1f} ms",
                 detail(GS::Detail::TexTrack), detail(GS::Detail::TexStaging),
                 detail(GS::Detail::TexDetile), detail(GS::Detail::TexUpload),
                 detail(GS::Detail::TexView), detail(GS::Detail::TexCreate),
-                detail(GS::Detail::BufTrack), detail(GS::Detail::BufCopy),
+                ms_of(delta(now.alloc_ns, last.alloc_ns)), delta(now.allocs, last.allocs),
+                delta(now.slow_allocs, last.slow_allocs),
+                ms_of(delta(now.slow_alloc_ns, last.slow_alloc_ns)), detail(GS::Detail::BufTrack),
+                detail(GS::Detail::BufCopy),
                 delta(now.recorder_protect_calls, last.recorder_protect_calls),
                 detail(GS::Detail::RecorderProtect));
         }

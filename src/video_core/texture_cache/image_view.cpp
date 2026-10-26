@@ -152,6 +152,9 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     const auto view_aspect = aspect & vk::ImageAspectFlagBits::eDepth     ? "Depth"
                              : aspect & vk::ImageAspectFlagBits::eStencil ? "Stencil"
                                                                           : "Color";
+    if (!Vulkan::ImageDebugNamesWanted()) {
+        return;
+    }
     Vulkan::SetObjectName(
         instance.GetDevice(), *image_view, "ImageView {}x{}x{} {:#x}:{:#x} {}:{} {}:{} ({})",
         image.info.size.width, image.info.size.height, image.info.size.depth,

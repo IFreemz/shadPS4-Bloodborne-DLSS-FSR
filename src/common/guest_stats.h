@@ -59,6 +59,11 @@ inline std::array<std::atomic<u64>, static_cast<size_t>(DirtySource::Count) * Up
     upload_age_bytes{};
 /// Copy only kept texture levels: guest bytes of left-out levels not copied for uploads.
 inline std::atomic<u64> image_skipped_bytes{0};
+/// Texture memory allocations (vmaCreateImage): all, and those over 1 ms (a new memory block).
+inline std::atomic<u64> image_allocs{0};
+inline std::atomic<u64> image_alloc_ns{0};
+inline std::atomic<u64> image_slow_allocs{0};
+inline std::atomic<u64> image_slow_alloc_ns{0};
 /// Direct texture copies: guest bytes copied from the game's own addresses.
 inline std::atomic<u64> image_direct_bytes{0};
 /// Buffer data uploaded from guest memory, and the time the copies took.

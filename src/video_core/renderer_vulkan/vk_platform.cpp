@@ -431,6 +431,14 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     return std::move(instance);
 }
 
+bool ImageDebugNamesWanted() {
+    static const bool wanted =
+        EmulatorSettings.IsRenderdocEnabled() || EmulatorSettings.IsVkValidationEnabled() ||
+        EmulatorSettings.IsVkCrashDiagnosticEnabled() ||
+        EmulatorSettings.IsVkHostMarkersEnabled() || EmulatorSettings.IsVkGuestMarkersEnabled();
+    return wanted;
+}
+
 vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance) {
     const vk::DebugUtilsMessengerCreateInfoEXT msg_ci = {
         .messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |

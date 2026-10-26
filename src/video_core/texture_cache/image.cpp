@@ -3,10 +3,15 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include "common/assert.h"
+#include "common/guest_stats.h"
+#include "common/scope_exit.h"
 #include "core/emulator_settings.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -159,6 +164,21 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci, std::source_locati
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
+    // Timed for the stutter report: a slow one (over 1 ms) is the allocator taking a new block of
+    // graphics card memory from the driver.
+    const auto alloc_start = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        const u64 ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - alloc_start)
+                                            .count());
+        namespace GS = Common::GuestStats;
+        GS::image_alloc_ns.fetch_add(ns, std::memory_order_relaxed);
+        GS::image_allocs.fetch_add(1, std::memory_order_relaxed);
+        if (ns >= 1'000'000) {
+            GS::image_slow_alloc_ns.fetch_add(ns, std::memory_order_relaxed);
+            GS::image_slow_allocs.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
     if (result == VK_ERROR_FEATURE_NOT_PRESENT && alloc_ci.pool) {
@@ -185,11 +205,24 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci, std::source_locati
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
-    std::string_view file = owner.file_name();
-    if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
-        file = file.substr(slash + 1);
+    // VRAM report owner: named once per creating line, not formatted for every texture.
+    static std::mutex owners_mutex;
+    static std::unordered_map<u64, u32> owners;
+    const u64 owner_key =
+        (std::bit_cast<u64>(owner.file_name()) << 16) ^ static_cast<u64>(owner.line());
+    {
+        std::scoped_lock lock{owners_mutex};
+        if (const auto it = owners.find(owner_key); it != owners.end()) {
+            vram_owner = it->second;
+        } else {
+            std::string_view file = owner.file_name();
+            if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+                file = file.substr(slash + 1);
+            }
+            vram_owner = VramOwners::Register(fmt::format("images from {}:{}", file, owner.line()));
+            owners.emplace(owner_key, vram_owner);
+        }
     }
-    vram_owner = VramOwners::Register(fmt::format("images from {}:{}", file, owner.line()));
     VramOwners::Track(vram_owner, allocator, allocation, true);
 }
 
@@ -231,16 +264,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .usage = usage_flags,
         .flags = flags,
     };
-    const auto image_format_properties =
-        instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
-        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
-                  vk::to_string(supported_format), vk::to_string(format_info.type),
-                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
-    }
-    supported_samples = image_format_properties.result == vk::Result::eSuccess
-                            ? image_format_properties.value.imageFormatProperties.sampleCounts
-                            : vk::SampleCountFlagBits::e1;
+    supported_samples = instance.GetImageSampleCounts(format_info);
     dropped_levels = LevelsToDrop(info);
 
     const vk::ImageCreateInfo image_ci = {
@@ -265,6 +289,9 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
     backing->image.Create(image_ci);
 
+    if (!Vulkan::ImageDebugNamesWanted()) {
+        return;
+    }
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
                           info.size.height, info.size.depth, AmdGpu::NameOf(info.tile_mode),

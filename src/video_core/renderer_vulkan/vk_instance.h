@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <unordered_map>
 
@@ -90,6 +91,11 @@ public:
 
     /// A queue for GPU readbacks that runs beside rendering (a copy engine when there is one):
     /// a readback then waits only for the work that wrote its data, not all queued work.
+    /// Sample counts an image with these properties supports (vkGetPhysicalDeviceImageFormat-
+    /// Properties2, remembered: a traversal burst creates ~200 textures in a frame, mostly of a few
+    /// kinds). 1 when the format is not supported.
+    vk::SampleCountFlags GetImageSampleCounts(const vk::PhysicalDeviceImageFormatInfo2& info) const;
+
     bool HasReadbackQueue() const {
         return bool(readback_queue);
     }
@@ -616,6 +622,8 @@ private:
     bool vertex_input_dynamic_state{};
     bool list_restart{};
     bool provoking_vertex{};
+    mutable std::mutex image_sample_counts_mutex;
+    mutable std::unordered_map<u64, vk::SampleCountFlags> image_sample_counts;
     bool shader_stencil_export{};
     bool image_load_store_lod{};
     bool amd_gcn_shader{};

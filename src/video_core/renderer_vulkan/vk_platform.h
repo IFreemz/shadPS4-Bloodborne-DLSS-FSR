@@ -30,6 +30,11 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
 vk::UniqueDebugUtilsMessengerEXT CreateDebugCallback(vk::Instance instance);
 
+/// Debug names on textures and their views are only read by debugging tools (RenderDoc,
+/// validation, crash diagnostics, markers): naming each one (a formatted string and a driver call)
+/// is skipped otherwise. A traversal burst creates ~200 textures in one frame.
+bool ImageDebugNamesWanted();
+
 template <typename T>
 concept VulkanHandleType = vk::isVulkanHandleType<T>::value;
 
