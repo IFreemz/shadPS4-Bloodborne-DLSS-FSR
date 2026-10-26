@@ -66,11 +66,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
     {
         const int copy_threads = EmulatorSettings.GetBbCopyThreads();
-        const u32 workers = Common::CopyPool::Configure(
-            Common::BbTuning::IsBloodborne(Common::ElfInfo::Instance().GameSerial()) &&
-                    copy_threads > 0
-                ? static_cast<u32>(copy_threads)
-                : 0u);
+        const bool bloodborne =
+            Common::BbTuning::IsBloodborne(Common::ElfInfo::Instance().GameSerial());
+        const u32 workers =
+            Common::CopyPool::Configure(!bloodborne        ? 0u
+                                        : copy_threads > 0 ? static_cast<u32>(copy_threads)
+                                                           : Common::CopyPool::AutoWorkers());
         LOG_INFO(Render_Vulkan, "Copy threads: {} (setting {})", workers,
                  copy_threads > 0 ? std::to_string(copy_threads) : std::string{"auto"});
     }

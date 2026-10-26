@@ -10,6 +10,7 @@
 #include <cmrc/cmrc.hpp>
 #include <stb_image.h>
 
+#include "common/copy_pool.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -104,7 +105,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbDirectTextureCopiesSetting = EmulatorSettings.IsBbDirectTextureCopies();
     {
         const int threads = EmulatorSettings.GetBbCopyThreads();
-        bbCopyThreadsSetting = threads >= 8 ? 2 : threads >= 6 ? 1 : 0;
+        bbCopyThreadsSetting = threads >= 8 ? 3 : threads >= 6 ? 2 : threads >= 4 ? 1 : 0;
     }
     bbCachedTextureStagingSetting = EmulatorSettings.IsBbCachedTextureStaging();
     bbSpreadLoadsSetting = EmulatorSettings.IsBbSpreadLoads();
@@ -213,8 +214,8 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbRenderDuringPresent(bbRenderDuringPresentSetting, isSpecific);
     EmulatorSettings.SetBbSkipLeftOutLevels(bbSkipLeftOutLevelsSetting, isSpecific);
     EmulatorSettings.SetBbDirectTextureCopies(bbDirectTextureCopiesSetting, isSpecific);
-    EmulatorSettings.SetBbCopyThreads(std::array{0, 6, 8}[std::clamp(bbCopyThreadsSetting, 0, 2)],
-                                      isSpecific);
+    EmulatorSettings.SetBbCopyThreads(
+        std::array{0, 4, 6, 8}[std::clamp(bbCopyThreadsSetting, 0, 3)], isSpecific);
     EmulatorSettings.SetBbCachedTextureStaging(bbCachedTextureStagingSetting, isSpecific);
     EmulatorSettings.SetBbSpreadLoads(bbSpreadLoadsSetting, isSpecific);
     EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
@@ -977,7 +978,9 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Texture quality High/Medium: less data copied per upload");
                 AddSettingCheckbox("    Direct texture copies", bbDirectTextureCopiesSetting,
                                    "Texture data read straight from game memory (faster loads)");
-                AddSettingCombo("    Copy threads", bbCopyThreadsSetting, {"Auto (4)", "6", "8"});
+                AddSettingCombo(
+                    "    Copy threads", bbCopyThreadsSetting,
+                    {fmt::format("Auto ({})", Common::CopyPool::AutoWorkers()), "4", "6", "8"});
                 if (ImGui::IsItemHovered()) {
                     ShowTooltip("Threads copying texture data when an area streams in: more "
                                 "copy faster but compete with the game's threads (needs a "

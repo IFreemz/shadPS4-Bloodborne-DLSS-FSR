@@ -42,4 +42,9 @@ bool WaitAsync();
 /// pool's first use; returns the number it runs with.
 u32 Configure(u32 workers);
 
+/// Bloodborne's automatic copy thread count: half the logical cores, 2 to 8 (16 threads: 8,
+/// 12: 6, 8: 4, 6: 3). Memory bandwidth stops scaling around 8; below that more threads copied
+/// traversal bursts faster without slowing the game's own threads.
+u32 AutoWorkers();
+
 } // namespace Common::CopyPool

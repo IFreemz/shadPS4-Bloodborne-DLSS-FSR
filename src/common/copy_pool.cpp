@@ -215,6 +215,11 @@ bool WaitAsync() {
     return GetPool().WaitAsync();
 }
 
+u32 AutoWorkers() {
+    const u32 hardware = std::max(1u, std::thread::hardware_concurrency());
+    return std::clamp(hardware / 2, 2u, 8u);
+}
+
 u32 Configure(u32 workers) {
     requested_workers.store(workers, std::memory_order_relaxed);
     return GetPool().Workers();

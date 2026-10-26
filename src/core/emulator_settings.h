@@ -410,8 +410,10 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
 // -------------------------------
 // Bloodborne settings whose default changed to on are switched on once in configs saved before
 // (each saved config holds every value, so a new default never reached them). 1: "Also free idle
-// buffers" and "Background texture copies". 2: "Real occlusion tests".
-constexpr int BbDefaultsVersion = 2;
+// buffers" and "Background texture copies". 2: "Real occlusion tests". 3: "Use more VRAM",
+// "Overlap game and GPU frames", "Early GPU data write-back", "Keep rendering while presenting",
+// "Copy only kept texture levels" and "Direct texture copies".
+constexpr int BbDefaultsVersion = 3;
 
 struct GPUSettings {
     Setting<u32> window_width{1280};
@@ -470,7 +472,7 @@ struct GPUSettings {
     Setting<bool> bb_load_screen_cleanup{true};
     // With VRAM cleanup (testing): marks from the driver's current VRAM budget, a small margin
     // below it, instead of an eighth of the card kept free. Off: the usual marks.
-    Setting<bool> bb_more_vram{false};
+    Setting<bool> bb_more_vram{true};
     // With "Use more VRAM" (testing, applies at start): up to the card's size less a reserve for
     // Windows, past the driver's budget (Windows then makes room by moving other programs' memory
     // to system RAM), with memory priorities so texture copies are the first to go if it moves any
@@ -523,11 +525,11 @@ struct GPUSettings {
     // the game waits for the last one, and its first two submissions do not wait at all (after
     // Lantern Engine). Off: every submission after the end of a frame waits for the GPU side to be
     // idle, as before.
-    Setting<bool> bb_overlap_frames{false};
+    Setting<bool> bb_overlap_frames{true};
     // Threaded renderer: memory a game thread had to wait for a GPU readback of is sent to the GPU
     // as soon as GPU work writes it again, and copied back once the GPU has finished, so the
     // game's next write does not wait. Off: read back only when the game touches it, as before.
-    Setting<bool> bb_early_writeback{false};
+    Setting<bool> bb_early_writeback{true};
     // Threaded renderer: occlusion query results written in order with the queued draws. Off:
     // the decoding thread waits for every queued draw first, as before.
     Setting<bool> bb_occlusion_in_order{true};
@@ -550,16 +552,16 @@ struct GPUSettings {
     // Threaded renderer: while a frame is presented (a frame limiter such as RTSS may sleep in
     // the present), the GPU threads' submissions queue up and go to the GPU right after it
     // returns, instead of the threads waiting for the queue. Off: they wait for the present.
-    Setting<bool> bb_render_during_present{false};
+    Setting<bool> bb_render_during_present{true};
     // Texture quality High/Medium: the guest data of a texture's left-out largest level is not
     // copied for its uploads (only the levels kept), which is most of a traversal burst's bytes
     // for the textures it reduces. Off: the whole texture is copied and the level dropped after.
-    Setting<bool> bb_skip_left_out_levels{false};
+    Setting<bool> bb_skip_left_out_levels{true};
     // Threaded renderer: texture data is copied from the game's own addresses when the whole
     // texture is mapped and readable, not through the view of the backing memory (whose pages
     // the process has not touched yet: the first read of each 4 KiB page costs a fault, which
     // made traversal copies run at ~5 GB/s). Off: always through the backing view.
-    Setting<bool> bb_direct_texture_copies{false};
+    Setting<bool> bb_direct_texture_copies{true};
     // Threaded renderer: when an area loads (hundreds of textures in a second), texture uploads
     // past 64 MiB a frame wait for the next frames (new ones show black meanwhile), so the load
     // is spread over several frames. Off: everything uploaded at once.
@@ -685,9 +687,9 @@ struct VulkanSettings {
     Setting<bool> pipeline_cache_enabled{false};
     Setting<bool> pipeline_cache_archived{false};
     // Bloodborne threaded renderer (here: GPUSettings' JSON field list is at its 64 limit).
-    // Copy threads for texture and buffer data (0 = a quarter of the logical cores, at most 4, as
-    // before; otherwise this many, leaving two cores); applies after a restart. Traversal bursts
-    // of new textures copy 200-440 MiB in one frame at ~7 GB/s on 4.
+    // Copy threads for texture and buffer data (0 = auto: half the logical cores, 2 to 8;
+    // otherwise this many, leaving two cores); applies after a restart. Traversal bursts of new
+    // textures copy 200-440 MiB in one frame: ~7 GB/s on 4 threads, ~10 GB/s on 8.
     Setting<int> bb_copy_threads{0};
     // Texture uploads staged in cached system memory instead of write-combined (uncached)
     // memory: faster for the CPU's copy, possibly slower for the GPU's read. Off: uncached.

@@ -416,13 +416,23 @@ bool EmulatorSettingsImpl::UpdateBbDefaults(const json& file, bool game_specific
     if (version < 2) {
         switch_on(m_gpu.bb_real_occlusion);
     }
+    if (version < 3) {
+        switch_on(m_gpu.bb_more_vram);
+        switch_on(m_gpu.bb_overlap_frames);
+        switch_on(m_gpu.bb_early_writeback);
+        switch_on(m_gpu.bb_render_during_present);
+        switch_on(m_gpu.bb_skip_left_out_levels);
+        switch_on(m_gpu.bb_direct_texture_copies);
+    }
     if (game_specific && m_gpu.bb_defaults.game_specific_value) {
         m_gpu.bb_defaults.game_specific_value = BbDefaultsVersion;
     }
     m_gpu.bb_defaults.value = BbDefaultsVersion;
-    LOG_INFO(Config,
-             "Bloodborne settings: {}real occlusion tests switched on (new defaults, {} config)",
-             version < 1 ? "idle buffer freeing, background texture copies and " : "",
+    LOG_INFO(Config, "Bloodborne settings: {}{}{} switched on (new defaults, {} config)",
+             version < 1 ? "idle buffer freeing, background texture copies, " : "",
+             version < 2 ? "real occlusion tests, " : "",
+             "more VRAM, overlapped frames, early write-back, rendering while presenting, kept "
+             "texture levels only and direct texture copies",
              game_specific ? "game" : "global");
     return true;
 }
