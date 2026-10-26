@@ -44,6 +44,9 @@ inline std::atomic<u64> arena_binds{0}; ///< buffer arena ranges made resident
 inline std::atomic<u64> image_uploads{0};
 inline std::atomic<u64> image_upload_bytes{0};
 inline std::atomic<u64> image_upload_ns{0};
+/// Keep rendering while presenting: GPU queue operations that waited for a present to return
+/// instead of their thread waiting.
+inline std::atomic<u64> queue_ops_behind_present{0};
 /// Guest memory copied into staging for texture uploads (part of image_upload_ns).
 inline std::atomic<u64> image_copy_ns{0};
 /// Buffer data uploaded from guest memory, and the time the copies took.

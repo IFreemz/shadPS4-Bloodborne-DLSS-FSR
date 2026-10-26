@@ -1234,50 +1234,52 @@ bool BufferCache::GarbageCollectResidentMemory(bool load_screen) {
     // Everything recorded so far, the page table clears included, runs before the unbind.
     const u64 work_tick = scheduler.CurrentTick();
     scheduler.Flush();
-    std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
-    buffer_binds.reserve(unbinds.size());
-    for (const ArenaBinds& arena_binds : unbinds) {
-        buffer_binds.push_back(vk::SparseBufferMemoryBindInfo{
-            .buffer = arena_binds.arena->Handle(),
-            .bindCount = static_cast<u32>(arena_binds.binds.size()),
-            .pBinds = arena_binds.binds.data(),
-        });
-    }
-
     const u64 signal_tick = memory_semaphore.NextTick();
     const vk::Semaphore signal_sema = memory_semaphore.Handle();
     const vk::Semaphore wait_sema = scheduler.GetWorkSemaphore()->Handle();
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .waitSemaphoreValueCount = 1u,
-        .pWaitSemaphoreValues = &work_tick,
-        .signalSemaphoreValueCount = 1u,
-        .pSignalSemaphoreValues = &signal_tick,
-    };
-    const vk::BindSparseInfo sparse_info = {
-        .pNext = &timeline_si,
-        .waitSemaphoreCount = 1u,
-        .pWaitSemaphores = &wait_sema,
-        .bufferBindCount = static_cast<u32>(buffer_binds.size()),
-        .pBufferBinds = buffer_binds.data(),
-        .signalSemaphoreCount = 1u,
-        .pSignalSemaphores = &signal_sema,
-    };
-    vk::Result result;
     // Timed: on some drivers (bbport saw NVIDIA on Linux take 10 s and more) this call is slow.
     const auto unbind_start = std::chrono::steady_clock::now();
     {
         // The graphics queue is shared with the presenter (and frame generation): queue
-        // operations must be serialized like every other submission.
+        // operations must be serialized like every other submission. With Keep rendering while
+        // presenting the unbind may run after this returns, so it keeps its own copy.
         std::scoped_lock submit_lock{Vulkan::Scheduler::submit_mutex};
-        Common::Crumbs::Add("buffer eviction: sparse unbind (ranges)", buffer_binds.size());
-        result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+        Common::Crumbs::Add("buffer eviction: sparse unbind (ranges)", unbinds.size());
+        Vulkan::Scheduler::QueueOp([queue = instance.GetGraphicsQueue(), unbinds, work_tick,
+                                    signal_tick, signal_sema, wait_sema] {
+            std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
+            buffer_binds.reserve(unbinds.size());
+            for (const ArenaBinds& arena_binds : unbinds) {
+                buffer_binds.push_back(vk::SparseBufferMemoryBindInfo{
+                    .buffer = arena_binds.arena->Handle(),
+                    .bindCount = static_cast<u32>(arena_binds.binds.size()),
+                    .pBinds = arena_binds.binds.data(),
+                });
+            }
+            const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+                .waitSemaphoreValueCount = 1u,
+                .pWaitSemaphoreValues = &work_tick,
+                .signalSemaphoreValueCount = 1u,
+                .pSignalSemaphoreValues = &signal_tick,
+            };
+            const vk::BindSparseInfo sparse_info = {
+                .pNext = &timeline_si,
+                .waitSemaphoreCount = 1u,
+                .pWaitSemaphores = &wait_sema,
+                .bufferBindCount = static_cast<u32>(buffer_binds.size()),
+                .pBufferBinds = buffer_binds.data(),
+                .signalSemaphoreCount = 1u,
+                .pSignalSemaphores = &signal_sema,
+            };
+            const vk::Result result = queue.bindSparse(sparse_info);
+            ASSERT_MSG(result == vk::Result::eSuccess, "Failed to unbind sparse guest memory: {}",
+                       vk::to_string(result));
+        });
         Common::Crumbs::Add("buffer eviction: sparse unbind done");
     }
     const double unbind_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - unbind_start)
             .count();
-    ASSERT_MSG(result == vk::Result::eSuccess, "Failed to unbind sparse guest memory: {}",
-               vk::to_string(result));
     last_unbind_tick = signal_tick;
 
     u64 freed_bytes = 0;
@@ -1487,46 +1489,49 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
         return;
     }
 
-    std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
-    buffer_binds.reserve(pending_binds.size());
-
-    for (const auto& binds : pending_binds) {
-        buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
-            .buffer = binds.arena->Handle(),
-            .bindCount = static_cast<u32>(binds.binds.size()),
-            .pBinds = binds.binds.data(),
-        });
-    }
-
     const u64 signal_tick = memory_semaphore.NextTick();
     const auto signal_sema = memory_semaphore.Handle();
 
     // Buffer eviction: binds wait for the last unbind, which may still be waiting on the GPU
     // (the same range can be unbound there and bound again here).
     const bool after_unbind = last_unbind_tick != 0;
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .waitSemaphoreValueCount = after_unbind ? 1u : 0u,
-        .pWaitSemaphoreValues = after_unbind ? &last_unbind_tick : nullptr,
-        .signalSemaphoreValueCount = 1u,
-        .pSignalSemaphoreValues = &signal_tick,
-    };
-
-    const vk::BindSparseInfo sparse_info = {
-        .pNext = &timeline_si,
-        .waitSemaphoreCount = after_unbind ? 1u : 0u,
-        .pWaitSemaphores = after_unbind ? &signal_sema : nullptr,
-        .bufferBindCount = static_cast<u32>(buffer_binds.size()),
-        .pBufferBinds = buffer_binds.data(),
-        .signalSemaphoreCount = 1u,
-        .pSignalSemaphores = &signal_sema,
-    };
+    const u64 unbind_tick = last_unbind_tick;
 
     info.AddWait(signal_sema, signal_tick);
     const auto bind_start = std::chrono::steady_clock::now();
-    Common::Crumbs::Add("buffer memory: sparse bind (ranges)", buffer_binds.size());
-    auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+    Common::Crumbs::Add("buffer memory: sparse bind (ranges)", pending_binds.size());
+    // With Keep rendering while presenting the bind may run after this returns (before the
+    // submission waiting for it), so it keeps its own copy.
+    Vulkan::Scheduler::QueueOp([queue = instance.GetGraphicsQueue(), binds = pending_binds,
+                                signal_tick, signal_sema, after_unbind, unbind_tick] {
+        std::vector<vk::SparseBufferMemoryBindInfo> buffer_binds;
+        buffer_binds.reserve(binds.size());
+        for (const auto& arena_binds : binds) {
+            buffer_binds.emplace_back(vk::SparseBufferMemoryBindInfo{
+                .buffer = arena_binds.arena->Handle(),
+                .bindCount = static_cast<u32>(arena_binds.binds.size()),
+                .pBinds = arena_binds.binds.data(),
+            });
+        }
+        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+            .waitSemaphoreValueCount = after_unbind ? 1u : 0u,
+            .pWaitSemaphoreValues = after_unbind ? &unbind_tick : nullptr,
+            .signalSemaphoreValueCount = 1u,
+            .pSignalSemaphoreValues = &signal_tick,
+        };
+        const vk::BindSparseInfo sparse_info = {
+            .pNext = &timeline_si,
+            .waitSemaphoreCount = after_unbind ? 1u : 0u,
+            .pWaitSemaphores = after_unbind ? &signal_sema : nullptr,
+            .bufferBindCount = static_cast<u32>(buffer_binds.size()),
+            .pBufferBinds = buffer_binds.data(),
+            .signalSemaphoreCount = 1u,
+            .pSignalSemaphores = &signal_sema,
+        };
+        const auto submit_result = queue.bindSparse(sparse_info);
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    });
     Common::Crumbs::Add("buffer memory: sparse bind done");
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     if (vram_reclaim) {
         // Buffer eviction makes binding more frequent (evicted ranges come back): report slow
         // driver calls, at most once a second.

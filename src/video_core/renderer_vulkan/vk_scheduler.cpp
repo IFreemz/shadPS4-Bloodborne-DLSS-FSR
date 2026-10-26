@@ -18,6 +18,35 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 std::mutex Scheduler::present_mutex;
+std::mutex Scheduler::queue_ops_mutex;
+bool Scheduler::deferring_queue_ops = false;
+std::vector<Common::UniqueFunction<void>> Scheduler::deferred_queue_ops;
+
+void Scheduler::QueueOp(Common::UniqueFunction<void>&& op) {
+    std::scoped_lock lk{queue_ops_mutex};
+    if (deferring_queue_ops) {
+        deferred_queue_ops.push_back(std::move(op));
+        Common::GuestStats::queue_ops_behind_present.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    op();
+}
+
+void Scheduler::BeginDeferringQueueOps() {
+    std::scoped_lock lk{queue_ops_mutex};
+    deferring_queue_ops = true;
+}
+
+void Scheduler::EndDeferringQueueOps() {
+    // submit_mutex first (the order QueueOp's callers take them in): everything else that uses
+    // the queue or waits for the device to be idle holds it.
+    std::scoped_lock lk{submit_mutex, queue_ops_mutex};
+    for (auto& op : deferred_queue_ops) {
+        op();
+    }
+    deferred_queue_ops.clear();
+    deferring_queue_ops = false;
+}
 
 Scheduler::Scheduler(const Instance& instance)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
@@ -446,37 +475,40 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
-    std::array<vk::PipelineStageFlags, std::tuple_size_v<decltype(info.wait_semas)>>
-        wait_stage_masks;
-    wait_stage_masks.fill(vk::PipelineStageFlagBits::eAllCommands);
+    // A copy of the submission: it may run after this returns (Keep rendering while presenting).
+    QueueOp([queue = instance.GetGraphicsQueue(), info, cmd_buffers = std::move(cmd_buffers)] {
+        std::array<vk::PipelineStageFlags, std::tuple_size_v<decltype(info.wait_semas)>>
+            wait_stage_masks;
+        wait_stage_masks.fill(vk::PipelineStageFlagBits::eAllCommands);
 
-    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
-        .waitSemaphoreValueCount = info.num_wait_semas,
-        .pWaitSemaphoreValues = info.wait_ticks.data(),
-        .signalSemaphoreValueCount = info.num_signal_semas,
-        .pSignalSemaphoreValues = info.signal_ticks.data(),
-    };
+        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+            .waitSemaphoreValueCount = info.num_wait_semas,
+            .pWaitSemaphoreValues = info.wait_ticks.data(),
+            .signalSemaphoreValueCount = info.num_signal_semas,
+            .pSignalSemaphoreValues = info.signal_ticks.data(),
+        };
 
-    const vk::SubmitInfo submit_info = {
-        .pNext = &timeline_si,
-        .waitSemaphoreCount = info.num_wait_semas,
-        .pWaitSemaphores = info.wait_semas.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
-        .commandBufferCount = static_cast<u32>(cmd_buffers.size()),
-        .pCommandBuffers = cmd_buffers.data(),
-        .signalSemaphoreCount = info.num_signal_semas,
-        .pSignalSemaphores = info.signal_semas.data(),
-    };
+        const vk::SubmitInfo submit_info = {
+            .pNext = &timeline_si,
+            .waitSemaphoreCount = info.num_wait_semas,
+            .pWaitSemaphores = info.wait_semas.data(),
+            .pWaitDstStageMask = wait_stage_masks.data(),
+            .commandBufferCount = static_cast<u32>(cmd_buffers.size()),
+            .pCommandBuffers = cmd_buffers.data(),
+            .signalSemaphoreCount = info.num_signal_semas,
+            .pSignalSemaphores = info.signal_semas.data(),
+        };
 
-    ImGui::Core::TextureManager::Submit();
-    const auto submit_start = std::chrono::steady_clock::now();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
-    Common::GuestStats::queue_submit_ns.fetch_add(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-                                                             submit_start)
-            .count(),
-        std::memory_order_relaxed);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+        ImGui::Core::TextureManager::Submit();
+        const auto submit_start = std::chrono::steady_clock::now();
+        auto submit_result = queue.submit(submit_info, info.fence);
+        Common::GuestStats::queue_submit_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 submit_start)
+                .count(),
+            std::memory_order_relaxed);
+        ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    });
 
     work_semaphore.Refresh();
     CollectGpuTiming();

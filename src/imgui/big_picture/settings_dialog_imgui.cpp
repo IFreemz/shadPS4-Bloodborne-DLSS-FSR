@@ -99,6 +99,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbHardwareInterpolationSetting = EmulatorSettings.IsBbHardwareInterpolation();
     bbRealOcclusionSetting = EmulatorSettings.IsBbRealOcclusion();
     bbCopyThreadSetting = EmulatorSettings.IsBbCopyThread();
+    bbRenderDuringPresentSetting = EmulatorSettings.IsBbRenderDuringPresent();
     bbSpreadLoadsSetting = EmulatorSettings.IsBbSpreadLoads();
     {
         // 0 (the game's own), 2, 4, 8, 16 -> 0..4
@@ -202,6 +203,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbHardwareInterpolation(bbHardwareInterpolationSetting, isSpecific);
     EmulatorSettings.SetBbRealOcclusion(bbRealOcclusionSetting, isSpecific);
     EmulatorSettings.SetBbCopyThread(bbCopyThreadSetting, isSpecific);
+    EmulatorSettings.SetBbRenderDuringPresent(bbRenderDuringPresentSetting, isSpecific);
     EmulatorSettings.SetBbSpreadLoads(bbSpreadLoadsSetting, isSpecific);
     EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
                                      isSpecific);
@@ -954,6 +956,9 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Areas hidden behind walls are skipped by the game");
                 AddSettingCheckbox("    Copy thread", bbCopyThreadSetting,
                                    "Draw memory copies on their own thread (needs a restart)");
+                AddSettingCheckbox("    Keep rendering while presenting",
+                                   bbRenderDuringPresentSetting,
+                                   "Frame limiters like RTSS don't hold up rendering");
                 AddSettingCheckbox("    Spread area loading", bbSpreadLoadsSetting,
                                    "Respawns and area loads upload textures over a few frames");
             }

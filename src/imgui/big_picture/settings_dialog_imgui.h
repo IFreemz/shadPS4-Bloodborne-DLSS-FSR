@@ -185,6 +185,7 @@ private:
     bool bbHardwareInterpolationSetting;
     bool bbRealOcclusionSetting;
     bool bbCopyThreadSetting;
+    bool bbRenderDuringPresentSetting;
     bool bbSpreadLoadsSetting;
     bool bbStutterDetailSetting;
     int bbVramBudgetTestSetting;

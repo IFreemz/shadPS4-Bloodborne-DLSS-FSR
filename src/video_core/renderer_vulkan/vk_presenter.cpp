@@ -967,7 +967,24 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
 
+    // Keep rendering while presenting: with a frame limiter (RTSS) sleeping in the present, the
+    // GPU threads no longer wait for it mid-frame, so nothing held the game back: frames queued
+    // up two or three deep (25-40 ms from the game's flip to the display) and were shown on the
+    // limiter's even rhythm while they had been made unevenly (judder with a flat frame graph).
+    // The wait moves here, to the frame's end: the next frame waits for the last one's present.
+    const bool keep_rendering = KeepRenderingWhilePresenting();
+    if (keep_rendering) {
+        std::unique_lock lock{awaiting_mutex};
+        awaiting_cv.wait_for(lock, std::chrono::milliseconds{100},
+                             [this] { return frames_awaiting_present == 0; });
+    }
+
     Frame* frame = GetRenderFrame();
+    if (keep_rendering) {
+        std::scoped_lock lock{awaiting_mutex};
+        frame->awaiting_present = true;
+        ++frames_awaiting_present;
+    }
 
     const auto frame_subresources = vk::ImageSubresourceRange{
         .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -1266,8 +1283,23 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
+bool Presenter::KeepRenderingWhilePresenting() const {
+    return !instance.HasSeparatePresentQueue() && !FrameGen::Requested() && rasterizer &&
+           rasterizer->ThreadedRendererActive() && EmulatorSettings.IsBbRenderDuringPresent();
+}
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
     Common::Crumbs::Add("present (game frame)", is_game_frame);
+    SCOPE_EXIT {
+        if (!is_reusing_frame && frame->awaiting_present) {
+            {
+                std::scoped_lock lock{awaiting_mutex};
+                frame->awaiting_present = false;
+                --frames_awaiting_present;
+            }
+            awaiting_cv.notify_all();
+        }
+    };
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -1558,19 +1590,30 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Present to swapchain.
     {
         FrameGen::TimingScope lock_timing{"present_and_lock"};
-        std::scoped_lock present_lock{instance.HasSeparatePresentQueue() ? Scheduler::present_mutex
-                                                                         : Scheduler::submit_mutex};
+        // Keep rendering while presenting: a frame limiter (RTSS) sleeps in the present call; under
+        // submit_mutex that stopped the GPU threads' submissions for up to a frame, so the next
+        // frame was late and missed the limiter's next slot too. Their queue operations now wait
+        // in order and run when the present returns; presents stay serialized.
+        const bool keep_rendering = KeepRenderingWhilePresenting();
+        std::scoped_lock present_lock{instance.HasSeparatePresentQueue() || keep_rendering
+                                          ? Scheduler::present_mutex
+                                          : Scheduler::submit_mutex};
         FrameGen::BeginPresent();
         FrameGen::TimingScope present_timing{"present"};
         bool presented;
         {
             FrameGen::TimingScope timing{"queue_present"};
             const auto start = std::chrono::steady_clock::now();
+            if (keep_rendering) {
+                Scheduler::BeginDeferringQueueOps();
+            }
             presented = swapchain.Present();
+            const auto present_end = std::chrono::steady_clock::now();
+            if (keep_rendering) {
+                Scheduler::EndDeferringQueueOps();
+            }
             Common::GuestStats::present_queue_ns.fetch_add(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - start)
-                    .count(),
+                std::chrono::duration_cast<std::chrono::nanoseconds>(present_end - start).count(),
                 std::memory_order_relaxed);
             Common::GuestStats::presents.fetch_add(1, std::memory_order_relaxed);
             FrameGen::ReplayPresentStall(true);
@@ -1584,7 +1627,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
         if (!presented) {
             std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
-            if (instance.HasSeparatePresentQueue()) {
+            if (instance.HasSeparatePresentQueue() || keep_rendering) {
                 submit_lock.lock();
             }
             swapchain.Recreate(window.GetWidth(), window.GetHeight());

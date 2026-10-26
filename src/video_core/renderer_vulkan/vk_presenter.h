@@ -50,6 +50,8 @@ struct Frame {
     vk::ImageView hudless_view;
     ImTextureID hudless_texture{};
     bool has_hudless{}; // this frame's game image has a HUD-less copy
+    // Keep rendering while presenting: prepared for the display and not presented yet.
+    bool awaiting_present{};
 };
 
 enum SchedulerType {
@@ -168,6 +170,13 @@ private:
     void DestroyHudless(Frame& frame);
     std::mutex free_mutex;
     std::condition_variable free_cv;
+    /// Keep rendering while presenting: game frames prepared and not presented yet. A new one
+    /// waits until the last is presented, so a frame limiter sleeping in the present paces the
+    /// game one frame behind, as a blocking present did (not two or three frames behind).
+    bool KeepRenderingWhilePresenting() const;
+    std::mutex awaiting_mutex;
+    std::condition_variable awaiting_cv;
+    u32 frames_awaiting_present{};
     std::condition_variable_any frame_cv;
     std::optional<ImGui::RefCountedTexture> splash_img;
     std::vector<VAddr> vo_buffers_addr;

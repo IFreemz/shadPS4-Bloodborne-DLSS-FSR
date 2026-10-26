@@ -15,6 +15,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 #include <queue>
 
 #include "common/interval_set.h"
@@ -610,12 +611,26 @@ public:
     static std::mutex submit_mutex;
     static std::mutex present_mutex;
 
+    /// An operation on the graphics queue (a submission, a sparse binding), called with
+    /// submit_mutex held: run now, or, while a frame is presented with Keep rendering while
+    /// presenting, right after the present returns, in order.
+    static void QueueOp(Common::UniqueFunction<void>&& op);
+    /// Keep rendering while presenting: the present runs without holding submit_mutex, so a
+    /// frame limiter sleeping in it does not stop the GPU threads; their queue operations wait
+    /// in order and run when it returns. Begin before the present call, End after it.
+    static void BeginDeferringQueueOps();
+    static void EndDeferringQueueOps();
+
 private:
     void EndSession();
 
     void SubmitExecution(SubmitInfo& info);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
+
+    static std::mutex queue_ops_mutex;
+    static bool deferring_queue_ops;
+    static std::vector<Common::UniqueFunction<void>> deferred_queue_ops;
 
 private:
     const Instance& instance;

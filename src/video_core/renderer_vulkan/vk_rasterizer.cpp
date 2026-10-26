@@ -1361,6 +1361,7 @@ void Rasterizer::ReportHitch() {
     now.present_queue_ns = GS::present_queue_ns.load(std::memory_order_relaxed);
     now.present_frame_wait_ns = GS::present_frame_wait_ns.load(std::memory_order_relaxed);
     now.presents = GS::presents.load(std::memory_order_relaxed);
+    now.queue_ops_behind_present = GS::queue_ops_behind_present.load(std::memory_order_relaxed);
     now.gpu_busy_ns = GS::gpu_timeline_busy_ns.load(std::memory_order_relaxed);
     now.gpu_idle_ns = GS::gpu_timeline_idle_ns.load(std::memory_order_relaxed);
     now.gpu_submits = GS::gpu_timeline_submits.load(std::memory_order_relaxed);
@@ -1473,19 +1474,22 @@ void Rasterizer::ReportHitch() {
             ms_of(delta(now.diag_ns, last.diag_ns)));
         // Where a wait for the GPU goes: the GPU's own timeline (executing our submissions, or
         // idle between them) and the presentation thread (window image, present call, frames).
-        LOG_WARNING(Render_Vulkan,
-                    "Stutter detail: GPU timeline {:.1f} ms executing, {:.1f} ms idle between "
-                    "submissions ({} submissions measured, a frame or two late) | queue submit "
-                    "calls {:.1f} ms | presentation: {} presents, acquiring a window image "
-                    "{:.1f} ms, present calls {:.1f} ms, waiting for a free frame {:.1f} ms",
-                    ms_of(delta(now.gpu_busy_ns, last.gpu_busy_ns)),
-                    ms_of(delta(now.gpu_idle_ns, last.gpu_idle_ns)),
-                    delta(now.gpu_submits, last.gpu_submits),
-                    ms_of(delta(now.queue_submit_ns, last.queue_submit_ns)),
-                    delta(now.presents, last.presents),
-                    ms_of(delta(now.present_acquire_ns, last.present_acquire_ns)),
-                    ms_of(delta(now.present_queue_ns, last.present_queue_ns)),
-                    ms_of(delta(now.present_frame_wait_ns, last.present_frame_wait_ns)));
+        LOG_WARNING(
+            Render_Vulkan,
+            "Stutter detail: GPU timeline {:.1f} ms executing, {:.1f} ms idle between "
+            "submissions ({} submissions measured, a frame or two late) | queue submit "
+            "calls {:.1f} ms | presentation: {} presents, acquiring a window image "
+            "{:.1f} ms, present calls {:.1f} ms, waiting for a free frame {:.1f} ms, {} GPU "
+            "submissions queued behind a present",
+            ms_of(delta(now.gpu_busy_ns, last.gpu_busy_ns)),
+            ms_of(delta(now.gpu_idle_ns, last.gpu_idle_ns)),
+            delta(now.gpu_submits, last.gpu_submits),
+            ms_of(delta(now.queue_submit_ns, last.queue_submit_ns)),
+            delta(now.presents, last.presents),
+            ms_of(delta(now.present_acquire_ns, last.present_acquire_ns)),
+            ms_of(delta(now.present_queue_ns, last.present_queue_ns)),
+            ms_of(delta(now.present_frame_wait_ns, last.present_frame_wait_ns)),
+            delta(now.queue_ops_behind_present, last.queue_ops_behind_present));
         const auto heaps = instance.GetMemoryHeapReport();
         const auto& cleanup_now = now.cleanup;
         const auto& cleanup_last = last.cleanup;
