@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdlib>
+#include <iterator>
+#include <string>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -396,6 +401,65 @@ static void ExecuteDmaData(Vulkan::Rasterizer& rasterizer, const PM4DmaData& dma
     }
 }
 
+namespace {
+
+struct PacketTrail {
+    static constexpr u32 Capacity = 16;
+    std::array<std::pair<u32, u32>, Capacity> packets{};
+    u32 total{};
+
+    void Add(u32 dword_offset, u32 header) {
+        packets[total++ % Capacity] = {dword_offset, header};
+    }
+};
+
+u64 HashCommands(std::span<const u32> words) {
+    u64 hash = 0xcbf29ce484222325ull;
+    for (const u32 word : words) {
+        hash = (hash ^ word) * 0x100000001b3ull;
+    }
+    return hash;
+}
+
+void LogBadPacket(std::span<const u32> commands, const u32* bad, u64 start_hash,
+                  const PacketTrail& trail) {
+    const u64 at = static_cast<u64>(bad - commands.data());
+    const u64 first = at > 8 ? at - 8 : 0;
+    const u64 last = std::min<u64>(commands.size(), at + 9);
+    std::string around;
+    for (u64 i = first; i < last; ++i) {
+        if (i == at) {
+            fmt::format_to(std::back_inserter(around), "[{:08x}] ", commands[i]);
+        } else {
+            fmt::format_to(std::back_inserter(around), "{:08x} ", commands[i]);
+        }
+    }
+    const u32 shown = std::min(trail.total, PacketTrail::Capacity);
+    std::string recent;
+    for (u32 i = trail.total - shown; i < trail.total; ++i) {
+        const auto [offset, raw] = trail.packets[i % PacketTrail::Capacity];
+        const auto* header = reinterpret_cast<const PM4Header*>(&raw);
+        const u32 type = header->type;
+        if (type == 3) {
+            const PM4ItOpcode opcode = header->type3.opcode;
+            fmt::format_to(std::back_inserter(recent), "{}: {} ({:#x}, {} dwords); ", offset,
+                           magic_enum::enum_name(opcode), static_cast<u32>(opcode),
+                           header->type3.NumWords() + 1);
+        } else {
+            fmt::format_to(std::back_inserter(recent), "{}: type {} ({:08x}); ", offset, type, raw);
+        }
+    }
+    LOG_CRITICAL(Render,
+                 "Bad PM4 packet at dword {} of {} in the draw command buffer at {:#x}, header "
+                 "{:08x} | the buffer {} since the submission started | words around it: {}| "
+                 "last {} packets, oldest first: {}",
+                 at, commands.size(), reinterpret_cast<uintptr_t>(commands.data()), *bad,
+                 HashCommands(commands) == start_hash ? "is unchanged" : "CHANGED", around, shown,
+                 recent);
+}
+
+} // namespace
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
 
@@ -412,20 +476,34 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    const std::span<const u32> commands = dcb;
+    const u64 commands_hash = HashCommands(commands);
+    PacketTrail trail;
     while (!dcb.empty()) {
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
+        trail.Add(static_cast<u32>(dcb.data() - commands.data()), header->raw);
 
         switch (type) {
         default:
+            LogBadPacket(commands, dcb.data(), commands_hash, trail);
             UNREACHABLE_MSG("Wrong PM4 type {}", type);
             break;
-        case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
+        case 0: {
+            static std::atomic<u32> type0_packets{0};
+            const u32 seen = ++type0_packets;
+            if (seen <= 8) {
+                LogBadPacket(commands, dcb.data(), commands_hash, trail);
+            }
+            LOG_WARNING(Render,
+                        "Skipped PM4 type 0 packet (register writes are not emulated), base reg: "
+                        "{:#x}, size: {}, skipped so far: {}",
+                        header->type0.base.Value(), header->type0.NumWords(), seen);
+            dcb = NextPacket(dcb, std::min<size_t>(header->type0.NumWords() + 1, dcb.size()));
+            continue;
+        }
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -1194,6 +1272,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             default:
+                LogBadPacket(commands, dcb.data(), commands_hash, trail);
                 UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                                 static_cast<u32>(opcode), count);
             }

@@ -252,6 +252,9 @@ private:
     void MakeResidentPooled(const Buffer* arena, const IntervalList<>& bind_ranges,
                             u64 resident_blocks);
     ResidentBlocks TakeResidentBlocks(u64 wanted);
+    /// Allocates resident memory; when the driver refuses, the VRAM state goes to the log.
+    vk::DeviceMemory AllocateResidentMemory(const vk::MemoryAllocateInfo& alloc_info,
+                                            const char* pool);
     /// Returns the slab's size in blocks when nothing of it is bound any more (to be freed).
     u64 ReturnResidentBlocks(vk::DeviceMemory memory, u64 start, u64 count);
     void MarkResidentUse(VAddr device_addr, u64 size);

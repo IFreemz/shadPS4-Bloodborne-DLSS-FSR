@@ -620,14 +620,18 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
         return address_space[first_page];
     }
 
-    LOG_WARNING(Render, "Migrating arena");
-
     const u64 first_addr = first_arena ? first_arena->cpu_addr : (first_page << ARENA_PAGE_BITS);
     const u64 first_size = first_arena ? first_arena->size_bytes : ARENA_PAGE_SIZE;
     const u64 last_size = last_arena ? last_arena->size_bytes : ARENA_PAGE_SIZE;
 
     const u64 base_block = first_addr >> block_shift;
     const u64 total_size = first_size + last_size;
+    LOG_WARNING(Render,
+                "Migrating arena: pages {} and {} ({} and {} MiB, {}) into one of {} MiB, {} "
+                "arenas so far",
+                first_page, last_page, first_size >> 20, last_size >> 20,
+                first_arena ? "first exists" : "first new", total_size >> 20, arenas.size());
+    Common::Crumbs::Add("buffer arena: migrate (first page, last page)", first_page, last_page);
     const u64 end_block = (first_addr + total_size) >> block_shift;
     auto* new_arena = &arenas.emplace_back(instance, first_addr, total_size, MemoryType::Sparse);
     auto* bind = BindsForArena(new_arena);
@@ -676,6 +680,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     if (bind_ranges.Empty()) {
         return;
     }
+    Common::Crumbs::Add("buffer residency: make resident (MiB, first block)",
+                        (u64(resident_blocks) << block_shift) >> 20, first_block);
     const auto resident_start = std::chrono::steady_clock::now();
     SCOPE_EXIT {
         Common::GuestStats::resident_ns.fetch_add(
@@ -724,7 +730,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
                                   : bind_bytes,
             .memoryTypeIndex = arena_memory_type_index,
         };
-        resident_slab = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+        resident_slab = AllocateResidentMemory(alloc_info, "slab");
         resident_slab_size = alloc_info.allocationSize;
         resident_slab_used = 0;
     }
@@ -845,7 +851,7 @@ BufferCache::ResidentBlocks BufferCache::TakeResidentBlocks(u64 wanted) {
             .allocationSize = slab_blocks << block_shift,
             .memoryTypeIndex = arena_memory_type_index,
         };
-        memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
+        memory = AllocateResidentMemory(alloc_info, "pooled slab");
         auto& created = resident_slabs[static_cast<VkDeviceMemory>(memory)];
         created.size_blocks = slab_blocks;
         created.free.emplace(0, slab_blocks);
@@ -861,6 +867,42 @@ BufferCache::ResidentBlocks BufferCache::TakeResidentBlocks(u64 wanted) {
     }
     slab->live_blocks += count;
     return {memory, start, count};
+}
+
+vk::DeviceMemory BufferCache::AllocateResidentMemory(const vk::MemoryAllocateInfo& alloc_info,
+                                                     const char* pool) {
+    const u64 size_mib = alloc_info.allocationSize >> 20;
+    Common::Crumbs::Add("buffer memory: allocate (MiB, resident MiB)", size_mib,
+                        resident_bytes.load(std::memory_order_relaxed) >> 20);
+    if (alloc_info.allocationSize > ResidentSlabSize) {
+        const auto heaps = instance.GetMemoryHeapReport();
+        LOG_INFO(Render, "Large buffer memory allocation ({}): {} MiB | VRAM {} of {} MiB", pool,
+                 size_mib, heaps.local_usage >> 20, heaps.local_budget >> 20);
+    }
+    auto allocated = instance.GetDevice().allocateMemory(alloc_info);
+    if (allocated.result != vk::Result::eSuccess) {
+        const auto heaps = instance.GetMemoryHeapReport();
+        u64 pool_blocks = 0;
+        u64 pool_free_blocks = 0;
+        for (const auto& [raw, slab] : resident_slabs) {
+            pool_blocks += slab.size_blocks;
+            pool_free_blocks += slab.size_blocks - slab.live_blocks;
+        }
+        LOG_CRITICAL(Render,
+                     "Buffer memory allocation failed ({}): {} MiB requested, {}, memory type {} "
+                     "| VRAM {} of {} MiB (emulator budget {} MiB), system memory {} MiB | buffer "
+                     "memory {} MiB resident, {} MiB in {} pooled slabs ({} MiB free for reuse), "
+                     "{} evicted allocations waiting to be freed, buffer eviction {}",
+                     pool, size_mib, vk::to_string(allocated.result), alloc_info.memoryTypeIndex,
+                     heaps.local_usage >> 20, heaps.local_budget >> 20,
+                     instance.GetTotalMemoryBudget() >> 20, heaps.host_usage >> 20,
+                     resident_bytes.load(std::memory_order_relaxed) >> 20,
+                     (pool_blocks << block_shift) >> 20, resident_slabs.size(),
+                     (pool_free_blocks << block_shift) >> 20, retired_memory.size(),
+                     vram_reclaim ? "on" : "off");
+        Common::Crumbs::Add("buffer memory: allocation failed (MiB)", size_mib);
+    }
+    return Vulkan::Check(std::move(allocated));
 }
 
 u64 BufferCache::ReturnResidentBlocks(vk::DeviceMemory memory, u64 start, u64 count) {
