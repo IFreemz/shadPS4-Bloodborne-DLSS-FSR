@@ -2249,6 +2249,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 temporal_dlss.ObserveConstants(runtime, instance, ring, prefetched->offset, size,
                                                stage.pgm_hash, binding.unified);
                 temporal_dlss.ObserveSceneConstants(stage.FlatUserData().data(), size);
+                temporal_dlss.ObserveBlurInputs(stage.FlatUserData().data(), size, stage.pgm_hash,
+                                                binding.unified);
             } else {
                 // No barrier tracking: the GPU never writes the ring, and the host writes of a
                 // region are visible at submission (it is reused only after the GPU is done).
@@ -2257,6 +2259,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                                    size, stage.pgm_hash, binding.unified);
                     temporal_dlss.ObserveSceneConstants(
                         reinterpret_cast<const void*>(desc.GetSharp(stage).base_address), size);
+                    temporal_dlss.ObserveBlurInputs(
+                        reinterpret_cast<const void*>(desc.GetSharp(stage).base_address), size,
+                        stage.pgm_hash, binding.unified);
                 }
             }
             auto& set_write = set_writes[set_write_index++];
@@ -2285,6 +2290,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 temporal_dlss.ObserveConstants(runtime, instance, &vk_buffer, offset, ubo_size,
                                                stage.pgm_hash, binding.unified);
                 temporal_dlss.ObserveSceneConstants(flat_ud.data(), ubo_size);
+                temporal_dlss.ObserveBlurInputs(flat_ud.data(), ubo_size, stage.pgm_hash,
+                                                binding.unified);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
@@ -2352,6 +2359,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                                                    stage.pgm_hash, binding.unified);
                     temporal_dlss.ObserveSceneConstants(
                         reinterpret_cast<const void*>(vsharp.base_address), size);
+                    temporal_dlss.ObserveBlurInputs(
+                        reinterpret_cast<const void*>(vsharp.base_address), size, stage.pgm_hash,
+                        binding.unified);
                 }
             }
         }

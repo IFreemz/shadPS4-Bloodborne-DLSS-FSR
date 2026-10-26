@@ -111,6 +111,8 @@ public:
     void ObserveConstants(Runtime& runtime, const Instance& instance,
                           const VideoCore::Buffer* source, u64 offset, u64 size, u64 shader_hash,
                           u32 binding);
+    // The same bytes CPU-side: the game's motion blur inputs, for the motion blur watch.
+    void ObserveBlurInputs(const void* data, u64 size, u64 shader_hash, u32 binding);
 
     struct Presentation {
         vk::ImageView view;

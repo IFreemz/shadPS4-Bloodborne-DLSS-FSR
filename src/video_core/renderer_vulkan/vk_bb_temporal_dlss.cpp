@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -19,6 +20,7 @@
 #include "common/crash_crumbs.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/bb_game_fixes.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/host_shaders/bb_dlss_composite_comp.h"
 #include "video_core/host_shaders/bb_dlss_composite_hdr_comp.h"
@@ -484,6 +486,21 @@ struct BbTemporalDlss::Impl {
     };
     std::vector<FrameCamera> frame_cameras;
     u64 scene_camera_frames{};
+    // Motion blur watch (the whole picture but the character blurred after a respawn): the
+    // game's own motion blur matrix from the depth producer's constants, against the camera.
+    struct BlurWatch {
+        bool sampled{};
+        std::array<float, 16> matrix{};
+        float shift_px{};
+        std::array<float, 2> velocity_scale{};
+        u32 blur_draws{};
+        u32 frames{}, sampled_frames{}, still_frames{}, still_blurred{}, blur_frames{};
+        float max_shift{}, sum_shift{};
+        u32 streak{};
+        bool loading{};
+        u64 after_load_frame{};
+        std::chrono::steady_clock::time_point window_start{std::chrono::steady_clock::now()};
+    } blur;
     std::unique_ptr<OwnedImage> snapshot, motion, upscaled;
     // The HUD as its own layer (render size): this frame's and the last frame's game frame and
     // scene (with k and its confidence), alternating, and the layer itself.
@@ -707,7 +724,135 @@ struct BbTemporalDlss::Impl {
     }
 
     // After each evaluation attempt: per-frame guide inputs restart and the jitter advances.
+    // Largest shift, in pixels at 1280x720, that the game's motion blur matrix (previous to
+    // current clip space, rows) gives a grid of points on screen at a near and a far depth.
+    static float BlurShiftPx(const std::array<float, 16>& rows) {
+        float worst = 0.0f;
+        for (const float x : {-0.8f, 0.0f, 0.8f}) {
+            for (const float y : {-0.8f, 0.0f, 0.8f}) {
+                for (const float z : {0.1f, 0.9f}) {
+                    const std::array<float, 4> p{x, y, z, 1.0f};
+                    std::array<float, 4> q{};
+                    for (int i = 0; i < 4; ++i) {
+                        for (int k = 0; k < 4; ++k) {
+                            q[i] += rows[i * 4 + k] * p[k];
+                        }
+                    }
+                    if (!std::isfinite(q[0]) || !std::isfinite(q[1]) || !(std::abs(q[3]) > 1e-6f))
+                        return std::numeric_limits<float>::infinity();
+                    worst = std::max(
+                        worst, std::hypot((q[0] / q[3] - x) * 640.0f, (q[1] / q[3] - y) * 360.0f));
+                }
+            }
+        }
+        return worst;
+    }
+
+    // How far the game's blur matrix (last frame's position of each pixel) is from "nothing
+    // moved": its largest difference from the identity. With the camera still it should be ~0;
+    // BlurShiftPx's test depths (0.1, 0.9) read huge shifts from matrices that are fine near the
+    // depths the game actually uses, so it cannot tell a stuck matrix from a good one.
+    static float MatrixOffIdentity(const std::array<float, 16>& rows) {
+        float worst = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            const float expected = (i % 5 == 0) ? 1.0f : 0.0f;
+            const float diff = std::abs(rows[i] - expected);
+            if (!std::isfinite(diff))
+                return std::numeric_limits<float>::infinity();
+            worst = std::max(worst, diff);
+        }
+        return worst;
+    }
+
+    float CameraChange() const {
+        if (!camera.valid || !previous_camera.valid)
+            return -1.0f;
+        double change = 0.0;
+        for (size_t i = 0; i < camera.view.size(); ++i)
+            change = std::max(change, std::abs(camera.view[i] - previous_camera.view[i]));
+        return float(change);
+    }
+
+    std::string DescribeBlurFrame(float camera_change) const {
+        return fmt::format(
+            "game blur matrix shifts the image up to {:.1f} px, {:.4f} from not moving | camera "
+            "change {} | blur passes "
+            "{} (game motion blur {}) | velocity scale {:.4g} {:.4g} | depth {} at {:#x} | "
+            "matrix rows [{:.5f} {:.5f} {:.5f} {:.5f}] [{:.5f} {:.5f} {:.5f} {:.5f}] [{:.5f} "
+            "{:.5f} {:.5f} {:.5f}] [{:.5f} {:.5f} {:.5f} {:.5f}]",
+            blur.shift_px, MatrixOffIdentity(blur.matrix),
+            camera_change < 0.0f ? std::string{"unknown"} : fmt::format("{:.5f}", camera_change),
+            blur.blur_draws, tune.motion_blur ? "on" : "off", blur.velocity_scale[0],
+            blur.velocity_scale[1], depth_fallback ? "from another pass" : "from the producer",
+            producer_depth_address, blur.matrix[0], blur.matrix[1], blur.matrix[2], blur.matrix[3],
+            blur.matrix[4], blur.matrix[5], blur.matrix[6], blur.matrix[7], blur.matrix[8],
+            blur.matrix[9], blur.matrix[10], blur.matrix[11], blur.matrix[12], blur.matrix[13],
+            blur.matrix[14], blur.matrix[15]);
+    }
+
+    void FinishBlurFrame() {
+        // A still camera whose blur matrix is this far from "nothing moved" blurs the picture.
+        constexpr float MovingMatrix = 0.01f;
+        constexpr float StillCamera = 1e-3f;
+        const float camera_change = CameraChange();
+        ++blur.frames;
+        blur.blur_frames += blur.blur_draws != 0;
+        if (blur.sampled) {
+            ++blur.sampled_frames;
+            blur.max_shift = std::max(blur.max_shift, blur.shift_px);
+            blur.sum_shift += std::isfinite(blur.shift_px) ? blur.shift_px : 0.0f;
+            const bool still = camera_change >= 0.0f && camera_change < StillCamera;
+            blur.still_frames += still;
+            if (still && MatrixOffIdentity(blur.matrix) > MovingMatrix) {
+                ++blur.still_blurred;
+                if (++blur.streak == 30)
+                    LOG_WARNING(Render_Vulkan,
+                                "[BB-BLUR] Camera still for 30 frames but the game's motion "
+                                "blur matrix still moves the image (the picture is blurred): {}",
+                                DescribeBlurFrame(camera_change));
+            } else {
+                if (blur.streak >= 30)
+                    LOG_INFO(Render_Vulkan,
+                             "[BB-BLUR] Game blur matrix back to the camera after {} frames",
+                             blur.streak);
+                blur.streak = 0;
+            }
+        }
+        const bool loading = Core::BbGameFixes::IsLoadingScreen();
+        if (blur.loading && !loading)
+            blur.after_load_frame = frame;
+        blur.loading = loading;
+        if (blur.after_load_frame && frame - blur.after_load_frame <= 300 &&
+            (frame - blur.after_load_frame) % 60 == 0)
+            LOG_INFO(Render_Vulkan, "[BB-BLUR] {} frames after the loading screen: {}{}",
+                     frame - blur.after_load_frame, blur.sampled ? "" : "(no depth producer) ",
+                     DescribeBlurFrame(camera_change));
+        const auto now = std::chrono::steady_clock::now();
+        if (now - blur.window_start >= std::chrono::seconds{10}) {
+            if (blur.frames != 0)
+                LOG_INFO(Render_Vulkan,
+                         "[BB-BLUR] last 10 s: {} frames, {} with the depth producer, {} with "
+                         "motion blur passes | game blur matrix shift avg {:.1f} px, max {:.1f} "
+                         "px | camera still in {} frames, {} of them with a moving blur matrix "
+                         "(over {:.2f} from not moving)",
+                         blur.frames, blur.sampled_frames, blur.blur_frames,
+                         blur.sampled_frames ? blur.sum_shift / blur.sampled_frames : 0.0f,
+                         blur.max_shift, blur.still_frames, blur.still_blurred, MovingMatrix);
+            const auto streak = blur.streak;
+            const auto loading_state = blur.loading;
+            const auto after_load = blur.after_load_frame;
+            blur = {};
+            blur.streak = streak;
+            blur.loading = loading_state;
+            blur.after_load_frame = after_load;
+            blur.window_start = now;
+        }
+        blur.sampled = false;
+        blur.blur_draws = 0;
+    }
+
     void FrameBoundary(Scheduler& scheduler, BbVelocityMirror& mirror) {
+        FinishBlurFrame();
         if (frame - small_report_frame >= 600) {
             small_report_frame = frame;
             LOG_INFO(Render_Vulkan,
@@ -2005,6 +2150,21 @@ void BbTemporalDlss::ObserveTexture(const VideoCore::Image& image, VideoCore::Im
         impl->hdr_copy_source = Impl::Bound{id, view};
 }
 
+void BbTemporalDlss::ObserveBlurInputs(const void* data, u64 size, u64 hash, u32 binding) {
+    auto& s = *impl;
+    if (!s.requested || s.failed || s.stopped || !data)
+        return;
+    const auto* f = static_cast<const float*>(data);
+    if (hash == DepthProducer && binding == 0 && !s.blur.sampled &&
+        size >= (0x380 + 16) * sizeof(float)) {
+        std::copy_n(f + 0x380, 16, s.blur.matrix.begin());
+        s.blur.shift_px = Impl::BlurShiftPx(s.blur.matrix);
+        s.blur.sampled = true;
+    } else if (hash == OpaqueVelocity && binding == 0 && size >= 2 * sizeof(float)) {
+        s.blur.velocity_scale = {f[0], f[1]};
+    }
+}
+
 void BbTemporalDlss::ObserveSceneConstants(const void* data, u64 size) {
     auto& s = *impl;
     if (!s.requested || s.failed || s.stopped || !data || size < 192 * sizeof(float))
@@ -2077,6 +2237,7 @@ std::array<float, 2> BbTemporalDlss::OnDraw(const Instance& instance, Runtime& r
     auto* color = draw.color ? &cache.GetImage(draw.color) : nullptr;
     try {
         if (draw.ps_hash == MotionBlur || draw.ps_hash == MotionBlurAlt) {
+            ++s.blur.blur_draws;
             const auto source = std::exchange(s.blur_source, std::nullopt);
             if (s.tune.motion_blur || !color || !source || source->id == draw.color)
                 return {};
