@@ -64,6 +64,16 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+    {
+        const int copy_threads = EmulatorSettings.GetBbCopyThreads();
+        const u32 workers = Common::CopyPool::Configure(
+            Common::BbTuning::IsBloodborne(Common::ElfInfo::Instance().GameSerial()) &&
+                    copy_threads > 0
+                ? static_cast<u32>(copy_threads)
+                : 0u);
+        LOG_INFO(Render_Vulkan, "Copy threads: {} (setting {})", workers,
+                 copy_threads > 0 ? std::to_string(copy_threads) : std::string{"auto"});
+    }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -1362,6 +1372,11 @@ void Rasterizer::ReportHitch() {
     now.present_frame_wait_ns = GS::present_frame_wait_ns.load(std::memory_order_relaxed);
     now.presents = GS::presents.load(std::memory_order_relaxed);
     now.queue_ops_behind_present = GS::queue_ops_behind_present.load(std::memory_order_relaxed);
+    now.skipped_bytes = GS::image_skipped_bytes.load(std::memory_order_relaxed);
+    now.direct_bytes = GS::image_direct_bytes.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < now.upload_ages.size(); ++i) {
+        now.upload_ages[i] = GS::upload_age_bytes[i].load(std::memory_order_relaxed);
+    }
     now.gpu_busy_ns = GS::gpu_timeline_busy_ns.load(std::memory_order_relaxed);
     now.gpu_idle_ns = GS::gpu_timeline_idle_ns.load(std::memory_order_relaxed);
     now.gpu_submits = GS::gpu_timeline_submits.load(std::memory_order_relaxed);
@@ -1432,7 +1447,8 @@ void Rasterizer::ReportHitch() {
             "{:.1f} ms, {} packets | GPU waits {} ({:.1f} ms, longest {:.1f} ms at {}:{}) | {} "
             "pipelines compiled ({} more and {} shaders in the background, {} draws skipped "
             "meanwhile, waited {:.1f} ms for them) | {} "
-            "texture uploads ({:.1f} MiB, {:.1f} ms, copying {:.1f} ms) | "
+            "texture uploads ({:.1f} MiB, {:.1f} ms, copying {:.1f} ms, {:.1f} MiB of left-out "
+            "levels not copied, {:.1f} MiB copied directly) | "
             "buffer uploads {:.1f} MiB, {:.1f} ms | {} buffer ranges made resident ({:.1f} MiB, "
             "{:.1f} ms) | {} staging allocations ({:.1f} MiB, {:.1f} ms) | {} background "
             "copies (1 MiB pieces), waited {:.1f} ms | page protection {} "
@@ -1454,6 +1470,8 @@ void Rasterizer::ReportHitch() {
             delta(now.upload_bytes, last.upload_bytes) / 1048576.0,
             ms_of(delta(now.upload_ns, last.upload_ns)),
             ms_of(delta(now.image_copy_ns, last.image_copy_ns)),
+            delta(now.skipped_bytes, last.skipped_bytes) / 1048576.0,
+            delta(now.direct_bytes, last.direct_bytes) / 1048576.0,
             delta(now.buffer_bytes, last.buffer_bytes) / 1048576.0,
             ms_of(delta(now.buffer_ns, last.buffer_ns)), delta(now.arena_binds, last.arena_binds),
             delta(now.resident_bytes, last.resident_bytes) / 1048576.0,
@@ -1490,6 +1508,29 @@ void Rasterizer::ReportHitch() {
             ms_of(delta(now.present_queue_ns, last.present_queue_ns)),
             ms_of(delta(now.present_frame_wait_ns, last.present_frame_wait_ns)),
             delta(now.queue_ops_behind_present, last.queue_ops_behind_present));
+        // Where this frame's texture uploads came from and how long before the upload their data
+        // went stale: what copying earlier (when the data is written) could take off the frame.
+        {
+            static constexpr std::array<const char*, 3> sources{
+                "written by the game", "written by the GPU", "maybe written (small)"};
+            const auto age_mib = [&](GS::DirtySource source, size_t bucket) {
+                const size_t i = static_cast<size_t>(source) * GS::UploadAgeBuckets + bucket;
+                return delta(now.upload_ages[i], last.upload_ages[i]) / 1048576.0;
+            };
+            std::string by_source =
+                fmt::format("new textures {:.1f}", age_mib(GS::DirtySource::New, 0));
+            for (size_t s = 1; s < static_cast<size_t>(GS::DirtySource::Count); ++s) {
+                const auto source = static_cast<GS::DirtySource>(s);
+                by_source +=
+                    fmt::format(" | {} {:.1f} / {:.1f} / {:.1f} / {:.1f} / {:.1f}", sources[s - 1],
+                                age_mib(source, 0), age_mib(source, 1), age_mib(source, 2),
+                                age_mib(source, 3), age_mib(source, 4));
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "Stutter uploads by source (MiB; for writes, how long before the upload: "
+                        "under 1 / 1-2 / 2-6 / 6-30 / 30+ frames): {}",
+                        by_source);
+        }
         const auto heaps = instance.GetMemoryHeapReport();
         const auto& cleanup_now = now.cleanup;
         const auto& cleanup_last = last.cleanup;

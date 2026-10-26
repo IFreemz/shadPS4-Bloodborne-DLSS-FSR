@@ -211,6 +211,10 @@ public:
     /// Texture quality: the largest guest levels the Vulkan image leaves out (it is that much
     /// smaller, and its level 0 is guest level dropped_levels).
     u32 dropped_levels{};
+    /// Upload statistics: when the image's contents last became stale (steady clock ns; 0 for an
+    /// image not uploaded yet) and how (DirtySource).
+    u64 dirty_since_ns{};
+    u8 dirty_source{};
 
     struct {
         u32 texture : 1;

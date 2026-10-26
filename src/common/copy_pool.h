@@ -38,4 +38,8 @@ void Async(std::function<void()> task);
 /// Returns whether there was anything to wait for.
 bool WaitAsync();
 
+/// The number of pool threads (0: a quarter of the logical cores, at most 4). Only before the
+/// pool's first use; returns the number it runs with.
+u32 Configure(u32 workers);
+
 } // namespace Common::CopyPool

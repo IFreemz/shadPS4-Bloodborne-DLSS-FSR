@@ -186,6 +186,10 @@ private:
     bool bbRealOcclusionSetting;
     bool bbCopyThreadSetting;
     bool bbRenderDuringPresentSetting;
+    bool bbSkipLeftOutLevelsSetting;
+    bool bbDirectTextureCopiesSetting;
+    int bbCopyThreadsSetting; ///< index into copyThreadOptions
+    bool bbCachedTextureStagingSetting;
     bool bbSpreadLoadsSetting;
     bool bbStutterDetailSetting;
     int bbVramBudgetTestSetting;

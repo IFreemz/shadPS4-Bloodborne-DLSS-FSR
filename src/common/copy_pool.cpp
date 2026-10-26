@@ -16,12 +16,18 @@ namespace Common::CopyPool {
 
 namespace {
 
+std::atomic<u32> requested_workers{0};
+
 class Pool {
 public:
     Pool() {
         // A few threads: memory bandwidth, not cores, limits copies, and the game needs its own.
+        // Copy threads (setting): more, for traversal bursts of 200-440 MiB of new textures.
         const u32 hardware = std::max(1u, std::thread::hardware_concurrency());
-        const u32 workers = std::clamp(hardware / 4, 1u, 4u);
+        const u32 requested = requested_workers.load(std::memory_order_relaxed);
+        const u32 workers = requested != 0
+                                ? std::clamp(requested, 1u, hardware > 2 ? hardware - 2 : 1u)
+                                : std::clamp(hardware / 4, 1u, 4u);
         for (u32 i = 0; i < workers; ++i) {
             threads.emplace_back([this](std::stop_token stop) { WorkerLoop(stop); });
         }
@@ -156,6 +162,12 @@ private:
         }
     }
 
+public:
+    u32 Workers() const {
+        return static_cast<u32>(threads.size());
+    }
+
+private:
     std::vector<std::jthread> threads;
     std::mutex job_mutex; ///< one job at a time; other callers copy inline
     std::mutex mutex;
@@ -201,6 +213,11 @@ void Async(std::function<void()> task) {
 
 bool WaitAsync() {
     return GetPool().WaitAsync();
+}
+
+u32 Configure(u32 workers) {
+    requested_workers.store(workers, std::memory_order_relaxed);
+    return GetPool().Workers();
 }
 
 } // namespace Common::CopyPool

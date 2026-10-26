@@ -649,26 +649,59 @@ std::pair<const Buffer*, u64> BufferCache::ObtainGeometryBuffer(VAddr device_add
     return {arena, arena->Offset(device_addr)};
 }
 
-std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
+std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size,
+                                                                u32 skip) {
     if (IsRegionGpuModified(device_addr, size)) {
         return ObtainBuffer(device_addr, size, false);
     }
-    const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
-                                              instance.StorageMinAlignment());
+    // Cached texture staging: the CPU's copy into cached memory runs at normal memory speed
+    // (write-combined memory needs long sequential writes); the GPU then reads it over the bus.
+    const auto staging_type =
+        Common::BbTuning::Threaded() && EmulatorSettings.IsBbCachedTextureStaging()
+            ? VideoCore::MemoryType::HostCached
+            : VideoCore::MemoryType::HostUncached;
+    const auto staging = staging_pool.Request(size, staging_type, instance.StorageMinAlignment());
+    // Left-out levels: the staging memory keeps the image's layout, their bytes are just not
+    // filled (nothing copies them into the image).
+    skip = static_cast<u32>(std::min<u64>(skip, staging.size));
+    Common::GuestStats::image_skipped_bytes.fetch_add(skip, std::memory_order_relaxed);
     const auto start = std::chrono::steady_clock::now();
+    // Direct texture copies: from the game's own addresses (their pages are mapped in, the game
+    // just wrote them) instead of the backing memory's view, whose untouched pages fault on the
+    // first read. Only the texture itself: the staging size may run past it. Unmapping waits for
+    // background copies (Rasterizer::UnmapMemory).
+    const u64 copy_end = std::min<u64>(size, staging.size);
+    const bool direct = Common::BbTuning::Threaded() &&
+                        EmulatorSettings.IsBbDirectTextureCopies() && copy_end > skip &&
+                        memory->IsReadableMapping(device_addr + skip, copy_end - skip);
+    if (direct) {
+        Common::GuestStats::image_direct_bytes.fetch_add(copy_end - skip,
+                                                         std::memory_order_relaxed);
+    }
+    const auto copy = [memory = memory, direct, device_addr, copy_end](u64 offset, u8* destination,
+                                                                       u64 length) {
+        if (direct) {
+            const u64 direct_length = offset < copy_end ? std::min(length, copy_end - offset) : 0;
+            std::memcpy(destination, std::bit_cast<const u8*>(device_addr + offset), direct_length);
+            if (direct_length < length) {
+                std::memset(destination + direct_length, 0, length - direct_length);
+            }
+        } else {
+            memory->CopySparseMemory(device_addr + offset, destination, length);
+        }
+    };
     if (staging.size >= BackgroundCopyMin && Common::BbTuning::Threaded() &&
         EmulatorSettings.IsBbBackgroundTextureCopies()) {
         // Streaming a new area uploads ~1000 textures, ~200 KiB each, in a frame: copied one by
         // one they held up the draw recorder for tens of ms. On the copy threads, in pieces of up
         // to 1 MiB; waited for before the submission that reads the staging memory
         // (Scheduler::SubmitExecution) and before the guest sees a fence (Rasterizer::OnFence).
-        for (u64 offset = 0; offset < staging.size; offset += BackgroundCopyPiece) {
+        for (u64 offset = skip; offset < staging.size; offset += BackgroundCopyPiece) {
             const u64 length = std::min(BackgroundCopyPiece, staging.size - offset);
             Common::GuestStats::async_copies.fetch_add(1, std::memory_order_relaxed);
-            Common::CopyPool::Async([memory = memory, source = device_addr + offset,
-                                     destination = staging.mapped + offset, length,
+            Common::CopyPool::Async([copy, offset, destination = staging.mapped + offset, length,
                                      buffer = staging.buffer, flush = staging.offset + offset] {
-                memory->CopySparseMemory(source, destination, length);
+                copy(offset, destination, length);
                 buffer->Flush(flush, length);
             });
         }
@@ -676,11 +709,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     }
     if (Common::BbTuning::Streaming()) {
         // Streaming a new area copies 100+ MiB of textures in a frame: large ones in parallel.
-        Common::CopyPool::SplitCopy(staging.size, [&](u64 offset, u64 length) {
-            memory->CopySparseMemory(device_addr + offset, staging.mapped + offset, length);
+        Common::CopyPool::SplitCopy(staging.size - skip, [&](u64 offset, u64 length) {
+            copy(skip + offset, staging.mapped + skip + offset, length);
         });
     } else {
-        memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+        copy(skip, staging.mapped + skip, staging.size - skip);
     }
     Common::GuestStats::image_copy_ns.fetch_add(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -

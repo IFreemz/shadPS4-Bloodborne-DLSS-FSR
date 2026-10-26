@@ -548,7 +548,7 @@ private:
 private:
     void RestoreFullQuality();
     void NoteEvicted(const Image& image);
-    void NoteUpload(const Image& image);
+    void NoteUpload(Image& image);
     void LoadScreenCleanup();
     void UpdateVramLimits();
     void ReportPastBudget();

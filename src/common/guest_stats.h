@@ -49,6 +49,18 @@ inline std::atomic<u64> image_upload_ns{0};
 inline std::atomic<u64> queue_ops_behind_present{0};
 /// Guest memory copied into staging for texture uploads (part of image_upload_ns).
 inline std::atomic<u64> image_copy_ns{0};
+/// Texture uploads by what made the texture stale and how long before its upload: bytes per
+/// [source][age]. Sources: a new texture (when its data was written is unknown), a game (CPU)
+/// write, a GPU write to its memory, a possible game write (small textures, checked by hash).
+/// Ages in 60 Hz frames: under 1, 1-2, 2-6, 6-30, 30 or more.
+enum class DirtySource : u8 { New, Cpu, Gpu, MaybeCpu, Count };
+inline constexpr size_t UploadAgeBuckets = 5;
+inline std::array<std::atomic<u64>, static_cast<size_t>(DirtySource::Count) * UploadAgeBuckets>
+    upload_age_bytes{};
+/// Copy only kept texture levels: guest bytes of left-out levels not copied for uploads.
+inline std::atomic<u64> image_skipped_bytes{0};
+/// Direct texture copies: guest bytes copied from the game's own addresses.
+inline std::atomic<u64> image_direct_bytes{0};
 /// Buffer data uploaded from guest memory, and the time the copies took.
 inline std::atomic<u64> buffer_upload_bytes{0};
 inline std::atomic<u64> buffer_upload_ns{0};

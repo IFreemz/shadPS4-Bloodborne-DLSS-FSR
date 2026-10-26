@@ -100,6 +100,13 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbRealOcclusionSetting = EmulatorSettings.IsBbRealOcclusion();
     bbCopyThreadSetting = EmulatorSettings.IsBbCopyThread();
     bbRenderDuringPresentSetting = EmulatorSettings.IsBbRenderDuringPresent();
+    bbSkipLeftOutLevelsSetting = EmulatorSettings.IsBbSkipLeftOutLevels();
+    bbDirectTextureCopiesSetting = EmulatorSettings.IsBbDirectTextureCopies();
+    {
+        const int threads = EmulatorSettings.GetBbCopyThreads();
+        bbCopyThreadsSetting = threads >= 8 ? 2 : threads >= 6 ? 1 : 0;
+    }
+    bbCachedTextureStagingSetting = EmulatorSettings.IsBbCachedTextureStaging();
     bbSpreadLoadsSetting = EmulatorSettings.IsBbSpreadLoads();
     {
         // 0 (the game's own), 2, 4, 8, 16 -> 0..4
@@ -204,6 +211,11 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbRealOcclusion(bbRealOcclusionSetting, isSpecific);
     EmulatorSettings.SetBbCopyThread(bbCopyThreadSetting, isSpecific);
     EmulatorSettings.SetBbRenderDuringPresent(bbRenderDuringPresentSetting, isSpecific);
+    EmulatorSettings.SetBbSkipLeftOutLevels(bbSkipLeftOutLevelsSetting, isSpecific);
+    EmulatorSettings.SetBbDirectTextureCopies(bbDirectTextureCopiesSetting, isSpecific);
+    EmulatorSettings.SetBbCopyThreads(std::array{0, 6, 8}[std::clamp(bbCopyThreadsSetting, 0, 2)],
+                                      isSpecific);
+    EmulatorSettings.SetBbCachedTextureStaging(bbCachedTextureStagingSetting, isSpecific);
     EmulatorSettings.SetBbSpreadLoads(bbSpreadLoadsSetting, isSpecific);
     EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
                                      isSpecific);
@@ -961,6 +973,18 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Frame limiters like RTSS don't hold up rendering");
                 AddSettingCheckbox("    Spread area loading", bbSpreadLoadsSetting,
                                    "Respawns and area loads upload textures over a few frames");
+                AddSettingCheckbox("    Copy only kept texture levels", bbSkipLeftOutLevelsSetting,
+                                   "Texture quality High/Medium: less data copied per upload");
+                AddSettingCheckbox("    Direct texture copies", bbDirectTextureCopiesSetting,
+                                   "Texture data read straight from game memory (faster loads)");
+                AddSettingCombo("    Copy threads", bbCopyThreadsSetting, {"Auto (4)", "6", "8"});
+                if (ImGui::IsItemHovered()) {
+                    ShowTooltip("Threads copying texture data when an area streams in: more "
+                                "copy faster but compete with the game's threads (needs a "
+                                "restart)");
+                }
+                AddSettingCheckbox("    Cached texture staging", bbCachedTextureStagingSetting,
+                                   "Texture uploads staged in cached memory (faster copies)");
             }
 
             AddSettingSection("Graphics", "Picture quality and the in-game windows.", false);

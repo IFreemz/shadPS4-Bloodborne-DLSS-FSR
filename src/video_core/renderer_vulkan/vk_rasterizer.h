@@ -236,8 +236,9 @@ private:
             protect_ns{}, protect_calls{}, faults{};
         std::array<u64, static_cast<size_t>(Common::GuestStats::CmdState::Count) * 2> states{};
         u64 present_acquire_ns{}, present_queue_ns{}, present_frame_wait_ns{}, presents{},
-            queue_ops_behind_present{}, gpu_busy_ns{}, gpu_idle_ns{}, gpu_submits{},
-            queue_submit_ns{};
+            queue_ops_behind_present{}, skipped_bytes{}, direct_bytes{}, gpu_busy_ns{},
+            gpu_idle_ns{}, gpu_submits{}, queue_submit_ns{};
+        std::array<u64, Common::GuestStats::upload_age_bytes.size()> upload_ages{};
         u64 mutex_waits{}, sleeps{}, sleep_ns{}, uploads{}, upload_bytes{}, upload_ns{},
             image_copy_ns{}, buffer_bytes{}, buffer_ns{}, resident_ns{}, staging_count{},
             staging_bytes{}, staging_ns{}, async_copies{}, async_wait_ns{}, file_opens{},

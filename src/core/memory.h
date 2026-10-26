@@ -254,6 +254,10 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
+    /// True when the range is mapped and readable by the game: it can be copied from its own
+    /// addresses (Direct texture copies), not through the backing memory's view.
+    bool IsReadableMapping(VAddr virtual_addr, u64 size);
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);

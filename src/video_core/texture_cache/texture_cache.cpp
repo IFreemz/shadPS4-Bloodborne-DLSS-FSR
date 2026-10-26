@@ -357,7 +357,17 @@ void TextureCache::CompleteWriteBacks() {
     }
 }
 
+// Upload statistics: the first moment since its last upload that the image became stale.
+static void NoteDirty(Image& image, Common::GuestStats::DirtySource source) {
+    if (image.dirty_since_ns == 0) {
+        image.dirty_since_ns = static_cast<u64>(
+            std::chrono::steady_clock::now().time_since_epoch() / std::chrono::nanoseconds{1});
+        image.dirty_source = static_cast<u8>(source);
+    }
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
+    NoteDirty(image, Common::GuestStats::DirtySource::MaybeCpu);
     if (image.hash == 0) {
         // Initialize hash
         const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
@@ -390,6 +400,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
             image.flags |= ImageFlagBits::CpuDirty;
+            NoteDirty(image, Common::GuestStats::DirtySource::Cpu);
             ClearCleanTick(image);
             UntrackImage(image_id);
         } else if (pages_end < image_end) {
@@ -420,6 +431,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        NoteDirty(image, Common::GuestStats::DirtySource::Gpu);
         ClearCleanTick(image);
     });
 }
@@ -1029,6 +1041,27 @@ static void DropLeftOutLevels(const Image& image, SmallVector<vk::BufferImageCop
     }
 }
 
+// Copy only kept texture levels: the guest bytes in front of the first level the image keeps
+// (its left-out levels), which an upload does not need to copy. 0 when a left-out level lies
+// after a kept one, or with the setting off.
+static u32 LeftOutBytes(const Image& image) {
+    const u32 levels = image.info.resources.levels;
+    if (image.dropped_levels == 0 || image.dropped_levels >= levels ||
+        !EmulatorSettings.IsBbSkipLeftOutLevels()) {
+        return 0;
+    }
+    u32 kept_start = image.info.guest_size;
+    for (u32 m = image.dropped_levels; m < levels; ++m) {
+        kept_start = std::min(kept_start, image.info.mips_layout[m].offset);
+    }
+    for (u32 m = 0; m < image.dropped_levels; ++m) {
+        if (image.info.mips_layout[m].offset >= kept_start) {
+            return 0;
+        }
+    }
+    return kept_start;
+}
+
 bool TextureCache::PrepareRefresh(Image& image,
                                   SmallVector<vk::BufferImageCopy, 14>& image_copies) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
@@ -1194,8 +1227,8 @@ void TextureCache::RefreshImage(Image& image) {
     const auto upload_start = std::chrono::steady_clock::now();
     namespace GSD = Common::GuestStats;
     std::optional<GSD::DetailTimer> timer{std::in_place, GSD::Detail::TexStaging};
-    const auto [in_buffer, in_offset] =
-        buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+    const auto [in_buffer, in_offset] = buffer_cache.ObtainBufferForImage(
+        image.info.guest_address, image.info.guest_size, LeftOutBytes(image));
     timer.emplace(GSD::Detail::TexDetile);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
     for (auto& copy : image_copies) {
@@ -1289,8 +1322,8 @@ void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
             if (!PrepareRefresh(image, job.copies)) {
                 continue;
             }
-            const auto [buffer, offset] =
-                buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+            const auto [buffer, offset] = buffer_cache.ObtainBufferForImage(
+                image.info.guest_address, image.info.guest_size, LeftOutBytes(image));
             job.buffer = buffer;
             job.offset = offset;
             jobs.push_back(std::move(job));
@@ -1880,7 +1913,23 @@ static size_t SizeClassOf(u64 bytes) {
 static constexpr std::array<const char*, 5> SizeClassNames{"under 256 KiB", "256 KiB-1 MiB",
                                                            "1-4 MiB", "4-16 MiB", "16 MiB+"};
 
-void TextureCache::NoteUpload(const Image& image) {
+void TextureCache::NoteUpload(Image& image) {
+    {
+        namespace GS = Common::GuestStats;
+        const u64 now = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch() /
+                                         std::chrono::nanoseconds{1});
+        size_t source = static_cast<size_t>(GS::DirtySource::New);
+        size_t bucket = 0;
+        if (image.dirty_since_ns != 0) {
+            source = image.dirty_source;
+            constexpr u64 FrameNs = 16'666'667;
+            const u64 frames = (now - std::min(now, image.dirty_since_ns)) / FrameNs;
+            bucket = frames < 1 ? 0 : frames < 2 ? 1 : frames < 6 ? 2 : frames < 30 ? 3 : 4;
+        }
+        GS::upload_age_bytes[source * GS::UploadAgeBuckets + bucket].fetch_add(
+            image.info.guest_size, std::memory_order_relaxed);
+        image.dirty_since_ns = 0;
+    }
     const size_t size_class = SizeClassOf(image.info.guest_size);
     upload_count_by_size[size_class].fetch_add(1, std::memory_order_relaxed);
     upload_bytes_by_size[size_class].fetch_add(image.info.guest_size, std::memory_order_relaxed);

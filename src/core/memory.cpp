@@ -161,6 +161,20 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
     }
 }
 
+bool MemoryManager::IsReadableMapping(VAddr virtual_addr, u64 size) {
+    std::shared_lock lk{mutex};
+    if (size == 0 || !IsValidMapping(virtual_addr, size)) {
+        return false;
+    }
+    const VAddr end = virtual_addr + size;
+    for (auto it = FindVMA(virtual_addr); it != vma_map.end() && it->second.base < end; ++it) {
+        if (!it->second.IsMapped() || False(it->second.prot & MemoryProt::CpuRead)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::shared_lock lk{mutex};

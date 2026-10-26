@@ -551,6 +551,15 @@ struct GPUSettings {
     // the present), the GPU threads' submissions queue up and go to the GPU right after it
     // returns, instead of the threads waiting for the queue. Off: they wait for the present.
     Setting<bool> bb_render_during_present{false};
+    // Texture quality High/Medium: the guest data of a texture's left-out largest level is not
+    // copied for its uploads (only the levels kept), which is most of a traversal burst's bytes
+    // for the textures it reduces. Off: the whole texture is copied and the level dropped after.
+    Setting<bool> bb_skip_left_out_levels{false};
+    // Threaded renderer: texture data is copied from the game's own addresses when the whole
+    // texture is mapped and readable, not through the view of the backing memory (whose pages
+    // the process has not touched yet: the first read of each 4 KiB page costs a fault, which
+    // made traversal copies run at ~5 GB/s). Off: always through the backing view.
+    Setting<bool> bb_direct_texture_copies{false};
     // Threaded renderer: when an area loads (hundreds of textures in a second), texture uploads
     // past 64 MiB a frame wait for the next frames (new ones show black meanwhile), so the load
     // is spread over several frames. Off: everything uploaded at once.
@@ -633,6 +642,10 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_copy_thread", &GPUSettings::bb_copy_thread),
             make_override<GPUSettings>("bb_render_during_present",
                                        &GPUSettings::bb_render_during_present),
+            make_override<GPUSettings>("bb_skip_left_out_levels",
+                                       &GPUSettings::bb_skip_left_out_levels),
+            make_override<GPUSettings>("bb_direct_texture_copies",
+                                       &GPUSettings::bb_direct_texture_copies),
             make_override<GPUSettings>("bb_spread_loads", &GPUSettings::bb_spread_loads),
             make_override<GPUSettings>("bb_stutter_detail", &GPUSettings::bb_stutter_detail),
             make_override<GPUSettings>("bb_defaults", &GPUSettings::bb_defaults),
@@ -654,7 +667,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_submit_overlap, bb_overlap_frames, bb_early_writeback, bb_stutter_detail, bb_defaults,
     bb_merged_copy_commands, bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait,
     bb_hardware_interpolation, bb_real_occlusion, bb_copy_thread, bb_spread_loads,
-    bb_render_during_present)
+    bb_render_during_present, bb_skip_left_out_levels, bb_direct_texture_copies)
 
 // -------------------------------
 // Vulkan settings
@@ -671,6 +684,14 @@ struct VulkanSettings {
     Setting<bool> vkguest_markers{false};
     Setting<bool> pipeline_cache_enabled{false};
     Setting<bool> pipeline_cache_archived{false};
+    // Bloodborne threaded renderer (here: GPUSettings' JSON field list is at its 64 limit).
+    // Copy threads for texture and buffer data (0 = a quarter of the logical cores, at most 4, as
+    // before; otherwise this many, leaving two cores); applies after a restart. Traversal bursts
+    // of new textures copy 200-440 MiB in one frame at ~7 GB/s on 4.
+    Setting<int> bb_copy_threads{0};
+    // Texture uploads staged in cached system memory instead of write-combined (uncached)
+    // memory: faster for the CPU's copy, possibly slower for the GPU's read. Off: uncached.
+    Setting<bool> bb_cached_texture_staging{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -692,6 +713,9 @@ struct VulkanSettings {
                                           &VulkanSettings::pipeline_cache_enabled),
             make_override<VulkanSettings>("pipeline_cache_archived",
                                           &VulkanSettings::pipeline_cache_archived),
+            make_override<VulkanSettings>("bb_copy_threads", &VulkanSettings::bb_copy_threads),
+            make_override<VulkanSettings>("bb_cached_texture_staging",
+                                          &VulkanSettings::bb_cached_texture_staging),
         };
     }
 };
@@ -699,7 +723,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(VulkanSettings, gpu_id, renderdoc_enabled, vk
                                    vkvalidation_core_enabled, vkvalidation_sync_enabled,
                                    vkvalidation_gpu_enabled, vkcrash_diagnostic_enabled,
                                    vkhost_markers, vkguest_markers, pipeline_cache_enabled,
-                                   pipeline_cache_archived)
+                                   pipeline_cache_archived, bb_copy_threads,
+                                   bb_cached_texture_staging)
 
 // -------------------------------
 // Main manager
@@ -984,6 +1009,10 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbRealOcclusion, bb_real_occlusion)
     SETTING_FORWARD_BOOL(m_gpu, BbCopyThread, bb_copy_thread)
     SETTING_FORWARD_BOOL(m_gpu, BbRenderDuringPresent, bb_render_during_present)
+    SETTING_FORWARD_BOOL(m_gpu, BbSkipLeftOutLevels, bb_skip_left_out_levels)
+    SETTING_FORWARD_BOOL(m_gpu, BbDirectTextureCopies, bb_direct_texture_copies)
+    SETTING_FORWARD(m_vulkan, BbCopyThreads, bb_copy_threads)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCachedTextureStaging, bb_cached_texture_staging)
     SETTING_FORWARD_BOOL(m_gpu, BbSpreadLoads, bb_spread_loads)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)

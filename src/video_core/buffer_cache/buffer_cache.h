@@ -148,7 +148,9 @@ public:
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainGeometryBuffer(VAddr device_addr, u32 size);
 
     /// Attempts to obtain a buffer without modifying the cache contents.
-    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
+    /// The first `skip` bytes are not needed (levels the image leaves out): not copied.
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size,
+                                                                     u32 skip = 0);
 
     /// Writes a GPU-produced buffer range back to emulated memory.
     bool DownloadMemoryFromBuffer(const Buffer* arena, VAddr device_addr, u64 size);
