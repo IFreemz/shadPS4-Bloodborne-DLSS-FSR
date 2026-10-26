@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <filesystem>
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_init.h>
@@ -14,6 +16,7 @@
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/logging/formatter.h"
+#include "common/path_util.h"
 #include "common/scope_exit.h"
 #include "core/bb_mouse_camera.h"
 #include "core/debug_state.h"
@@ -98,6 +101,25 @@ static Uint32 SDLCALL PollControllerLightColour(void* userdata, SDL_TimerID time
     return interval;
 }
 
+// Why overlays can come out a different size depending on how shadPS4 was started: the
+// window's size in pixels against its size in Windows' scaled units, the display scale menus
+// multiply their text by, compatibility settings a launcher passes on, and where the settings
+// were read from.
+void WindowSDL::LogDisplaySetup() {
+    int logical_width = 0;
+    int logical_height = 0;
+    SDL_GetWindowSize(window, &logical_width, &logical_height);
+    const char* compat_layer = std::getenv("__COMPAT_LAYER");
+    LOG_INFO(Frontend,
+             "Display: window {}x{} pixels, {}x{} in scaled units, display scale {:.2f}, pixel "
+             "density {:.2f} | compatibility settings from the launcher: {} | started in {} | "
+             "settings from {}",
+             width, height, logical_width, logical_height, SDL_GetWindowDisplayScale(window),
+             SDL_GetWindowPixelDensity(window), compat_layer ? compat_layer : "none",
+             std::filesystem::current_path().string(),
+             Common::FS::GetUserPath(Common::FS::PathType::UserDir).string());
+}
+
 WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controllers_,
                      std::string_view window_title)
     : width{width_}, height{height_}, controllers{*controllers_} {
@@ -142,6 +164,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // The window geometry is only final once the fullscreen transition has settled; refresh
     // the cached size so the first swapchain and the splashscreen use the real drawable size.
     SDL_GetWindowSizeInPixels(window, &width, &height);
+    LogDisplaySetup();
 
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 

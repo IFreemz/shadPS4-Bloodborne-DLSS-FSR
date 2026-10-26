@@ -5,7 +5,9 @@
 
 #include <functional>
 #include <map>
+#include <string_view>
 #include <variant>
+#include <vector>
 #include <SDL3/SDL.h>
 #include <imgui.h>
 
@@ -32,6 +34,7 @@ private:
         Folders,
         Log,
         Experimental,
+        Bloodborne,
     };
 
     void SaveSettings(std::string profile);
@@ -43,16 +46,20 @@ private:
     void GetProfileInfo();
 
     void DrawMainContent(bool* open, const std::function<void()>& applySettings);
+    bool CloseKeyPressed() const;
+    std::vector<SettingsCategory> VisibleCategories() const;
     void DrawSettingsTable(SettingsCategory);
     void DrawProfileSelector();
     void DrawGameFolderManager();
     void DrawCategoryTabs();
     void AddCategory(std::string name, std::variant<SDL_Texture*, ImGui::RefCountedTexture> texture,
-                     SettingsCategory category);
+                     SettingsCategory category, float center_x, float max_text_width);
 
     void AddSettingCheckbox(std::string name, bool& value);
     /// A checkbox with a short grey hint beside it (seen without hovering, also on a pad).
     void AddSettingCheckbox(std::string name, bool& value, const char* hint);
+    void AddHint(std::string_view hint);
+    void ShowTooltip(std::string_view text);
     /// A section heading row: a coloured title, and a short note beside it.
     void AddSettingSection(const char* title, const char* note, bool experimental);
     void AddSettingSliderInt(std::string name, int& value, int min, int max);
@@ -70,12 +77,14 @@ private:
     std::string runningGameSerial = "";
     bool isGameRunning = false;
     bool closeOnSave = false;
+    int openedFrame = 0; ///< ImGui frame the window was opened on (Prepare)
     int deleteProfileIndex = -1;
 
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> profilesTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> generalTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> experimentalTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> graphicsTexture;
+    std::variant<SDL_Texture*, ImGui::RefCountedTexture> bloodborneTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> inputTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> trophyTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> logTexture;
@@ -162,6 +171,7 @@ private:
     int bbAnisotropySetting;     ///< index into anisotropyOptions
     int bbDrawDataMemorySetting; ///< index into drawDataMemoryOptions
     int bbTextureQualitySetting; ///< index into textureQualityOptions
+    bool bbIgnoreDisplayScaleSetting;
     bool bbExactProtectionSetting;
     bool bbBatchedUploadsSetting;
     bool bbTextureSetMemoSetting;

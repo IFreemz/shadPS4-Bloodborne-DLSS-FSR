@@ -83,6 +83,7 @@ public:
 private:
     // Fullscreen (exclusive or borderless) or windowed, as the settings say.
     void ApplyDisplayMode();
+    void LogDisplaySetup();
     void OnResize();
     void OnKeyboardMouseInput(const SDL_Event* event);
     void OnGamepadEvent(const SDL_Event* event);

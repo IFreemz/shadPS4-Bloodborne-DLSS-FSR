@@ -1582,6 +1582,7 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CMakeRC.cmake")
 cmrc_add_resource_library(embedded-resources
         ALIAS res::embedded
         NAMESPACE res
+        src/resources/big_picture/bloodborne.png
         src/resources/big_picture/controller.png
         src/resources/big_picture/experimental.png
         src/resources/big_picture/folder.png

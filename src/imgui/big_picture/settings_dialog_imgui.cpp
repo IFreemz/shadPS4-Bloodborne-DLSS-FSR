@@ -1,8 +1,10 @@
 //  SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <map>
 #include <ranges>
+#include <utility>
 #include <ImGuiFileDialog.h>
 #include <SDL3/SDL_events.h>
 #include <cmrc/cmrc.hpp>
@@ -107,6 +109,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     }
     bbDrawDataMemorySetting = std::clamp(EmulatorSettings.GetBbDrawDataMemory(), 0, 2);
     bbTextureQualitySetting = std::clamp(EmulatorSettings.GetBbTextureQuality(), 0, 2);
+    bbIgnoreDisplayScaleSetting = EmulatorSettings.IsBbIgnoreDisplayScale();
     bbStutterDetailSetting = EmulatorSettings.IsBbStutterDetail();
     bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
 
@@ -200,6 +203,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
                                      isSpecific);
     EmulatorSettings.SetBbDrawDataMemory(bbDrawDataMemorySetting, isSpecific);
     EmulatorSettings.SetBbTextureQuality(bbTextureQualitySetting, isSpecific);
+    EmulatorSettings.SetBbIgnoreDisplayScale(bbIgnoreDisplayScaleSetting, isSpecific);
     EmulatorSettings.SetBbStutterDetail(bbStutterDetailSetting, isSpecific);
     EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
 
@@ -285,6 +289,7 @@ SettingsWindow::SettingsWindow(bool gameRunning) : isGameRunning(gameRunning) {
     loadTexture("src/resources/big_picture/settings.png", generalTexture);
     loadTexture("src/resources/big_picture/experimental.png", experimentalTexture);
     loadTexture("src/resources/big_picture/graphics.png", graphicsTexture);
+    loadTexture("src/resources/big_picture/bloodborne.png", bloodborneTexture);
     loadTexture("src/resources/big_picture/controller.png", inputTexture);
     loadTexture("src/resources/big_picture/trophy.png", trophyTexture);
     loadTexture("src/resources/big_picture/log.png", logTexture);
@@ -319,6 +324,23 @@ SettingsWindow::SettingsWindow(bool gameRunning) : isGameRunning(gameRunning) {
 
 void SettingsWindow::Prepare() {
     uiScale = EmulatorSettings.GetBigPictureScale() / 1000.f;
+    openedFrame = ImGui::GetFrameCount();
+}
+
+// Esc, Circle on a controller, or (in game) F3 again: closes the window like Cancel. Only while
+// it has the focus (not another window such as the F1 one), not while a popup, a dropdown or an
+// edited field takes the key, nor in the first frames, which still see the key press that
+// opened it.
+bool SettingsWindow::CloseKeyPressed() const {
+    if (ImGui::GetFrameCount() <= openedFrame + 2 ||
+        !ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) ||
+        ImGui::IsAnyItemActive() ||
+        ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) {
+        return false;
+    }
+    return ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+           ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+           (isGameRunning && ImGui::IsKeyPressed(ImGuiKey_F3, false));
 }
 
 void SettingsWindow::DeInit() {
@@ -373,25 +395,31 @@ void SettingsWindow::SetupWindow() {
         ImGui::SetKeyboardFocusHere();
     }
 
-    SettingsCategory firstCategory =
-        isGameRunning ? SettingsCategory::General : SettingsCategory::Profiles;
-    SettingsCategory lastCategory =
-        currentProfile != "Global" ? SettingsCategory::Experimental : SettingsCategory::Log;
-
-    // Navigate categories with Tab / R1 / L1
-    if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1) || ImGui::IsKeyPressed(ImGuiKey_Tab)) {
-        int currentIndex = static_cast<int>(currentCategory);
-        currentCategory == lastCategory
-            ? currentCategory = static_cast<SettingsCategory>(firstCategory)
-            : currentCategory = static_cast<SettingsCategory>(currentIndex + 1);
+    // Navigate categories with Tab / R1 / L1, in the order the tabs are shown
+    const bool next = ImGui::IsKeyPressed(ImGuiKey_GamepadR1) || ImGui::IsKeyPressed(ImGuiKey_Tab);
+    const bool previous = ImGui::IsKeyPressed(ImGuiKey_GamepadL1);
+    if (next || previous) {
+        const auto categories = VisibleCategories();
+        const auto it = std::ranges::find(categories, currentCategory);
+        const int count = static_cast<int>(categories.size());
+        const int index = it == categories.end() ? 0 : static_cast<int>(it - categories.begin());
+        currentCategory = categories[(index + (next ? 1 : count - 1)) % count];
     }
+}
 
-    if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1)) {
-        int currentIndex = static_cast<int>(currentCategory);
-        currentIndex == static_cast<int>(firstCategory)
-            ? currentCategory = lastCategory
-            : currentCategory = static_cast<SettingsCategory>(currentIndex - 1);
+std::vector<SettingsWindow::SettingsCategory> SettingsWindow::VisibleCategories() const {
+    std::vector<SettingsCategory> categories;
+    if (!isGameRunning) {
+        categories.push_back(SettingsCategory::Profiles);
     }
+    categories.insert(categories.end(), {SettingsCategory::General, SettingsCategory::Graphics,
+                                         SettingsCategory::Input, SettingsCategory::Trophy,
+                                         SettingsCategory::Folders, SettingsCategory::Log});
+    if (currentProfile != "Global") {
+        categories.push_back(SettingsCategory::Experimental);
+    }
+    categories.push_back(SettingsCategory::Bloodborne);
+    return categories;
 }
 
 void SettingsWindow::DrawCategoryTabs() {
@@ -408,22 +436,47 @@ void SettingsWindow::DrawCategoryTabs() {
 
     ImGui::BeginChild("Categories", ImVec2(0, vertSize), child_flags, window_flags);
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(30.0f * uiScale, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0.0f, 0.0f));
 
-    // Must add categories in enum order for L1/R1 to work correctly
-    if (!isGameRunning) {
-        AddCategory("Profiles", profilesTexture, SettingsCategory::Profiles);
-    }
+    struct Tab {
+        const char* name;
+        std::variant<SDL_Texture*, ImGui::RefCountedTexture>* texture;
+    };
+    const auto tab_of = [&](SettingsCategory category) -> Tab {
+        switch (category) {
+        case SettingsCategory::Profiles:
+            return {"Profiles", &profilesTexture};
+        case SettingsCategory::General:
+            return {"General", &generalTexture};
+        case SettingsCategory::Graphics:
+            return {"Graphics", &graphicsTexture};
+        case SettingsCategory::Input:
+            return {"Input", &inputTexture};
+        case SettingsCategory::Trophy:
+            return {"Trophy", &trophyTexture};
+        case SettingsCategory::Folders:
+            return {"Game Folders", &foldersTexture};
+        case SettingsCategory::Log:
+            return {"Log", &logTexture};
+        case SettingsCategory::Experimental:
+            return {"Experimental", &experimentalTexture};
+        case SettingsCategory::Bloodborne:
+        default:
+            return {"Bloodborne", &bloodborneTexture};
+        }
+    };
 
-    AddCategory("General", generalTexture, SettingsCategory::General);
-    AddCategory("Graphics", graphicsTexture, SettingsCategory::Graphics);
-    AddCategory("Input", inputTexture, SettingsCategory::Input);
-    AddCategory("Trophy", trophyTexture, SettingsCategory::Trophy);
-    AddCategory("Game Folders", foldersTexture, SettingsCategory::Folders);
-    AddCategory("Log", logTexture, SettingsCategory::Log);
-
-    if (currentProfile != "Global") {
-        AddCategory("Experimental", experimentalTexture, SettingsCategory::Experimental);
+    // Icons evenly spaced 30 apart; a name wider than its tab is shortened with "..." (the full
+    // name shows when the icon is hovered).
+    const auto categories = VisibleCategories();
+    const float icon_width = settingsIconSize * uiScale + ImGui::GetStyle().FramePadding.x * 2.0f;
+    const float pitch = icon_width + 30.0f * uiScale;
+    const float max_text_width = pitch - 8.0f * uiScale;
+    const float first_center = ImGui::GetCursorPosX() + icon_width * 0.5f;
+    for (size_t i = 0; i < categories.size(); ++i) {
+        const Tab tab = tab_of(categories[i]);
+        AddCategory(tab.name, *tab.texture, categories[i],
+                    first_center + pitch * static_cast<float>(i), max_text_width);
     }
 
     ImGui::PopStyleVar();
@@ -433,9 +486,24 @@ void SettingsWindow::DrawCategoryTabs() {
 
 void SettingsWindow::AddCategory(std::string name,
                                  std::variant<SDL_Texture*, ImGui::RefCountedTexture> texture,
-                                 SettingsCategory category) {
+                                 SettingsCategory category, float center_x, float max_text_width) {
     ImGui::SameLine();
     ImGui::BeginGroup();
+
+    // Icon and name centred on center_x (DrawCategoryTabs spaces the tabs).
+    const float icon_width = settingsIconSize * uiScale + ImGui::GetStyle().FramePadding.x * 2.0f;
+    std::string label = name;
+    if (ImGui::CalcTextSize(label.c_str()).x > max_text_width) {
+        while (!label.empty() && ImGui::CalcTextSize((label + "...").c_str()).x > max_text_width) {
+            label.pop_back();
+        }
+        while (!label.empty() && label.back() == ' ') {
+            label.pop_back();
+        }
+        label += "...";
+    }
+    const float text_width = ImGui::CalcTextSize(label.c_str()).x;
+    ImGui::SetCursorPosX(center_x - icon_width * 0.5f);
 
     // make button appear hovered as long as category is selected, otherwise dull its hovered color
     currentCategory == category
@@ -454,15 +522,15 @@ void SettingsWindow::AddCategory(std::string name,
                                ImVec2(settingsIconSize * uiScale, settingsIconSize * uiScale))) {
             currentCategory = category;
         }
+        if (label != name && ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("%s", name.c_str());
+        }
     }
 
     ImGui::PopStyleColor();
 
-    ImGui::SetCursorPosX(
-        (ImGui::GetCursorPosX() +
-         (settingsIconSize * uiScale - ImGui::CalcTextSize(name.c_str()).x) * 0.5f) +
-        ImGui::GetStyle().FramePadding.x);
-    ImGui::Text("%s", name.c_str());
+    ImGui::SetCursorPosX(center_x - text_width * 0.5f);
+    ImGui::Text("%s", label.c_str());
     ImGui::EndGroup();
 }
 
@@ -549,7 +617,7 @@ void SettingsWindow::DrawMainContent(bool* open, const std::function<void()>& ap
     }
 
     ImGui::SameLine();
-    if (ImGui::Button("Cancel")) {
+    if (ImGui::Button("Cancel") || CloseKeyPressed()) {
         DeInit();
         *open = false;
         if (applySettings) {
@@ -818,9 +886,16 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingSliderFloat("RCAS Attenuation", rcasAttenuationSetting, 0.0f, 3.0f, 3);
             }
 
+            ImGui::EndTable();
+        }
+    } else if (category == SettingsCategory::Bloodborne) {
+        if (ImGui::BeginTable("SettingsTable", 2)) {
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 500.0f * uiScale);
+            ImGui::TableSetupColumn("Value");
+
             // Bloodborne-only, experimental: everything the threaded renderer work added. Off
             // (the switch, or one toggle under it) is the standard shadPS4 behaviour.
-            AddSettingSection("Bloodborne - Experimental",
+            AddSettingSection("Threaded Renderer",
                               "Used by Bloodborne only. If something goes wrong, turn off "
                               "Threaded Renderer to get standard shadPS4 behaviour.",
                               true);
@@ -831,12 +906,11 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox("    Streaming optimisations", bbStreamingSetting,
                                    "Smaller hitches entering new areas");
                 AddSettingCheckbox("    GPU readbacks on the copy queue", bbReadbackQueueSetting,
-                                   "Fewer small stutters (turning on needs a restart)");
+                                   "Fewer small stutters (needs a restart)");
                 AddSettingCheckbox("    Merged copy shaders", bbMergedCopiesSetting,
                                    "Less GPU copy work");
                 if (bbMergedCopiesSetting) {
-                    AddSettingCheckbox("        As copy commands (testing)",
-                                       bbMergedCopyCommandsSetting,
+                    AddSettingCheckbox("        As copy commands", bbMergedCopyCommandsSetting,
                                        "White dots test: GPU copy commands instead of the "
                                        "copy shader");
                 }
@@ -852,55 +926,63 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Occlusion test geometry the emulator does not use");
                 AddSettingCheckbox("    Background shader compiles", bbBackgroundPipelinesSetting,
                                    "New objects appear a frame late instead of a stutter");
-                AddSettingCheckbox("    Reuse texture lookups (testing)", bbTextureSetMemoSetting,
+                AddSettingCheckbox("    Reuse texture lookups", bbTextureSetMemoSetting,
                                    "A draw's textures found once, not every draw");
-                AddSettingCheckbox("    Copy geometry ahead (testing)", bbRingGeometrySetting,
+                AddSettingCheckbox("    Copy geometry ahead", bbRingGeometrySetting,
                                    "Small vertex/index data copied by the decoding thread");
-                AddSettingCheckbox("    Overlap GPU submissions (testing)", bbSubmitOverlapSetting,
+                AddSettingCheckbox("    Overlap GPU submissions", bbSubmitOverlapSetting,
                                    "Next submission decoded while the last is recorded");
-                AddSettingCheckbox("    Occlusion results in order (testing)",
-                                   bbOcclusionInOrderSetting,
+                AddSettingCheckbox("    Occlusion results in order", bbOcclusionInOrderSetting,
                                    "Occlusion results queued behind the draws, no wait");
-                AddSettingCheckbox("    Fast pixel shader math (testing, restart)",
-                                   bbFastPixelMathSetting,
-                                   "Driver fuses multiply-adds; shaders rebuilt after a change");
-                AddSettingCheckbox("    Constant copies without waiting (testing)",
-                                   bbConstantsNoWaitSetting,
+                AddSettingCheckbox("    Fast pixel shader math", bbFastPixelMathSetting,
+                                   "Driver fuses multiply-adds; shaders rebuilt (needs a restart)");
+                AddSettingCheckbox("    Constant copies without waiting", bbConstantsNoWaitSetting,
                                    "Game's constant copies don't wait for queued draws");
-                AddSettingCheckbox(
-                    "    GPU interpolation where safe (testing, restart)",
-                    bbHardwareInterpolationSetting,
-                    "NVIDIA: less pixel shader code; shaders rebuilt after a change");
+                AddSettingCheckbox("    GPU interpolation where safe",
+                                   bbHardwareInterpolationSetting,
+                                   "NVIDIA: less pixel shader code (needs a restart)");
                 AddSettingCheckbox("    Real occlusion tests", bbRealOcclusionSetting,
                                    "Areas hidden behind walls are skipped by the game");
-                AddSettingCheckbox("    Copy thread (testing, restart)", bbCopyThreadSetting,
-                                   "Game memory copies for draws made on a thread of their own");
-                AddSettingCheckbox("    Spread area loading (testing)", bbSpreadLoadsSetting,
+                AddSettingCheckbox("    Copy thread", bbCopyThreadSetting,
+                                   "Draw memory copies on their own thread (needs a restart)");
+                AddSettingCheckbox("    Spread area loading", bbSpreadLoadsSetting,
                                    "Respawns and area loads upload textures over a few frames");
             }
-            // Sharper ground and stairs at an angle; applies after a restart.
+
+            AddSettingSection("Graphics", "Picture quality and the in-game windows.", false);
             AddSettingCombo("Anisotropic filtering", bbAnisotropySetting, anisotropyOptions);
+            if (ImGui::IsItemHovered()) {
+                ShowTooltip("Sharper ground and stairs at an angle (needs a restart)");
+            }
             AddSettingCombo("Texture quality", bbTextureQualitySetting, textureQualityOptions);
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Less VRAM for big textures (the BB Remaster mod's) by leaving "
-                                  "out their sharpest level:\nHigh: textures over 2048, Medium: "
-                                  "over 1024 (about 500 MB less in busy areas).\nApplies to "
-                                  "textures loaded after a change: from the next loading screen.");
+                ShowTooltip("Less VRAM for big textures (the BB Remaster mod's) by leaving "
+                            "out their sharpest level:\nHigh: textures over 2048, Medium: "
+                            "over 1024 (about 500 MB less in busy areas).\nApplies to "
+                            "textures loaded after a change: from the next loading screen.");
             }
+            AddSettingCheckbox("Menus sized by screen pixels", bbIgnoreDisplayScaleSetting,
+                               "Ignores Windows display scaling (125%, 150%), as games do");
+
+            AddSettingSection("Performance", "How the game's data reaches the graphics card.",
+                              false);
             // The per-draw data the CPU writes every frame: in graphics card memory with Resizable
             // BAR / Smart Access Memory, else system memory. The log says which was used.
-            AddSettingCombo("Resizable BAR / Smart Access Memory (restart)",
-                            bbDrawDataMemorySetting, drawDataMemoryOptions);
+            AddSettingCombo("Resizable BAR / Smart Access Memory", bbDrawDataMemorySetting,
+                            drawDataMemoryOptions);
             if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Puts the data the game changes every frame straight into "
-                                  "graphics card memory.\nNeeds Resizable BAR (NVIDIA, Intel) or "
-                                  "Smart Access Memory (AMD) enabled in the BIOS.\nAuto detects "
-                                  "it. Try Off if you get stutter or crashes.");
+                ShowTooltip("Puts the data the game changes every frame straight into "
+                            "graphics card memory.\nNeeds Resizable BAR (NVIDIA, Intel) or "
+                            "Smart Access Memory (AMD) enabled in the BIOS.\nAuto detects "
+                            "it. Try Off if you get stutter or crashes. (needs a restart)");
             }
             AddSettingCheckbox("Protect only changed pages", bbExactProtectionSetting,
                                "Less CPU time protecting game memory the GPU reads");
             AddSettingCheckbox("Batched texture uploads", bbBatchedUploadsSetting,
                                "New textures of a draw uploaded together");
+
+            AddSettingSection(
+                "VRAM", "Graphics card memory in long sessions and with texture mods.", false);
             AddSettingCheckbox("VRAM cleanup", bbVramReclaimSetting,
                                "Frees unused VRAM in long sessions (needs a restart)");
             if (bbVramReclaimSetting) {
@@ -909,12 +991,12 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                     "Buffer memory unused for 30 s near the limit (needs a restart)");
                 AddSettingCheckbox("    Clean up at loading screens", bbLoadScreenCleanupSetting,
                                    "Frees what the last area used; the next one loads its own");
-                AddSettingCheckbox("    Use more VRAM (testing)", bbMoreVramSetting,
+                AddSettingCheckbox("    Use more VRAM", bbMoreVramSetting,
                                    "Cleans up only close to the driver's VRAM budget");
                 if (bbMoreVramSetting) {
-                    AddSettingCheckbox("        Go past the budget (testing, restart)",
-                                       bbVramPastBudgetSetting,
-                                       "Up to the card's size; Windows moves other programs out");
+                    AddSettingCheckbox("        Go past the budget", bbVramPastBudgetSetting,
+                                       "Up to the card's size; Windows moves other programs out "
+                                       "(needs a restart)");
                 }
             }
             AddSettingSection("Diagnostics", "For troubleshooting. Slower when on: leave off.",
@@ -929,8 +1011,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.2f, 1.0f), "(costs fps)");
             // Testing the VRAM cleanup: act as if the GPU had this much VRAM (0 = real amount).
-            AddSettingSliderInt("VRAM budget for testing (MB, 0 = real)", bbVramBudgetTestSetting,
-                                0, 24000);
+            AddSettingSliderInt("VRAM budget override (MB, 0 = real)", bbVramBudgetTestSetting, 0,
+                                24000);
 
             ImGui::EndTable();
         }
@@ -1021,10 +1103,45 @@ void SettingsWindow::AddSettingCheckbox(std::string name, bool& value) {
     ImGui::Checkbox(label.c_str(), &value);
 }
 
+// "(needs a restart)" in a hint or tooltip stands out in amber, without the brackets.
+constexpr std::string_view RestartNote = "(needs a restart)";
+constexpr ImVec4 RestartColour{1.0f, 0.78f, 0.35f, 1.0f};
+
+static std::pair<std::string_view, bool> SplitRestartNote(std::string_view text) {
+    const auto at = text.find(RestartNote);
+    if (at == std::string_view::npos) {
+        return {text, false};
+    }
+    auto before = text.substr(0, at);
+    while (!before.empty() && before.back() == ' ') {
+        before.remove_suffix(1);
+    }
+    return {before, true};
+}
+
+void SettingsWindow::AddHint(std::string_view hint) {
+    const auto [text, restart] = SplitRestartNote(hint);
+    ImGui::TextDisabled("%.*s", static_cast<int>(text.size()), text.data());
+    if (restart) {
+        ImGui::SameLine();
+        ImGui::TextColored(RestartColour, "needs a restart");
+    }
+}
+
+void SettingsWindow::ShowTooltip(std::string_view tooltip) {
+    const auto [text, restart] = SplitRestartNote(tooltip);
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(text.data(), text.data() + text.size());
+    if (restart) {
+        ImGui::TextColored(RestartColour, "Needs a restart");
+    }
+    ImGui::EndTooltip();
+}
+
 void SettingsWindow::AddSettingCheckbox(std::string name, bool& value, const char* hint) {
     AddSettingCheckbox(name, value);
     ImGui::SameLine();
-    ImGui::TextDisabled("%s", hint);
+    AddHint(hint);
 }
 
 void SettingsWindow::AddSettingSection(const char* title, const char* note, bool experimental) {

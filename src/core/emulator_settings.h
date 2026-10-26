@@ -480,6 +480,9 @@ struct GPUSettings {
     // (over 1024). Only block-compressed textures with mip levels that the GPU never writes: their
     // largest level is left out. Applies to textures loaded after a change.
     Setting<int> bb_texture_quality{0};
+    // shadPS4's in-game windows (F3, F1, pop-ups) sized by screen pixels, as games size their
+    // menus, instead of also by Windows' display scaling (150% made them half as big again).
+    Setting<bool> bb_ignore_display_scale{true};
     // Testing: the VRAM budget the caches assume, in MiB (0 = the GPU's real budget; at start).
     Setting<int> bb_vram_budget_test_mb{0};
     // Threaded renderer: textures and large buffer uploads copied from guest memory on background
@@ -586,6 +589,8 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_more_vram", &GPUSettings::bb_more_vram),
             make_override<GPUSettings>("bb_vram_past_budget", &GPUSettings::bb_vram_past_budget),
             make_override<GPUSettings>("bb_texture_quality", &GPUSettings::bb_texture_quality),
+            make_override<GPUSettings>("bb_ignore_display_scale",
+                                       &GPUSettings::bb_ignore_display_scale),
             make_override<GPUSettings>("bb_background_texture_copies",
                                        &GPUSettings::bb_background_texture_copies),
             make_override<GPUSettings>("bb_vram_budget_test_mb",
@@ -626,11 +631,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     threaded_renderer_gpu_profile, bb_object_motion, bb_readback_queue, bb_streaming,
     bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
     bb_load_screen_cleanup, bb_more_vram, bb_vram_past_budget, bb_texture_quality,
-    bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place, bb_skip_empty_draws,
-    bb_background_pipelines, bb_anisotropy, bb_exact_protection, bb_batched_uploads,
-    bb_texture_set_memo, bb_ring_geometry, bb_submit_overlap, bb_stutter_detail, bb_defaults,
-    bb_merged_copy_commands, bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait,
-    bb_hardware_interpolation, bb_real_occlusion, bb_copy_thread, bb_spread_loads)
+    bb_ignore_display_scale, bb_vram_budget_test_mb, bb_background_texture_copies,
+    bb_geometry_in_place, bb_skip_empty_draws, bb_background_pipelines, bb_anisotropy,
+    bb_exact_protection, bb_batched_uploads, bb_texture_set_memo, bb_ring_geometry,
+    bb_submit_overlap, bb_stutter_detail, bb_defaults, bb_merged_copy_commands,
+    bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait, bb_hardware_interpolation,
+    bb_real_occlusion, bb_copy_thread, bb_spread_loads)
 
 // -------------------------------
 // Vulkan settings
@@ -961,6 +967,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
     SETTING_FORWARD(m_gpu, BbTextureQuality, bb_texture_quality)
+    SETTING_FORWARD_BOOL(m_gpu, BbIgnoreDisplayScale, bb_ignore_display_scale)
     SETTING_FORWARD(m_gpu, BbAnisotropy, bb_anisotropy)
     SETTING_FORWARD(m_gpu, BbDrawDataMemory, bb_draw_data_memory)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)

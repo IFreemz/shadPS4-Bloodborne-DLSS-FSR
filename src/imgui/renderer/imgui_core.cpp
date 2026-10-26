@@ -37,6 +37,7 @@ static std::mutex change_layers_mutex{};
 
 static ImGuiID dock_id;
 static std::atomic<std::uint32_t> force_gamepad_input_capture_count{0};
+static float display_scale = 1.0f; ///< Windows' display scaling of the game window
 
 namespace ImGui {
 
@@ -142,7 +143,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     dock_id = ImHashStr(label);
 
     if (const auto dpi = SDL_GetWindowDisplayScale(window.GetSDLWindow()); dpi > 0.0f) {
-        GetIO().FontGlobalScale *= dpi;
+        display_scale = dpi;
     }
 
     std::at_quick_exit([] { SaveIniSettingsToDisk(GetIO().IniFilename); });
@@ -235,6 +236,8 @@ ImGuiID NewFrame(bool is_reusing_frame) {
         }
     }
 
+    GetIO().FontGlobalScale =
+        0.5f * (EmulatorSettings.IsBbIgnoreDisplayScale() ? 1.0f : display_scale);
     Sdl::NewFrame(is_reusing_frame);
     ImGui::NewFrame();
     SetKeyOwner(ImGuiKey_GamepadFaceUp, ImHashStr("shadps4/pad"));
