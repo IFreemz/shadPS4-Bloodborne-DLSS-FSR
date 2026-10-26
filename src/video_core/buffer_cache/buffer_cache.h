@@ -111,6 +111,32 @@ public:
     /// GPU work that wrote the data had been submitted or had finished), logged every 10 s.
     void LogReadbackReport();
 
+    /// Early write-back (threaded renderer): memory a game thread had to wait for a readback of
+    /// is "hot" for a while. GPU work writing hot memory asks for its batch to be sent at once,
+    /// and once the GPU has finished it the data is copied back to guest memory, so the game's
+    /// next write finds it there instead of waiting for the GPU.
+    void SetEarlyWriteback(bool enabled) noexcept {
+        early_writeback.store(enabled, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool EarlyWriteback() const noexcept {
+        return early_writeback.load(std::memory_order_relaxed);
+    }
+    /// The batch being recorded writes hot memory (cleared by the call).
+    [[nodiscard]] bool TakeWritebackFlush() noexcept {
+        const bool wanted = writeback_flush.exchange(false, std::memory_order_acq_rel);
+        writeback_flushes.fetch_add(wanted ? 1 : 0, std::memory_order_relaxed);
+        return wanted;
+    }
+    struct PendingWriteback {
+        VAddr address;
+        u64 size;
+        u64 tick;
+    };
+    /// Hot writes whose GPU work has finished (removed from the pending list).
+    [[nodiscard]] std::vector<PendingWriteback> TakeFinishedWritebacks();
+    /// Copies a finished hot write back to guest memory (GPU command thread, draw pipe idle).
+    void WriteBack(const PendingWriteback& writeback);
+
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
@@ -307,6 +333,17 @@ private:
     std::mutex gpu_write_mutex;
     std::unordered_map<u64, u64> gpu_write_ticks;    ///< 64 KiB block -> tick of the last GPU write
     u64 readback_queue_count{}, readback_queue_ns{}; ///< readbacks on the second queue (report)
+
+    /// Early write-back state (see SetEarlyWriteback), under writeback_mutex.
+    std::atomic<bool> early_writeback{false};
+    std::atomic<bool> writeback_flush{false};
+    std::mutex writeback_mutex;
+    std::unordered_map<u64, std::chrono::steady_clock::time_point> hot_blocks; ///< 64 KiB blocks
+    std::vector<PendingWriteback> pending_writebacks;
+    u64 writebacks_done{}, writeback_bytes{}; ///< since the last report (writeback_mutex)
+    std::atomic<u64> writeback_flushes{};
+    void MarkHot(VAddr device_addr, u64 size);
+    void NoteHotWrite(VAddr device_addr, u64 size);
 
     /// Notes that GPU work recorded now writes [device_addr, device_addr + size).
     void NoteGpuWrite(VAddr device_addr, u64 size);

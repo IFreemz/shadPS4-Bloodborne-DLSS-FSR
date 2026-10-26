@@ -129,6 +129,21 @@ public:
         submit_cv.notify_one();
     }
 
+    /// Overlapped frames: the game's frame `frame` ended after everything submitted so far, on
+    /// every queue. Reported to `on_frame_retired` once that work is decoded and recorded (what
+    /// GPU idle reported before), whatever is submitted after it.
+    void SubmitDone(u64 frame) noexcept {
+        std::scoped_lock lk{submit_mutex};
+        mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
+        mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
+        frame_ends.emplace_back(submissions_total, frame);
+        submit_cv.notify_one();
+    }
+
+    void SetFrameRetiredCallback(void (*callback)(u64 frame)) noexcept {
+        on_frame_retired = callback;
+    }
+
     void WaitGpuIdle() noexcept {
         std::unique_lock lk{submit_mutex};
         submit_cv.wait(lk, [this] { return num_submits == 0 && work_retired; });
@@ -245,6 +260,7 @@ private:
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
+    void RetireFrames();
 
     struct GpuQueue {
         std::mutex m_access{};
@@ -253,6 +269,7 @@ private:
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
+        std::queue<u64> submit_seqs{}; ///< each submission's number (overlapped frames)
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
@@ -309,6 +326,11 @@ private:
     std::atomic<bool> work_retired{true};
     std::atomic<u32> num_commands{};
     std::atomic<bool> submit_done{};
+    /// Overlapped frames: submissions made so far, and the game's frame ends (the last
+    /// submission's number at each, its frame number). Under submit_mutex.
+    u64 submissions_total{};
+    std::deque<std::pair<u64, u64>> frame_ends;
+    void (*on_frame_retired)(u64 frame){};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};

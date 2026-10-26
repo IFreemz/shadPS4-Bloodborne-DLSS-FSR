@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/game_waits.h"
 #include "common/thread.h"
 #ifdef _WIN32
 #include "common/ntapi.h"
@@ -262,6 +263,7 @@ static void* RunThread(void* arg) {
     auto* curthread = static_cast<Pthread*>(arg);
     g_curthread = curthread;
     Common::SetCurrentThreadName(curthread->name.c_str());
+    Common::GameWaits::BeginGameThread(curthread->name);
     DebugState.AddCurrentThreadToGuestList();
     Core::InitializeTLS();
 
@@ -277,6 +279,7 @@ static void* RunThread(void* arg) {
     void* ret = _runOnAnotherStack(curthread->arg, (void*)curthread->start_routine, stack);
 
     /* Remove thread from tracking */
+    Common::GameWaits::EndGameThread();
     DebugState.RemoveCurrentThreadFromGuestList();
     posix_pthread_exit(ret);
 #ifdef WIN32

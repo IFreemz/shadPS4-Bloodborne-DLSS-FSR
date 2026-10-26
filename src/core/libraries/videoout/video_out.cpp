@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/elf_info.h"
+#include "common/game_waits.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
@@ -176,6 +177,7 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
     LOG_DEBUG(Lib_VideoOut, "bufferIndex = {}, flipMode = {}, flipArg = {}", bufferIndex, flipMode,
               flipArg);
 
+    const Common::GameWaits::Scope wait{"flip submit"};
     if (!driver->SubmitFlip(port, bufferIndex, flipArg)) {
         LOG_ERROR(Lib_VideoOut, "Flip queue is full");
         return ORBIS_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;

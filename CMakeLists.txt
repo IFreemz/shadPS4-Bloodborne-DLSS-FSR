@@ -878,6 +878,8 @@ set(COMMON src/common/logging/classes.cpp
            src/common/thread.cpp
            src/common/thread.h
            src/common/guest_stats.h
+           src/common/game_waits.cpp
+           src/common/game_waits.h
            src/common/bb_tuning.h
            src/common/frame_pacing.h
            src/common/copy_pool.cpp

@@ -12,6 +12,7 @@
 #include "common/crash_crumbs.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "common/game_waits.h"
 #include "common/guest_stats.h"
 #include "common/scope_exit.h"
 #include "core/bb_resolution.h"
@@ -1155,6 +1156,23 @@ u64 Rasterizer::Flush() {
     return current_tick;
 }
 
+void Rasterizer::OnSubmissionDecoded() {
+    if (!buffer_cache.EarlyWriteback()) {
+        return;
+    }
+    if (buffer_cache.TakeWritebackFlush()) {
+        Flush();
+    }
+    const auto finished = buffer_cache.TakeFinishedWritebacks();
+    if (finished.empty()) {
+        return;
+    }
+    DrainDrawPipe();
+    for (const auto& writeback : finished) {
+        buffer_cache.WriteBack(writeback);
+    }
+}
+
 void Rasterizer::Finish() {
     DrainDrawPipe();
     scheduler.Finish();
@@ -1189,6 +1207,9 @@ void Rasterizer::OnSubmit() {
                                        std::memory_order_relaxed);
         BB::readback_queue.store(pipe_enabled && EmulatorSettings.IsBbReadbackQueue(),
                                  std::memory_order_relaxed);
+        buffer_cache.SetEarlyWriteback(pipe_enabled && EmulatorSettings.IsBbEarlyWriteback() &&
+                                       EmulatorSettings.GetReadbacksMode() !=
+                                           GpuReadbacksMode::Disabled);
         scheduler.SetGpuTiming(diag);
         GpuProfiler::OnFrame(instance, scheduler,
                              pipe_enabled && EmulatorSettings.IsThreadedRendererGpuProfile());
@@ -3077,8 +3098,14 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.InvalidateMemory(addr, size, assume_locks);
-    texture_cache.InvalidateMemory(addr, size);
+    {
+        const Common::GameWaits::Scope wait{"write fault: buffers"};
+        buffer_cache.InvalidateMemory(addr, size, assume_locks);
+    }
+    {
+        const Common::GameWaits::Scope wait{"write fault: textures"};
+        texture_cache.InvalidateMemory(addr, size);
+    }
     return true;
 }
 

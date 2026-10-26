@@ -114,6 +114,10 @@ public:
     void UnmapMemory(VAddr addr, u64 size);
 
     u64 Flush();
+    /// GPU command thread, after each decoded submission: early write-back (see
+    /// BufferCache::SetEarlyWriteback) sends a batch that writes hot memory, and copies back
+    /// the hot writes whose GPU work has finished.
+    void OnSubmissionDecoded();
     void Finish();
     void OnSubmit();
     void OnFence();

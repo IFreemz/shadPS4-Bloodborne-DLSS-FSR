@@ -7,9 +7,11 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "common/game_waits.h"
 #include "common/logging/log.h"
 #include "common/slot_vector.h"
 #include "core/address_space.h"
+#include "core/bb_game_fixes.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/gnmdriver/gnm_error.h"
@@ -90,6 +92,62 @@ static void WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+}
+
+// The submission lock, then the wait for the GPU to finish the last frame's work if the game
+// asked for it (timed apart for the game frame report).
+static std::unique_lock<std::mutex> LockForSubmit() {
+    std::unique_lock lock{m_submit_lock, std::defer_lock};
+    {
+        const Common::GameWaits::Scope wait{"GPU submit lock"};
+        lock.lock();
+    }
+    {
+        const Common::GameWaits::Scope wait{"GPU idle wait"};
+        WaitGpuIdle();
+    }
+    return lock;
+}
+
+// Overlapped frames (Threaded renderer, after Lantern Engine): the game frees a frame's memory
+// once a submission made after its sceGnmSubmitDone returns, and the submission lock gave it
+// that by making the submission wait for GPU idle first. Here the submission is handed over
+// first, so the GPU side starts the next frame instead of draining between frames, then waits
+// for the frame before to be done; the first two submissions of a frame do not wait at all (the
+// game builds them in the frame context before the previous one). More than that leaked the
+// game's heap in Lantern Engine's tests.
+static bool OverlapFrames() {
+    static const bool on =
+        EmulatorSettings.IsThreadedRenderer() && EmulatorSettings.IsBbOverlapFrames();
+    return on;
+}
+static constexpr u32 SubmitsAheadOfLastFrame = 2;
+static u64 frames_retired{}; // guarded by m_wait_idle
+static u32 submits_this_frame{};
+
+static void NoteFramesRetired(u64 frame) {
+    std::scoped_lock lock{m_wait_idle};
+    frames_retired = std::max(frames_retired, frame);
+    cv_lock.notify_all();
+}
+
+static void WaitPreviousFrame() {
+    const Common::GameWaits::Scope wait{"previous frame wait"};
+    std::unique_lock lock{m_wait_idle};
+    cv_lock.wait(lock, [] { return frames_retired >= frames_submitted; });
+}
+
+static void WaitPreviousFrameAtSubmit() {
+    if (++submits_this_frame > SubmitsAheadOfLastFrame) {
+        WaitPreviousFrame();
+    }
+}
+
+static void OverlappedSubmitDone() {
+    WaitPreviousFrame();
+    submits_this_frame = 0;
+    ++frames_submitted;
+    liverpool->SubmitDone(frames_submitted);
 }
 
 // Write a special NOP packet with N DWs data block
@@ -308,8 +366,8 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         return;
     }
 
-    std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    const auto lk = LockForSubmit();
+    const Common::GameWaits::Scope wait{"compute submit"};
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
@@ -1435,8 +1493,8 @@ s32 PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload(u64 workload, u32* gp
         return ORBIS_GNM_ERROR_SUBMISSION_NOT_ENOUGH_RESOURCES;
     }
 
-    std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    const auto lk = LockForSubmit();
+    const Common::GameWaits::Scope wait{"GPU flip and submit done"};
 
     // Write a PrepareFlip, then patch the flip request
     auto* nop = reinterpret_cast<PM4CmdNop*>(gpu_addr);
@@ -1472,6 +1530,11 @@ s32 PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload(u64 workload, u32* gp
     }
     liverpool->SubmitGfx(dcb_span, {});
 
+    if (OverlapFrames()) {
+        OverlappedSubmitDone();
+        send_init_packet = true;
+        return ORBIS_OK;
+    }
     if (!liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
@@ -2377,6 +2440,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
+    Common::GameWaits::FrameBoundary(EmulatorSettings.IsThreadedRendererDiagnostics(),
+                                     Core::BbGameFixes::IsLoadingScreen());
     // Frame generation's Reflex markers: the game's frame ends with this submission.
     Vulkan::FrameGen::GameSubmitBegin();
     struct FrameEnd {
@@ -2421,17 +2486,22 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     auto* cmdbuf = dcb_gpu_addrs[count - 1];
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
-    std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
-
-    const s32 patch_result =
-        PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
-    if (patch_result != ORBIS_OK) {
-        return patch_result;
+    const auto lk = LockForSubmit();
+    s32 result;
+    {
+        const Common::GameWaits::Scope wait{"GPU submit and flip"};
+        const s32 patch_result = PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode,
+                                                  flip_arg, nullptr /*unk*/);
+        if (patch_result != ORBIS_OK) {
+            return patch_result;
+        }
+        result = PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
+                               const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
     }
-
-    return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
-                         const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+    if (OverlapFrames()) {
+        WaitPreviousFrameAtSubmit();
+    }
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
@@ -2464,11 +2534,17 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
         }
     }
 
-    std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
-
-    return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
-                         const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+    const auto lk = LockForSubmit();
+    s32 result;
+    {
+        const Common::GameWaits::Scope wait{"GPU submit"};
+        result = PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
+                               const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
+    }
+    if (OverlapFrames()) {
+        WaitPreviousFrameAtSubmit();
+    }
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[],
@@ -2481,8 +2557,14 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     LOG_DEBUG(Lib_GnmDriver, "called");
-    std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    const auto lk = LockForSubmit();
+    if (OverlapFrames()) {
+        OverlappedSubmitDone();
+        send_init_packet = true;
+        DebugState.IncGnmFrameNum();
+        return ORBIS_OK;
+    }
+    const Common::GameWaits::Scope wait{"GPU submit done"};
     if (!liverpool->IsGpuIdle()) {
         submission_lock = true;
     }
@@ -3061,6 +3143,13 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
 
     Platform::IrqC::Instance()->Register(Platform::InterruptId::GpuIdle, ResetSubmissionLock,
                                          nullptr);
+    liverpool->SetFrameRetiredCallback(NoteFramesRetired);
+    if (OverlapFrames()) {
+        LOG_INFO(Lib_GnmDriver,
+                 "Overlapped frames: the next frame is handed to the GPU side "
+                 "before the game waits for the last one ({} submissions ahead)",
+                 SubmitsAheadOfLastFrame);
+    }
 
     LIB_FUNCTION("b0xyllnVY-I", "libSceGnmDriver", 1, "libSceGnmDriver", sceGnmAddEqEvent);
     LIB_FUNCTION("b08AgtPlHPg", "libSceGnmDriver", 1, "libSceGnmDriver", sceGnmAreSubmitsAllowed);

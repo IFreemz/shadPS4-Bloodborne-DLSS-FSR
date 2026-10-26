@@ -17,6 +17,7 @@
 
 #include "common/assert.h"
 #include "common/error.h"
+#include "common/game_waits.h"
 #include "common/guest_stats.h"
 #include "common/logging/log.h"
 #include "common/scope_exit.h"
@@ -89,6 +90,7 @@ static std::map<std::string, FactoryDevice> available_device = {
 namespace Libraries::Kernel {
 
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
+    const Common::GameWaits::Scope wait{"file open"};
     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
     Common::GuestStats::file_opens.fetch_add(1, std::memory_order_relaxed);
 
@@ -382,6 +384,7 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
 }
 
 s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
+    const Common::GameWaits::Scope wait{"file read"};
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto* file = h->GetFile(fd);
     if (file == nullptr) {
@@ -544,6 +547,7 @@ s64 PS4_SYSV_ABI sceKernelLseek(s32 fd, s64 offset, s32 whence) {
 }
 
 s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
+    const Common::GameWaits::Scope wait{"file read"};
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto* file = h->GetFile(fd);
     if (file == nullptr) {
@@ -1335,6 +1339,7 @@ s32 PS4_SYSV_ABI sceKernelRename(const char* from, const char* to) {
 }
 
 s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 offset) {
+    const Common::GameWaits::Scope wait{"file read"};
     if (offset < 0) {
         *__Error() = POSIX_EINVAL;
         return -1;

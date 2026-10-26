@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/bb_tuning.h"
+#include "common/game_waits.h"
 #include "common/guest_stats.h"
 
 #ifdef _WIN64
@@ -40,6 +41,7 @@ bool TimedMutex::try_lock() {
 
 void TimedMutex::Wait(u32 timeout_ms) {
     Common::GuestStats::mutex_waits.fetch_add(1, std::memory_order_relaxed);
+    const Common::GameWaits::Scope wait{"mutex"};
     u32 contended = Contended;
     WaitOnAddress(&state, &contended, sizeof(contended), timeout_ms);
 }

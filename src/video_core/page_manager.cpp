@@ -9,6 +9,7 @@
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
+#include "common/game_waits.h"
 #include "common/guest_stats.h"
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
@@ -465,8 +466,10 @@ struct SignalImpl : public PageManager::Impl {
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
         if (Common::IsWriteError(context)) {
+            const Common::GameWaits::Scope wait{"write fault"};
             return rasterizer->OnWriteFault(addr, size, is_gpu_thread);
         } else {
+            const Common::GameWaits::Scope wait{"read fault"};
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }
         return false;

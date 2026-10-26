@@ -91,6 +91,8 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbTextureSetMemoSetting = EmulatorSettings.IsBbTextureSetMemo();
     bbRingGeometrySetting = EmulatorSettings.IsBbRingGeometry();
     bbSubmitOverlapSetting = EmulatorSettings.IsBbSubmitOverlap();
+    bbOverlapFramesSetting = EmulatorSettings.IsBbOverlapFrames();
+    bbEarlyWritebackSetting = EmulatorSettings.IsBbEarlyWriteback();
     bbOcclusionInOrderSetting = EmulatorSettings.IsBbOcclusionInOrder();
     bbFastPixelMathSetting = EmulatorSettings.IsBbFastPixelMath();
     bbConstantsNoWaitSetting = EmulatorSettings.IsBbConstantsNoWait();
@@ -192,6 +194,8 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbTextureSetMemo(bbTextureSetMemoSetting, isSpecific);
     EmulatorSettings.SetBbRingGeometry(bbRingGeometrySetting, isSpecific);
     EmulatorSettings.SetBbSubmitOverlap(bbSubmitOverlapSetting, isSpecific);
+    EmulatorSettings.SetBbOverlapFrames(bbOverlapFramesSetting, isSpecific);
+    EmulatorSettings.SetBbEarlyWriteback(bbEarlyWritebackSetting, isSpecific);
     EmulatorSettings.SetBbOcclusionInOrder(bbOcclusionInOrderSetting, isSpecific);
     EmulatorSettings.SetBbFastPixelMath(bbFastPixelMathSetting, isSpecific);
     EmulatorSettings.SetBbConstantsNoWait(bbConstantsNoWaitSetting, isSpecific);
@@ -932,6 +936,11 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Small vertex/index data copied by the decoding thread");
                 AddSettingCheckbox("    Overlap GPU submissions", bbSubmitOverlapSetting,
                                    "Next submission decoded while the last is recorded");
+                AddSettingCheckbox("    Overlap game and GPU frames", bbOverlapFramesSetting,
+                                   "The game starts its next frame while the last one finishes "
+                                   "(needs a restart)");
+                AddSettingCheckbox("    Early GPU data write-back", bbEarlyWritebackSetting,
+                                   "GPU data the game writes over is copied back before it waits");
                 AddSettingCheckbox("    Occlusion results in order", bbOcclusionInOrderSetting,
                                    "Occlusion results queued behind the draws, no wait");
                 AddSettingCheckbox("    Fast pixel shader math", bbFastPixelMathSetting,

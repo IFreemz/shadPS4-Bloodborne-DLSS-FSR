@@ -18,6 +18,7 @@
 #include "common/crash_crumbs.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
+#include "common/game_waits.h"
 #include "common/guest_stats.h"
 #include "common/hash.h"
 #include "common/scope_exit.h"
@@ -377,7 +378,11 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 
     for (const auto image_id : image_ids) {
         Image& image = slot_images[image_id];
-        std::scoped_lock lk{image.mutex};
+        std::unique_lock lk{image.mutex, std::defer_lock};
+        {
+            const Common::GameWaits::Scope wait{"write fault: image lock"};
+            lk.lock();
+        }
 
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;

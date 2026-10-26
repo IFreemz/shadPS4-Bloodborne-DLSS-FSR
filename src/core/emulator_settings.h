@@ -519,6 +519,15 @@ struct GPUSettings {
     // Threaded renderer: the next GPU submission is decoded while the draw recorder still
     // records the last one. Off: waits for the recorder after each submission.
     Setting<bool> bb_submit_overlap{true};
+    // Threaded renderer (applies at start): the game's next frame is handed to the GPU side before
+    // the game waits for the last one, and its first two submissions do not wait at all (after
+    // Lantern Engine). Off: every submission after the end of a frame waits for the GPU side to be
+    // idle, as before.
+    Setting<bool> bb_overlap_frames{false};
+    // Threaded renderer: memory a game thread had to wait for a GPU readback of is sent to the GPU
+    // as soon as GPU work writes it again, and copied back once the GPU has finished, so the
+    // game's next write does not wait. Off: read back only when the game touches it, as before.
+    Setting<bool> bb_early_writeback{false};
     // Threaded renderer: occlusion query results written in order with the queued draws. Off:
     // the decoding thread waits for every queued draw first, as before.
     Setting<bool> bb_occlusion_in_order{true};
@@ -608,6 +617,8 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_texture_set_memo", &GPUSettings::bb_texture_set_memo),
             make_override<GPUSettings>("bb_ring_geometry", &GPUSettings::bb_ring_geometry),
             make_override<GPUSettings>("bb_submit_overlap", &GPUSettings::bb_submit_overlap),
+            make_override<GPUSettings>("bb_overlap_frames", &GPUSettings::bb_overlap_frames),
+            make_override<GPUSettings>("bb_early_writeback", &GPUSettings::bb_early_writeback),
             make_override<GPUSettings>("bb_occlusion_in_order",
                                        &GPUSettings::bb_occlusion_in_order),
             make_override<GPUSettings>("bb_fast_pixel_math", &GPUSettings::bb_fast_pixel_math),
@@ -634,9 +645,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_ignore_display_scale, bb_vram_budget_test_mb, bb_background_texture_copies,
     bb_geometry_in_place, bb_skip_empty_draws, bb_background_pipelines, bb_anisotropy,
     bb_exact_protection, bb_batched_uploads, bb_texture_set_memo, bb_ring_geometry,
-    bb_submit_overlap, bb_stutter_detail, bb_defaults, bb_merged_copy_commands,
-    bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait, bb_hardware_interpolation,
-    bb_real_occlusion, bb_copy_thread, bb_spread_loads)
+    bb_submit_overlap, bb_overlap_frames, bb_early_writeback, bb_stutter_detail, bb_defaults,
+    bb_merged_copy_commands, bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait,
+    bb_hardware_interpolation, bb_real_occlusion, bb_copy_thread, bb_spread_loads)
 
 // -------------------------------
 // Vulkan settings
@@ -957,6 +968,8 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbTextureSetMemo, bb_texture_set_memo)
     SETTING_FORWARD_BOOL(m_gpu, BbRingGeometry, bb_ring_geometry)
     SETTING_FORWARD_BOOL(m_gpu, BbSubmitOverlap, bb_submit_overlap)
+    SETTING_FORWARD_BOOL(m_gpu, BbOverlapFrames, bb_overlap_frames)
+    SETTING_FORWARD_BOOL(m_gpu, BbEarlyWriteback, bb_early_writeback)
     SETTING_FORWARD_BOOL(m_gpu, BbOcclusionInOrder, bb_occlusion_in_order)
     SETTING_FORWARD_BOOL(m_gpu, BbFastPixelMath, bb_fast_pixel_math)
     SETTING_FORWARD_BOOL(m_gpu, BbConstantsNoWait, bb_constants_no_wait)

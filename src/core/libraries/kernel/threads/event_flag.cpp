@@ -7,6 +7,7 @@
 #include <thread>
 
 #include "common/assert.h"
+#include "common/game_waits.h"
 #include "common/logging/log.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
@@ -105,6 +106,7 @@ public:
     }
 
     int Wait(u64 bits, WaitMode wait_mode, ClearMode clear_mode, u64* result, u32* ptr_micros) {
+        const Common::GameWaits::Scope wait{"event flag", m_name};
         std::unique_lock lock{m_mutex};
 
         if (m_deleted) {

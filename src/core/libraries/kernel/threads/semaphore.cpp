@@ -9,6 +9,7 @@
 
 #include "core/libraries/kernel/sync/semaphore.h"
 
+#include "common/game_waits.h"
 #include "common/logging/log.h"
 #include "common/slot_vector.h"
 #include "core/libraries/kernel/kernel.h"
@@ -65,6 +66,7 @@ static bool PthreadSemTryAcquire(PthreadSem* sem) {
 }
 
 static s32 PthreadSemWait(PthreadSem* sem, const OrbisKernelTimespec* abstime, u64 usec = 0) {
+    const Common::GameWaits::Scope wait{"posix semaphore"};
     const bool is_reltime = abstime == THR_RELTIME;
     auto reltime_deadline = std::chrono::steady_clock::time_point{};
     bool first_sleep = true;
@@ -330,6 +332,7 @@ s32 PS4_SYSV_ABI sceKernelWaitSema(OrbisKernelSema sem, s32 needCount, u32* pTim
     if (!orbis_sems.IsAllocated(sem)) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
+    const Common::GameWaits::Scope wait{"semaphore", orbis_sems[sem].name};
     return orbis_sems[sem].Wait(true, needCount, pTimeout);
 }
 

@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 
 #include "common/assert.h"
+#include "common/game_waits.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/threads/pthread.h"
@@ -211,6 +212,7 @@ int PthreadCond::Wait(PthreadMutexT* mutex, const OrbisKernelTimespec* abstime, 
 int PS4_SYSV_ABI posix_pthread_cond_wait(PthreadCondT* cond, PthreadMutexT* mutex) {
     PthreadCond* cvp{};
     CHECK_AND_INIT_COND
+    const Common::GameWaits::Scope wait{"cond wait"};
     return cvp->Wait(mutex, nullptr);
 }
 
@@ -223,6 +225,7 @@ int PS4_SYSV_ABI posix_pthread_cond_timedwait(PthreadCondT* cond, PthreadMutexT*
 
     PthreadCond* cvp{};
     CHECK_AND_INIT_COND
+    const Common::GameWaits::Scope wait{"cond wait"};
     return cvp->Wait(mutex, abstime);
 }
 
@@ -230,6 +233,7 @@ int PS4_SYSV_ABI posix_pthread_cond_reltimedwait_np(PthreadCondT* cond, PthreadM
                                                     u64 usec) {
     PthreadCond* cvp{};
     CHECK_AND_INIT_COND
+    const Common::GameWaits::Scope wait{"cond wait"};
     return cvp->Wait(mutex, THR_RELTIME, usec);
 }
 

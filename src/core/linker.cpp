@@ -5,6 +5,7 @@
 #include "common/arch.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
+#include "common/game_waits.h"
 #include "common/logging/formatter.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -148,6 +149,7 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
     main_thread.Run([this, module, &args, has_libcinternal](std::stop_token) {
         Common::SetCurrentThreadName("Game:Main");
+        Common::GameWaits::BeginGameThread("Game:Main");
 
 #ifndef _WIN32 // Clear any existing signal mask for game threads.
         sigset_t emptyset;

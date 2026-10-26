@@ -6,6 +6,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/game_waits.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "core/file_sys/fs.h"
@@ -480,7 +481,10 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    *out = equeue->WaitForEvents(ev, num, timo);
+    {
+        const Common::GameWaits::Scope wait{"equeue", equeue->GetName()};
+        *out = equeue->WaitForEvents(ev, num, timo);
+    }
 
     if (*out == 0) {
         return ORBIS_KERNEL_ERROR_ETIMEDOUT;

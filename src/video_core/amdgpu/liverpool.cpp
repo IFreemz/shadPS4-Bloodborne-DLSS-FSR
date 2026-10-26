@@ -214,8 +214,9 @@ void Liverpool::Process(std::stop_token stoken) {
         {
             set_state(CmdState::Idle);
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(submit_cv, lk, stoken,
-                                [this] { return num_commands || num_submits || submit_done; });
+            Common::CondvarWait(submit_cv, lk, stoken, [this] {
+                return num_commands || num_submits || submit_done || !frame_ends.empty();
+            });
             set_state(CmdState::Work);
         }
         if (stoken.stop_requested()) {
@@ -260,14 +261,22 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task.destroy();
 
-                std::scoped_lock lock{queue.m_access};
-                queue.submits.pop();
+                {
+                    std::scoped_lock lock{queue.m_access};
+                    queue.submits.pop();
+                    queue.submit_seqs.pop();
 
-                --num_submits;
-                std::scoped_lock lock2{submit_mutex};
-                submit_cv.notify_all();
+                    --num_submits;
+                    std::scoped_lock lock2{submit_mutex};
+                    submit_cv.notify_all();
+                }
+                if (rasterizer) {
+                    rasterizer->OnSubmissionDecoded();
+                }
+                RetireFrames();
             }
         }
+        RetireFrames();
 
         if (submit_done) {
             VideoCore::EndCapture();
@@ -1601,6 +1610,46 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
     return std::make_pair(dcb, ccb);
 }
 
+void Liverpool::RetireFrames() {
+    {
+        std::scoped_lock lk{submit_mutex};
+        if (frame_ends.empty()) {
+            return;
+        }
+    }
+    // The oldest submission not decoded yet, on any queue (queues finish out of order).
+    u64 oldest_pending = ~0ull;
+    for (u32 qid = 0; qid < num_mapped_queues; ++qid) {
+        auto& queue = mapped_queues[qid];
+        std::scoped_lock lock{queue.m_access};
+        if (!queue.submit_seqs.empty()) {
+            oldest_pending = std::min(oldest_pending, queue.submit_seqs.front());
+        }
+    }
+    u64 frame = 0;
+    {
+        std::scoped_lock lk{submit_mutex};
+        while (!frame_ends.empty() && frame_ends.front().first < oldest_pending) {
+            frame = frame_ends.front().second;
+            frame_ends.pop_front();
+        }
+    }
+    if (frame == 0) {
+        return;
+    }
+    // What the end of a frame and GPU idle did before: the frame's cache work, then everything
+    // queued for the draw recorder recorded.
+    VideoCore::EndCapture();
+    if (rasterizer) {
+        rasterizer->OnSubmit();
+        rasterizer->Flush();
+        rasterizer->DrainDrawPipe();
+    }
+    if (on_frame_retired) {
+        on_frame_retired(frame);
+    }
+}
+
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
@@ -1609,9 +1658,15 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     }
 
     auto task = ProcessGraphics(dcb, ccb);
+    u64 seq;
+    {
+        std::scoped_lock lk{submit_mutex};
+        seq = ++submissions_total;
+    }
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.submit_seqs.emplace(seq);
     }
 
     std::scoped_lock lk{submit_mutex};
@@ -1626,9 +1681,15 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
 
     const auto vqid = gnm_vqid - 1;
     const auto& task = ProcessCompute(acb, vqid);
+    u64 seq;
+    {
+        std::scoped_lock lk{submit_mutex};
+        seq = ++submissions_total;
+    }
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.submit_seqs.emplace(seq);
     }
 
     std::scoped_lock lk{submit_mutex};

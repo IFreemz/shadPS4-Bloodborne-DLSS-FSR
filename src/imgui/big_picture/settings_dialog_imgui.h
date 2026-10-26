@@ -177,6 +177,8 @@ private:
     bool bbTextureSetMemoSetting;
     bool bbRingGeometrySetting;
     bool bbSubmitOverlapSetting;
+    bool bbOverlapFramesSetting;
+    bool bbEarlyWritebackSetting;
     bool bbOcclusionInOrderSetting;
     bool bbFastPixelMathSetting;
     bool bbConstantsNoWaitSetting;

@@ -13,6 +13,7 @@
 #include "common/bb_tuning.h"
 #include "common/copy_pool.h"
 #include "common/crash_crumbs.h"
+#include "common/game_waits.h"
 #include "common/guest_stats.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
@@ -240,7 +241,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     const bool diagnostics = Common::GuestStats::diagnostics.load(std::memory_order_relaxed);
     std::string thread = diagnostics ? Common::GetCurrentThreadName() : std::string{};
     const auto blocked_start = std::chrono::steady_clock::now();
-    const auto flush_request = [this, device_addr, size, is_write, thread] {
+    // The game frame report: how long a game thread's readback waited for the GPU thread to take
+    // it, then for the download.
+    std::chrono::steady_clock::time_point taken{};
+    const bool for_game_thread = !assume_locks;
+    const auto flush_request = [this, device_addr, size, is_write, thread, &taken,
+                                for_game_thread] {
+        taken = std::chrono::steady_clock::now();
         readback_context = {thread, is_write, !thread.empty()};
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
@@ -254,6 +261,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+        if (for_game_thread && EarlyWriteback()) {
+            MarkHot(window_start, window_end - window_start);
+        }
         const bool downloaded = DownloadMemory(arena, window_start, window_end - window_start);
         readback_context.active = false;
         if (!downloaded) {
@@ -268,6 +278,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
     } else {
         liverpool->SendCommand<true>(std::move(flush_request));
+        if (Common::GameWaits::IsGameThread() && taken != std::chrono::steady_clock::time_point{}) {
+            const auto done = std::chrono::steady_clock::now();
+            Common::GameWaits::Record("readback: waiting for the GPU thread", {},
+                                      taken - blocked_start);
+            Common::GameWaits::Record("readback: download", {}, done - taken);
+        }
     }
     if (diagnostics) {
         // How long the game's thread was stopped (queued behind the GPU thread, then the wait).
@@ -299,6 +315,22 @@ void BufferCache::LogReadbackReport() {
         max_wait = std::exchange(readback_max_wait_ns, 0);
         queue_count = std::exchange(readback_queue_count, 0);
         queue_ns = std::exchange(readback_queue_ns, 0);
+    }
+    if (EarlyWriteback()) {
+        u64 done, bytes;
+        size_t pending, hot;
+        {
+            std::scoped_lock lock{writeback_mutex};
+            done = std::exchange(writebacks_done, 0);
+            bytes = std::exchange(writeback_bytes, 0);
+            pending = pending_writebacks.size();
+            hot = hot_blocks.size();
+        }
+        LOG_INFO(Render,
+                 "Early write-back (10 s): {} copies back to guest memory ({} KiB), {} batches "
+                 "sent early | {} waiting for the GPU, {} hot 64 KiB blocks",
+                 done, bytes >> 10, writeback_flushes.exchange(0, std::memory_order_relaxed),
+                 pending, hot);
     }
     u64 count = 0, wait = 0, blocked = 0;
     std::array<u64, 4> writer{};
@@ -347,7 +379,82 @@ void BufferCache::LogReadbackReport() {
     }
 }
 
+void BufferCache::MarkHot(VAddr device_addr, u64 size) {
+    const auto now = std::chrono::steady_clock::now();
+    std::scoped_lock lock{writeback_mutex};
+    for (u64 block = device_addr >> 16; block <= (device_addr + size - 1) >> 16; ++block) {
+        hot_blocks[block] = now;
+    }
+}
+
+void BufferCache::NoteHotWrite(VAddr device_addr, u64 size) {
+    // Hot for 10 s after the last readback a game thread waited for.
+    constexpr auto HotFor = std::chrono::seconds(10);
+    constexpr size_t MaxPending = 512;
+    const auto now = std::chrono::steady_clock::now();
+    std::scoped_lock lock{writeback_mutex};
+    if (hot_blocks.empty()) {
+        return;
+    }
+    bool hot = false;
+    for (u64 block = device_addr >> 16; block <= (device_addr + size - 1) >> 16 && !hot; ++block) {
+        const auto it = hot_blocks.find(block);
+        hot = it != hot_blocks.end() && now - it->second < HotFor;
+    }
+    if (!hot) {
+        return;
+    }
+    const u64 tick = scheduler.CurrentTick();
+    const auto same = std::ranges::find_if(pending_writebacks, [&](const PendingWriteback& w) {
+        return w.address == device_addr && w.size == size;
+    });
+    if (same != pending_writebacks.end()) {
+        same->tick = tick;
+    } else if (pending_writebacks.size() < MaxPending) {
+        pending_writebacks.push_back({device_addr, size, tick});
+    }
+    writeback_flush.store(true, std::memory_order_release);
+}
+
+std::vector<BufferCache::PendingWriteback> BufferCache::TakeFinishedWritebacks() {
+    std::vector<PendingWriteback> finished;
+    std::scoped_lock lock{writeback_mutex};
+    if (pending_writebacks.empty()) {
+        return finished;
+    }
+    const u64 current = scheduler.CurrentTick();
+    std::erase_if(pending_writebacks, [&](const PendingWriteback& w) {
+        if (w.tick >= current || !scheduler.IsFree(w.tick)) {
+            return false;
+        }
+        finished.push_back(w);
+        return true;
+    });
+    // Expired hot blocks are dropped now and then.
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(hot_blocks,
+                  [&](const auto& block) { return now - block.second > std::chrono::seconds(30); });
+    return finished;
+}
+
+void BufferCache::WriteBack(const PendingWriteback& writeback) {
+    // Only finished work on the second queue (no wait for everything queued), and not memory
+    // that newer GPU work writes again (its own write-back follows).
+    if (!readback_fence || !Common::BbTuning::ReadbackQueue() ||
+        !IsRegionGpuModified(writeback.address, writeback.size) ||
+        LastGpuWriteTick(writeback.address, writeback.size) > writeback.tick) {
+        return;
+    }
+    ReadMemory(writeback.address, writeback.size, false, true);
+    std::scoped_lock lock{writeback_mutex};
+    ++writebacks_done;
+    writeback_bytes += writeback.size;
+}
+
 void BufferCache::NoteGpuWrite(VAddr device_addr, u64 size) {
+    if (size != 0 && EarlyWriteback()) {
+        NoteHotWrite(device_addr, size);
+    }
     // Only needed for the second readback queue and the readback report.
     if (size == 0 ||
         (!readback_fence && !Common::GuestStats::diagnostics.load(std::memory_order_relaxed))) {
