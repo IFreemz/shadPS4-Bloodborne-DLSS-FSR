@@ -1,15 +1,22 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 #include "common/assert.h"
+#include "core/emulator_settings.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/vram_owners.h"
+
+#include <vulkan/vulkan_format_traits.hpp>
 
 #include <vk_mem_alloc.h>
 
@@ -18,6 +25,34 @@ namespace VideoCore {
 using namespace Vulkan;
 
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
+
+namespace {
+std::mutex keep_full_mutex;
+std::unordered_set<VAddr> keep_full_addresses;
+} // namespace
+
+void KeepFullQuality(VAddr guest_address) {
+    std::scoped_lock lock{keep_full_mutex};
+    keep_full_addresses.insert(guest_address);
+}
+
+// Texture quality: how many of the largest levels to leave out. Only 2D block-compressed
+// textures with a mip chain (sampled, never render targets or storage), larger than the
+// setting's size.
+static u32 LevelsToDrop(const ImageInfo& info) {
+    const int quality = EmulatorSettings.GetBbTextureQuality();
+    if (quality <= 0 || !info.props.is_block || info.props.is_depth || info.num_samples > 1 ||
+        info.type != AmdGpu::ImageType::Color2D || info.resources.levels < 2 ||
+        info.guest_address == 0) {
+        return 0;
+    }
+    const u32 keep_up_to = quality >= 2 ? 1024 : 2048;
+    if (std::max(info.size.width, info.size.height) <= keep_up_to) {
+        return 0;
+    }
+    std::scoped_lock lock{keep_full_mutex};
+    return keep_full_addresses.contains(info.guest_address) ? 0 : 1;
+}
 
 static vk::ImageUsageFlags ImageUsageFlags(const Vulkan::Instance& instance,
                                            const ImageInfo& info) {
@@ -89,19 +124,22 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 
 UniqueImage::~UniqueImage() {
     if (image) {
+        VramOwners::Track(vram_owner, allocator, allocation, false);
         vmaDestroyImage(allocator, image, allocation);
     }
 }
 
 void UniqueImage::Destroy() {
     if (image) {
+        VramOwners::Track(vram_owner, allocator, allocation, false);
+        vram_owner = VramOwners::NoOwner;
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
     }
 }
 
-void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+void UniqueImage::Create(const vk::ImageCreateInfo& image_ci, std::source_location owner) {
     this->image_ci = image_ci;
     ASSERT(!image);
     VmaAllocationCreateInfo alloc_ci = {
@@ -113,11 +151,21 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
         .pUserData = nullptr,
     };
 
+    // "Go past the budget": compressed textures in the low priority pool (another memory type
+    // than the pool's: the default one).
+    if (VramOwners::low_priority_textures && vk::isCompressed(image_ci.format)) {
+        alloc_ci.pool = VramOwners::low_priority_textures;
+    }
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
+    if (result == VK_ERROR_FEATURE_NOT_PRESENT && alloc_ci.pool) {
+        alloc_ci.pool = VK_NULL_HANDLE;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
         // Over the VRAM budget (small cards, a heavy area): allocated anyway, which the driver
         // pages out if it must, instead of stopping the emulator. The VRAM cleanup frees unused
@@ -137,6 +185,12 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
+    std::string_view file = owner.file_name();
+    if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) {
+        file = file.substr(slash + 1);
+    }
+    vram_owner = VramOwners::Register(fmt::format("images from {}:{}", file, owner.line()));
+    VramOwners::Track(vram_owner, allocator, allocation, true);
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
@@ -187,17 +241,18 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     supported_samples = image_format_properties.result == vk::Result::eSuccess
                             ? image_format_properties.value.imageFormatProperties.sampleCounts
                             : vk::SampleCountFlagBits::e1;
+    dropped_levels = LevelsToDrop(info);
 
     const vk::ImageCreateInfo image_ci = {
         .flags = flags,
         .imageType = ConvertImageType(info.type),
         .format = supported_format,
         .extent{
-            .width = info.size.width,
-            .height = info.size.height,
+            .width = std::max(info.size.width >> dropped_levels, 1u),
+            .height = std::max(info.size.height >> dropped_levels, 1u),
             .depth = info.size.depth,
         },
-        .mipLevels = static_cast<u32>(info.resources.levels),
+        .mipLevels = static_cast<u32>(info.resources.levels) - dropped_levels,
         .arrayLayers = static_cast<u32>(info.resources.layers),
         .samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples),
         .tiling = tiling,
@@ -241,14 +296,18 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
 
+    if (subres_range) {
+        subres_range = HostRange(*subres_range);
+    }
+    const auto resources = HostResources();
     const bool needs_partial_transition =
         subres_range &&
-        (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
+        (subres_range->base != SubresourceBase{} || subres_range->extent != resources);
     const bool partially_transited = !subresource_states.empty();
 
     if (needs_partial_transition || partially_transited) {
         if (!partially_transited) {
-            subresource_states.resize(info.resources.levels * info.resources.layers);
+            subresource_states.resize(resources.levels * resources.layers);
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
         }
 
@@ -258,16 +317,16 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         const u32 start_mip = needs_partial_transition ? subres_range->base.level : u16{0};
         const u32 end_mip = needs_partial_transition
                                 ? subres_range->base.level + subres_range->extent.levels
-                                : info.resources.levels;
+                                : resources.levels;
         const u32 start_layer = needs_partial_transition ? subres_range->base.layer : u16{0};
         const u32 end_layer = needs_partial_transition
                                   ? subres_range->base.layer + subres_range->extent.layers
-                                  : info.resources.layers;
+                                  : resources.layers;
         for (u32 mip = start_mip; mip < end_mip; ++mip) {
             for (u32 layer = start_layer; layer < end_layer; ++layer) {
                 // NOTE: these loops may produce a lot of small barriers.
                 // If this becomes a problem, we can optimize it by merging adjacent barriers.
-                const auto subres_idx = mip * info.resources.layers + layer;
+                const auto subres_idx = mip * resources.layers + layer;
                 ASSERT(subres_idx < subresource_states.size());
                 auto& state = subresource_states[subres_idx];
 

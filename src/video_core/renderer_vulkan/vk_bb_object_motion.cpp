@@ -10,10 +10,21 @@
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/vram_owners.h"
 
 namespace Vulkan {
 
 namespace {
+
+u32 MotionBuffersOwner() {
+    static const u32 owner = VideoCore::VramOwners::Register("character motion buffers");
+    return owner;
+}
+
+u32 MotionImagesOwner() {
+    static const u32 owner = VideoCore::VramOwners::Register("character motion images");
+    return owner;
+}
 
 bool CreateBuffer(const Instance& instance, vk::DeviceSize size, bool host, vk::Buffer& buffer,
                   VmaAllocation& allocation, void** mapped, u64& address) {
@@ -38,6 +49,7 @@ bool CreateBuffer(const Instance& instance, vk::DeviceSize size, bool host, vk::
         VK_SUCCESS) {
         return false;
     }
+    VideoCore::VramOwners::Track(MotionBuffersOwner(), instance.GetAllocator(), allocation, true);
     buffer = raw;
     if (mapped) {
         *mapped = info.pMappedData;
@@ -87,9 +99,11 @@ BbObjectMotion::~BbObjectMotion() {
     }
     const auto allocator = instance.GetAllocator();
     if (params_buffer) {
+        VideoCore::VramOwners::Track(MotionBuffersOwner(), allocator, params_allocation, false);
         vmaDestroyBuffer(allocator, params_buffer, params_allocation);
     }
     if (positions_buffer) {
+        VideoCore::VramOwners::Track(MotionBuffersOwner(), allocator, positions_allocation, false);
         vmaDestroyBuffer(allocator, positions_buffer, positions_allocation);
     }
 }
@@ -174,6 +188,7 @@ void BbObjectMotion::DestroyTarget(Target& target, bool deferred) {
     auto destroy = [device, allocator, image = target.image, allocation = target.allocation,
                     view = target.view] {
         device.destroyImageView(view);
+        VideoCore::VramOwners::Track(MotionImagesOwner(), allocator, allocation, false);
         vmaDestroyImage(allocator, image, allocation);
     };
     if (deferred) {
@@ -221,6 +236,8 @@ BbObjectMotion::Target& BbObjectMotion::GetTarget(u32 width, u32 height) {
                        nullptr) != VK_SUCCESS) {
         UNREACHABLE_MSG("Character motion image {}x{} could not be created", width, height);
     }
+    VideoCore::VramOwners::Track(MotionImagesOwner(), instance.GetAllocator(), slot->allocation,
+                                 true);
     slot->image = raw;
     slot->view = instance.GetDevice()
                      .createImageView({

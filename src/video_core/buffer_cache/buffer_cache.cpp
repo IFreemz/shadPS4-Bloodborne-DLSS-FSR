@@ -67,6 +67,9 @@ static constexpr u64 RESIDENT_BUFFER_GC_COOLDOWN = 120;
 static constexpr u64 RESIDENT_BUFFER_GC_TARGET = 256_MB;
 // Less than this idle isn't worth a pass: each one waits for the GPU.
 static constexpr u64 RESIDENT_BUFFER_GC_MIN = 32_MB;
+// At a loading screen: buffer ranges unused this long are freed (the loading screen's own are in
+// use all along).
+static constexpr u64 LOAD_SCREEN_BUFFER_IDLE_SECONDS = 2;
 constexpr std::optional<u32> CmaskColorExpandedValue(u32 num_samples) {
     switch (num_samples) {
     case 1:
@@ -869,8 +872,18 @@ BufferCache::ResidentBlocks BufferCache::TakeResidentBlocks(u64 wanted) {
     return {memory, start, count};
 }
 
-vk::DeviceMemory BufferCache::AllocateResidentMemory(const vk::MemoryAllocateInfo& alloc_info,
+vk::DeviceMemory BufferCache::AllocateResidentMemory(const vk::MemoryAllocateInfo& requested,
                                                      const char* pool) {
+    // Memory priorities on: guest buffers ask to be the last of the emulator's memory Windows moves
+    // to system RAM (the GPU reads them in every draw).
+    const vk::MemoryPriorityAllocateInfoEXT priority_info = {
+        .pNext = requested.pNext,
+        .priority = Vulkan::Instance::HighBufferPriority,
+    };
+    vk::MemoryAllocateInfo alloc_info = requested;
+    if (instance.HasMemoryPriority()) {
+        alloc_info.pNext = &priority_info;
+    }
     const u64 size_mib = alloc_info.allocationSize >> 20;
     Common::Crumbs::Add("buffer memory: allocate (MiB, resident MiB)", size_mib,
                         resident_bytes.load(std::memory_order_relaxed) >> 20);
@@ -901,6 +914,41 @@ vk::DeviceMemory BufferCache::AllocateResidentMemory(const vk::MemoryAllocateInf
                      (pool_free_blocks << block_shift) >> 20, retired_memory.size(),
                      vram_reclaim ? "on" : "off");
         Common::Crumbs::Add("buffer memory: allocation failed (MiB)", size_mib);
+        // Out of graphics card memory: what can go at once goes, then the allocation is tried
+        // again. Evicted buffer memory whose unbind the GPU has done is bound to nothing (it waits
+        // a few seconds only as a precaution), and idle upload scratch is taken back on demand.
+        u64 retired_freed = 0;
+        if (!retired_memory.empty()) {
+            memory_semaphore.Refresh();
+            std::erase_if(retired_memory, [&](const RetiredMemory& retired) {
+                if (!memory_semaphore.IsFree(retired.unbind_tick)) {
+                    return false;
+                }
+                instance.GetDevice().freeMemory(retired.memory);
+                ++retired_freed;
+                return true;
+            });
+        }
+        const auto scratch = staging_pool.ReleaseIdleDeviceLocal(true);
+        allocated = instance.GetDevice().allocateMemory(alloc_info);
+        const auto after = instance.GetMemoryHeapReport();
+        if (allocated.result == vk::Result::eSuccess) {
+            LOG_WARNING(Render,
+                        "Buffer memory allocation ({}, {} MiB) succeeded on a second try after "
+                        "freeing {} evicted buffer allocations early and {} MiB of upload "
+                        "scratch | VRAM {} of {} MiB",
+                        pool, size_mib, retired_freed, scratch.bytes >> 20, after.local_usage >> 20,
+                        after.local_budget >> 20);
+            Common::Crumbs::Add("buffer memory: allocation recovered (MiB)", size_mib);
+        } else {
+            LOG_CRITICAL(Render,
+                         "Buffer memory allocation ({}, {} MiB) failed again after freeing {} "
+                         "evicted buffer allocations early and {} MiB of upload scratch: {} | "
+                         "VRAM {} of {} MiB",
+                         pool, size_mib, retired_freed, scratch.bytes >> 20,
+                         vk::to_string(allocated.result), after.local_usage >> 20,
+                         after.local_budget >> 20);
+        }
     }
     return Vulkan::Check(std::move(allocated));
 }
@@ -951,24 +999,40 @@ void BufferCache::MarkResidentUse(VAddr device_addr, u64 size) {
     }
 }
 
-void BufferCache::GarbageCollectResidentMemory() {
-    if (!vram_reclaim || !instance.CanReportMemoryUsage() || resident_ranges.Empty() ||
-        !pending_binds.empty()) {
-        return;
+bool BufferCache::GarbageCollectResidentMemory(bool load_screen) {
+    if (!vram_reclaim || !instance.CanReportMemoryUsage() || resident_ranges.Empty()) {
+        return true;
+    }
+    if (!pending_binds.empty()) {
+        return false;
     }
     const u64 budget = instance.GetTotalMemoryBudget();
     if (budget == 0) {
-        return;
+        return true;
     }
-    const u64 usage = instance.GetDeviceMemoryUsage();
+    // Memory in use: free space in the allocator's blocks and in the slabs here takes new data
+    // without more from the driver, which counts it as used all the same.
+    const u64 driver_usage = instance.GetDeviceMemoryUsage();
+    const auto allocator_usage = instance.GetAllocatorUsage();
+    const u64 unused =
+        (allocator_usage.held - std::min(allocator_usage.held, allocator_usage.in_use)) +
+        GetPoolUsage().free;
+    const u64 usage = driver_usage - std::min(driver_usage, unused);
     const u64 reserve = std::min<u64>(1_GB, budget / 8);
     // Only near the real limit: each pass waits for the GPU, and evicted buffers the game uses
     // again are made resident again (on 8 GB cards a lower target evicted every few seconds).
-    const u64 pressure_limit = budget - reserve;
-    if (cache_tick - last_resident_gc_tick < RESIDENT_BUFFER_GC_COOLDOWN ||
-        usage < pressure_limit) {
-        return;
+    // A loading screen hides the GPU wait, and what the next area needs is uploaded anyway.
+    const u64 pressure_limit =
+        EmulatorSettings.IsBbMoreVram() ? instance.GetLiveVramLimits().pressure : budget - reserve;
+    if (!load_screen && (cache_tick - last_resident_gc_tick < RESIDENT_BUFFER_GC_COOLDOWN ||
+                         usage < pressure_limit)) {
+        return true;
     }
+    const u64 idle_seconds =
+        load_screen ? LOAD_SCREEN_BUFFER_IDLE_SECONDS : RESIDENT_BUFFER_IDLE_SECONDS;
+    const u64 evict_target =
+        load_screen ? std::numeric_limits<u64>::max() : RESIDENT_BUFFER_GC_TARGET;
+    const u64 evict_min = load_screen ? 1 : RESIDENT_BUFFER_GC_MIN;
     last_resident_gc_tick = cache_tick;
     const auto pass_start = std::chrono::steady_clock::now();
 
@@ -990,7 +1054,7 @@ void BufferCache::GarbageCollectResidentMemory() {
             const u64 size = (end - start) << block_shift;
             const auto use = resident_chunk_use.find(address >> RESIDENT_CHUNK_SHIFT);
             const u64 last_use = use != resident_chunk_use.end() ? use->second : 0;
-            if (cache_second - last_use < RESIDENT_BUFFER_IDLE_SECONDS) {
+            if (cache_second - last_use < idle_seconds) {
                 recent_bytes += size;
             } else if (gpu_modified_ranges.Intersects(address, size) ||
                        memory_tracker->IsRegionGpuModified(address, size)) {
@@ -1008,20 +1072,20 @@ void BufferCache::GarbageCollectResidentMemory() {
     for (const Piece& piece : pieces) {
         evict.push_back(piece.backing);
         evict_size += (piece.backing.end - piece.backing.start) << block_shift;
-        if (evict_size >= RESIDENT_BUFFER_GC_TARGET) {
+        if (evict_size >= evict_target) {
             break;
         }
     }
-    if (evict_size < RESIDENT_BUFFER_GC_MIN) {
-        if (cache_tick - last_resident_diag_tick >= RESIDENT_BUFFER_REPORT_TICKS) {
+    if (evict_size < evict_min) {
+        if (!load_screen && cache_tick - last_resident_diag_tick >= RESIDENT_BUFFER_REPORT_TICKS) {
             last_resident_diag_tick = cache_tick;
             LOG_INFO(Render,
                      "Guest buffers under VRAM pressure ({} of {} MiB): nothing to evict | {} MiB "
                      "used in the last {} s, {} MiB holds GPU-written data, {} MiB idle",
-                     usage >> 20, budget >> 20, recent_bytes >> 20, RESIDENT_BUFFER_IDLE_SECONDS,
+                     usage >> 20, budget >> 20, recent_bytes >> 20, idle_seconds,
                      gpu_written_bytes >> 20, evict_size >> 20);
         }
-        return;
+        return true;
     }
 
     // No GPU wait (each one was a stutter): the unbind below waits on the GPU for the work
@@ -1133,13 +1197,19 @@ void BufferCache::GarbageCollectResidentMemory() {
     const double pass_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pass_start)
             .count();
+    namespace GS = Common::GuestStats;
+    GS::buffer_evictions.fetch_add(1, std::memory_order_relaxed);
+    GS::buffer_eviction_bytes.fetch_add(evict_size, std::memory_order_relaxed);
+    GS::buffer_eviction_ns.fetch_add(static_cast<u64>(pass_ms * 1e6), std::memory_order_relaxed);
+    GS::buffer_eviction_unbind_ns.fetch_add(static_cast<u64>(unbind_ms * 1e6),
+                                            std::memory_order_relaxed);
     LOG_INFO(Render,
-             "Evicted {} MiB of guest buffers unused for {}+ s ({} pieces), freed {} MiB ({} "
+             "{}Evicted {} MiB of guest buffers unused for {}+ s ({} pieces), freed {} MiB ({} "
              "allocations) | VRAM {} of {} MiB | kept: {} MiB used recently, {} MiB GPU-written "
              "| buffer memory {} MiB in {} allocations, {} MiB of it free for reuse | unbind call "
              "{:.2f} ms ({} ranges), whole pass {:.2f} ms",
-             evict_size >> 20, RESIDENT_BUFFER_IDLE_SECONDS, evict.size(), freed_bytes >> 20,
-             freed_allocations, usage >> 20, budget >> 20, recent_bytes >> 20,
+             load_screen ? "Loading screen: " : "", evict_size >> 20, idle_seconds, evict.size(),
+             freed_bytes >> 20, freed_allocations, usage >> 20, budget >> 20, recent_bytes >> 20,
              gpu_written_bytes >> 20, (pool_blocks << block_shift) >> 20, resident_slabs.size(),
              (pool_free_blocks << block_shift) >> 20, unbind_ms, evict.size(), pass_ms);
     if (unbind_ms >= SLOW_SPARSE_CALL_MS) {
@@ -1148,6 +1218,7 @@ void BufferCache::GarbageCollectResidentMemory() {
                     "repeats, turn off \"Also free idle buffers\" and report it with this log",
                     unbind_ms, evict.size());
     }
+    return true;
 }
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
@@ -1265,6 +1336,9 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
         return false;
     }
     Image& image = texture_cache.GetImage(image_id);
+    if (image.dropped_levels != 0) {
+        return false;
+    }
     ASSERT_MSG(device_addr == image.info.guest_address,
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
                image.info.guest_address);

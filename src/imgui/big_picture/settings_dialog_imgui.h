@@ -120,6 +120,7 @@ private:
     const std::vector<std::string> presentModeOptions = {"Mailbox", "Fifo", "Immediate"};
     const std::vector<std::string> anisotropyOptions = {"Game default", "2x", "4x", "8x", "16x"};
     const std::vector<std::string> drawDataMemoryOptions = {"Auto", "On", "Off"};
+    const std::vector<std::string> textureQualityOptions = {"Full", "High", "Medium"};
     const std::vector<std::string> hideCursorOptions = {"Never", "Idle", "Always"};
     const std::vector<std::string> trophySideOptions = {"left", "right", "top", "bottom"};
     const std::vector<std::string> readbacksModeOptions = {"Disabled", "Relaxed", "Precise"};
@@ -151,12 +152,16 @@ private:
     bool bbFlipWhenReadySetting;
     bool bbVramReclaimSetting;
     bool bbBufferEvictionSetting;
+    bool bbLoadScreenCleanupSetting;
+    bool bbMoreVramSetting;
+    bool bbVramPastBudgetSetting;
     bool bbBackgroundTextureCopiesSetting;
     bool bbGeometryInPlaceSetting;
     bool bbSkipEmptyDrawsSetting;
     bool bbBackgroundPipelinesSetting;
     int bbAnisotropySetting;     ///< index into anisotropyOptions
     int bbDrawDataMemorySetting; ///< index into drawDataMemoryOptions
+    int bbTextureQualitySetting; ///< index into textureQualityOptions
     bool bbExactProtectionSetting;
     bool bbBatchedUploadsSetting;
     bool bbTextureSetMemoSetting;

@@ -12,6 +12,8 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
 #include <boost/container/small_vector.hpp>
@@ -269,6 +271,12 @@ public:
         TouchImage(image);
     }
 
+    /// Texture quality estimate: a shader read this texture in a way that needs its exact size
+    /// (Shader::ExactTexelRead bits).
+    /// Texture quality: an image with levels left out is freed at the next cleanup and loaded
+    /// again with all of them.
+    void NoteExactTexelReads(ImageId image_id, u8 reads, u64 pgm_hash);
+
     /// Returns the image if the slot still holds the same image (uid), without refreshing it.
     [[nodiscard]] Image* TryGetImage(ImageId id, u64 uid) {
         if (!slot_images.IsAllocated(id))
@@ -402,6 +410,18 @@ public:
     /// Fills a report and resets the collector counters. Call on the thread running the collector.
     MemoryReport TakeMemoryReport();
 
+    /// Totals of the VRAM cleanup counters (Common::GuestStats), for reports over a period.
+    struct CleanupCounters {
+        u64 passes{}, pressure_passes{}, aggressive_passes{}, ns{}, usage_query_ns{};
+        u64 freed_images{}, freed_bytes{}, writebacks{}, writeback_bytes{}, writeback_done_ns{};
+        u64 written_bytes{}, reuploads{}, reupload_bytes{}, reupload_age_ms{};
+        u64 buffer_evictions{}, buffer_eviction_bytes{}, buffer_eviction_ns{};
+        u64 buffer_eviction_unbind_ns{}, uploaded_bytes{}, budget_limit_passes{};
+        u64 scratch_releases{}, scratch_released_bytes{}, scratch_allocations{};
+        u64 scratch_allocation_bytes{};
+    };
+    [[nodiscard]] static CleanupCounters ReadCleanupCounters();
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
@@ -521,8 +541,18 @@ private:
 
     void GarbageCollectImages();
     void GarbageCollectSamplers();
+    void LogCleanupReport();
+    void LogVramBreakdown();
+    void LogTextureQualityEstimate(u64 tick_30);
 
 private:
+    void RestoreFullQuality();
+    void NoteEvicted(const Image& image);
+    void NoteUpload(const Image& image);
+    void LoadScreenCleanup();
+    void UpdateVramLimits();
+    void ReportPastBudget();
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
@@ -562,7 +592,12 @@ private:
     std::chrono::steady_clock::time_point writeback_budget_time{};
     std::array<u64, 64> gc_tick_at_second{}; ///< VRAM cleanup: gc_tick at each of the last 64 s
     u64 gc_second = 0;
+    std::mutex restore_mutex;
+    std::vector<std::pair<ImageId, u64>> restore_full_quality; ///< image and its uid
+
     u64 load_window_bytes = 0; ///< image upload bytes at the start of this second
+    u64 load_window_reupload_bytes = 0; ///< of them re-uploads of freed images, at that start
+    u64 load_burst_ignored_second = 0;
     u64 load_until_second = 0; ///< VRAM cleanup frees ahead of a load until this second
     u64 gc_loads = 0;
     bool spread_loads_enabled = false;
@@ -573,6 +608,50 @@ private:
     u64 spread_loads = 0, spread_deferred = 0, spread_zero_filled = 0, spread_zero_bytes = 0;
     u64 gc_evicted = 0, gc_written_back = 0, gc_skipped_stuck = 0, gc_skipped_written = 0;
     u64 gc_runs = 0;
+    struct EvictedImage {
+        std::chrono::steady_clock::time_point time;
+        u64 size;
+    };
+    std::mutex evicted_mutex;
+    std::unordered_map<VAddr, EvictedImage> recently_evicted; ///< freed by the cleanup, by address
+    std::chrono::steady_clock::time_point cleanup_report_time{};
+    std::chrono::steady_clock::time_point slow_pass_report_time{};
+    CleanupCounters cleanup_last{};
+    u64 cleanup_host_usage{};
+    std::atomic<u64> pending_free_bytes{0}; ///< images deleted, released once the GPU is done
+    std::chrono::steady_clock::time_point scratch_report_time{};
+    /// "Use more VRAM": marks from the driver's live budget while on, the usual ones otherwise.
+    bool more_vram_enabled = false;
+    bool live_limits_active = false;
+    bool standard_limits_saved = false;
+    u64 standard_trigger = 0, standard_pressure = 0, standard_critical = 0;
+    u64 live_limit = 0, logged_limit = 0;
+    std::chrono::steady_clock::time_point limits_time{};
+    std::chrono::steady_clock::time_point past_budget_report_time{};
+    u64 past_budget_first_budget = 0, past_budget_first_host = 0;
+    /// After a loading screen's cleanup, the next area's first uploads aren't an area load to
+    /// free ahead of: there is room already.
+    std::chrono::steady_clock::time_point free_ahead_paused_until{};
+    /// VRAM breakdown report (every 10 s): gc_tick at each of the last 64 seconds, and uploads
+    /// by size since the last report.
+    std::chrono::steady_clock::time_point breakdown_time{};
+    std::array<u64, 64> breakdown_tick_at_second{};
+    u64 breakdown_second{};
+    static constexpr size_t SizeClasses = 5;
+    std::array<std::atomic<u64>, SizeClasses> upload_count_by_size{};
+    std::array<std::atomic<u64>, SizeClasses> upload_bytes_by_size{};
+    u32 quality_report_count{};
+    /// Cleanup at loading screens: the one in progress.
+    struct LoadScreen {
+        bool active{};
+        bool marked{}, images_done{}, buffers_done{}, reported{};
+        std::chrono::steady_clock::time_point start{};
+        u64 mark_tick{}; ///< images last used before this tick are the previous area's
+        u64 start_vram{};
+        u64 freed{}, freed_bytes{}, kept_written{}, kept_written_bytes{};
+        u64 free_ns{}, passes{}, scratch_bytes{};
+    } load_screen;
+    bool load_screen_cleanup_enabled = false;
     Common::LRUCache<Image> image_lru_cache;
     Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;

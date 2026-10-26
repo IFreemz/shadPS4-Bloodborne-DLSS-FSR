@@ -1361,6 +1361,7 @@ void Rasterizer::ReportHitch() {
         now.details[i] = GS::detail_ns[i].load(std::memory_order_relaxed);
     }
     now.recorder_protect_calls = GS::recorder_protect_calls.load(std::memory_order_relaxed);
+    now.cleanup = VideoCore::TextureCache::ReadCleanupCounters();
     GS::detail_timing.store(HitchProfile() && diagnostics.load(std::memory_order_relaxed),
                             std::memory_order_relaxed);
     const auto last = std::exchange(hitch_last, now);
@@ -1464,6 +1465,40 @@ void Rasterizer::ReportHitch() {
                     ms_of(delta(now.present_acquire_ns, last.present_acquire_ns)),
                     ms_of(delta(now.present_queue_ns, last.present_queue_ns)),
                     ms_of(delta(now.present_frame_wait_ns, last.present_frame_wait_ns)));
+        const auto heaps = instance.GetMemoryHeapReport();
+        const auto& cleanup_now = now.cleanup;
+        const auto& cleanup_last = last.cleanup;
+        LOG_WARNING(
+            Render_Vulkan,
+            "Stutter VRAM: image collector {} passes ({} under pressure, {} aggressive) {:.1f} ms "
+            "| freed {} images ({:.0f} MiB), {} write-backs started, {:.0f} MiB copied to guest "
+            "memory in {:.1f} ms | {} uploads at addresses freed by the cleanup ({:.0f} MiB) | "
+            "buffer evictions {} ({:.0f} MiB, {:.1f} ms, unbind {:.1f} ms) | upload scratch "
+            "released {:.0f} MiB, allocated {:.0f} MiB | reading memory use {:.1f} ms | VRAM {} of "
+            "{} MiB, {} MiB in system memory",
+            delta(cleanup_now.passes, cleanup_last.passes),
+            delta(cleanup_now.pressure_passes, cleanup_last.pressure_passes),
+            delta(cleanup_now.aggressive_passes, cleanup_last.aggressive_passes),
+            ms_of(delta(cleanup_now.ns, cleanup_last.ns)),
+            delta(cleanup_now.freed_images, cleanup_last.freed_images),
+            delta(cleanup_now.freed_bytes, cleanup_last.freed_bytes) / 1048576.0,
+            delta(cleanup_now.writebacks, cleanup_last.writebacks),
+            delta(cleanup_now.written_bytes, cleanup_last.written_bytes) / 1048576.0,
+            ms_of(delta(cleanup_now.writeback_done_ns, cleanup_last.writeback_done_ns)),
+            delta(cleanup_now.reuploads, cleanup_last.reuploads),
+            delta(cleanup_now.reupload_bytes, cleanup_last.reupload_bytes) / 1048576.0,
+            delta(cleanup_now.buffer_evictions, cleanup_last.buffer_evictions),
+            delta(cleanup_now.buffer_eviction_bytes, cleanup_last.buffer_eviction_bytes) /
+                1048576.0,
+            ms_of(delta(cleanup_now.buffer_eviction_ns, cleanup_last.buffer_eviction_ns)),
+            ms_of(delta(cleanup_now.buffer_eviction_unbind_ns,
+                        cleanup_last.buffer_eviction_unbind_ns)),
+            delta(cleanup_now.scratch_released_bytes, cleanup_last.scratch_released_bytes) /
+                1048576.0,
+            delta(cleanup_now.scratch_allocation_bytes, cleanup_last.scratch_allocation_bytes) /
+                1048576.0,
+            ms_of(delta(cleanup_now.usage_query_ns, cleanup_last.usage_query_ns)),
+            heaps.local_usage >> 20, heaps.local_budget >> 20, heaps.host_usage >> 20);
         if (HitchProfile()) {
             // Where the draw recorder's time went in this frame (every draw timed).
             std::array<std::pair<double, const char*>, SectionNames.size()> sections{};
@@ -2313,6 +2348,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image->binding.force_general |= image_desc.is_written;
         }
         image->binding.is_bound = 1u;
+        if (image_desc.exact_texel_reads && !image_desc.is_written) {
+            texture_cache.NoteExactTexelReads(image_id, image_desc.exact_texel_reads,
+                                              stage.pgm_hash);
+        }
     };
 
     // Texture set memo: the whole stage's sampled textures as resolved last time.

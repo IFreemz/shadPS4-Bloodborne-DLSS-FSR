@@ -278,6 +278,11 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     const bool is_same_type = !is_2d_to_3d && !is_3d_to_2d;
 
     for (u32 mip = 0; mip < num_mips; ++mip) {
+        // Levels left out by texture quality on either side are not copied (the destination
+        // keeps what its upload gave it).
+        if (mip < src->dropped_levels || mip < dst->dropped_levels) {
+            continue;
+        }
         const u32 mip_w = std::max(base_width >> mip, 1u);
         const u32 mip_h = std::max(base_height >> mip, 1u);
         const u32 mip_d = std::max(base_depth >> mip, 1u);
@@ -286,10 +291,10 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
         vk::ImageCopy region{};
         region.srcSubresource.aspectMask = src_aspect;
-        region.srcSubresource.mipLevel = mip;
+        region.srcSubresource.mipLevel = mip - src->dropped_levels;
         region.srcSubresource.baseArrayLayer = 0;
         region.dstSubresource.aspectMask = dst_aspect;
-        region.dstSubresource.mipLevel = mip;
+        region.dstSubresource.mipLevel = mip - dst->dropped_levels;
         region.dstSubresource.baseArrayLayer = 0;
 
         if (is_same_type) {
@@ -319,6 +324,9 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
         }
 
         regions.push_back(region);
+    }
+    if (regions.empty()) {
+        return;
     }
 
     scheduler.EndRendering();
@@ -401,6 +409,11 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
+    // Texture quality: a level the destination left out, or a source without its own level 0,
+    // is not copied (the destination's upload gives it the guest's contents).
+    if (src->dropped_levels != 0 || mip < dst->dropped_levels) {
+        return;
+    }
     const auto dst_dim = dst->info.props.is_block ? 2 : 0;
     const auto mip_block_w = std::max(dst->info.size.width >> (mip + dst_dim), 1u);
     const auto mip_block_h = std::max(dst->info.size.height >> (mip + dst_dim), 1u);
@@ -423,7 +436,7 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
         },
         .dstSubresource{
             .aspectMask = src->aspect_mask,
-            .mipLevel = mip,
+            .mipLevel = mip - dst->dropped_levels,
             .baseArrayLayer = slice,
             .layerCount = dst_layers,
         },
@@ -605,12 +618,13 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
         FlushBarriers();
     }
 
+    const auto host_range = dst->HostRange(range);
     const vk::ImageSubresourceRange vk_range = {
         .aspectMask = vk::ImageAspectFlagBits::eColor,
-        .baseMipLevel = range.base.level,
-        .levelCount = range.extent.levels,
-        .baseArrayLayer = range.base.layer,
-        .layerCount = range.extent.layers,
+        .baseMipLevel = host_range.base.level,
+        .levelCount = host_range.extent.levels,
+        .baseArrayLayer = host_range.base.layer,
+        .layerCount = host_range.extent.layers,
     };
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.clearColorImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,

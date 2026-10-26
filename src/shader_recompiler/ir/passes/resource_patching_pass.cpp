@@ -121,6 +121,7 @@ public:
         auto& image = image_resources[index];
         image.is_atomic |= desc.is_atomic;
         image.is_written |= desc.is_written;
+        image.exact_texel_reads |= desc.exact_texel_reads;
         return index;
     }
 
@@ -239,6 +240,18 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
     // need fallback (TODO is this 100% true?)
     const bool needs_mip_storage_fallback =
         inst_info.has_lod && is_written && !profile.supports_image_load_store_lod;
+    const u8 exact_texel_reads = [&] -> u8 {
+        switch (inst.GetOpcode()) {
+        case IR::Opcode::ImageRead:
+            return is_written ? 0 : ExactTexelFetch;
+        case IR::Opcode::ImageQueryDimensions:
+            return ExactTexelSizeQuery;
+        case IR::Opcode::ImageQueryLod:
+            return ExactTexelLodQuery;
+        default:
+            return 0;
+        }
+    }();
     ImageResource image_res = {
         .sharp_fetch = ConstructSharpFetch<AmdGpu::Image>(resource.sharps[0]),
         .is_depth = bool(inst_info.is_depth),
@@ -246,6 +259,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         .is_array = bool(inst_info.is_array),
         .is_written = is_written,
         .is_r128 = bool(inst_info.is_r128),
+        .exact_texel_reads = exact_texel_reads,
         .post_op = resource.sharps[0].post_op,
     };
 
@@ -743,6 +757,9 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
                          view_type == AmdGpu::ImageType::Color2DMsaaArray;
     const bool unnormalized = sampler.force_unnormalized || inst_info.is_unnormalized;
     const bool needs_dimentions = (!is_msaa && unnormalized) || (is_msaa && !unnormalized);
+    if (unnormalized) {
+        info.images[inst.Arg(0).U32() & 0xFFFF].exact_texel_reads |= ExactTexelUnnormalized;
+    }
     const auto dimensions =
         needs_dimentions ? ir.ImageQueryDimension(handle, ir.Imm32(0u), ir.Imm1(false), inst_info)
                          : IR::Value{};

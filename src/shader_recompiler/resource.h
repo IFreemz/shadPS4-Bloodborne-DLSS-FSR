@@ -126,6 +126,14 @@ enum class MipStorageFallbackMode : u16 {
     ConstantIndex,
 };
 
+/// Reads that depend on the texture's exact size in texels (a smaller copy would read wrong).
+enum ExactTexelRead : u8 {
+    ExactTexelFetch = 1 << 0,
+    ExactTexelSizeQuery = 1 << 1,
+    ExactTexelLodQuery = 1 << 2,
+    ExactTexelUnnormalized = 1 << 3,
+};
+
 struct ImageResource {
     SharpFetch<AmdGpu::Image> sharp_fetch{};
     bool is_depth{};
@@ -134,6 +142,7 @@ struct ImageResource {
     bool is_written{};
     bool is_r128{};
     u8 constant_mip_index{};
+    u8 exact_texel_reads{};
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
 

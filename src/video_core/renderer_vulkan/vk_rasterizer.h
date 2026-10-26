@@ -242,6 +242,7 @@ private:
         std::array<u64, 5> packet_kinds{};
         std::array<u64, static_cast<size_t>(Common::GuestStats::Detail::Count)> details{};
         u64 recorder_protect_calls{};
+        VideoCore::TextureCache::CleanupCounters cleanup{};
     };
     HitchSnapshot hitch_last{};
     /// Diagnostics setting (statistics, time breakdown, hitch reports, draw profile).

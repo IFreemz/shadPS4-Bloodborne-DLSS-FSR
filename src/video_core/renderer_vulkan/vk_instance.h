@@ -19,6 +19,7 @@ class WindowSDL;
 }
 
 VK_DEFINE_HANDLE(VmaAllocator)
+VK_DEFINE_HANDLE(VmaPool)
 
 namespace Vulkan {
 
@@ -516,6 +517,32 @@ public:
     };
     [[nodiscard]] MemoryHeapReport GetMemoryHeapReport() const;
 
+    /// The allocator's memory in device-local heaps: taken from the driver, and of it in use.
+    /// The difference is free space inside its blocks, still counted by the driver as used.
+    struct AllocatorUsage {
+        u64 held{};
+        u64 in_use{};
+    };
+    [[nodiscard]] AllocatorUsage GetAllocatorUsage() const;
+
+    /// "Use more VRAM": the cleanup's marks from the driver's budget now (it moves as other
+    /// programs use the card), a small margin below it instead of an eighth of it.
+    struct VramLimits {
+        u64 budget{};   ///< the driver's budget for this process
+        u64 limit{};    ///< past it, the driver starts moving memory to system RAM
+        u64 pressure{}; ///< textures unused for a few seconds go
+        u64 critical{}; ///< textures unused for a second go
+    };
+    [[nodiscard]] VramLimits GetLiveVramLimits() const;
+
+    /// Memory priorities are on: allocations can say how much they matter if Windows must move
+    /// some of the emulator's memory to system RAM.
+    [[nodiscard]] bool HasMemoryPriority() const noexcept {
+        return memory_priority;
+    }
+    static constexpr float LowTexturePriority = 0.25f;
+    static constexpr float HighBufferPriority = 1.0f;
+
     /// Returns the total memory budget available to the device.
     /// Testing: SHADPS4_VRAM_BUDGET_MB or the "VRAM budget for testing" setting simulate a
     /// smaller GPU's memory budget.
@@ -530,6 +557,7 @@ private:
 
     /// Creates the VMA allocator handle
     void CreateAllocator();
+    void CreateLowPriorityTexturePool();
 
     /// Collects various information from the device.
     void CollectDeviceParameters();
@@ -607,6 +635,9 @@ private:
     bool shader_clock{};
     bool compute_shader_derivatives{};
     bool supports_memory_budget{};
+    bool memory_priority{};          ///< VK_EXT_memory_priority on ("Go past the budget")
+    u64 device_local_heap_bytes{};   ///< the card's own memory
+    VmaPool low_priority_textures{}; ///< pool for block-compressed textures (memory_priority)
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

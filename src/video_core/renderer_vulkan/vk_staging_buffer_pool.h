@@ -51,6 +51,19 @@ public:
     /// Releases idle memory.
     void TickFrame();
 
+    /// VRAM cleanup under pressure: frees the graphics card memory blocks and buffers (scratch
+    /// for detiling and copies) unused for about a second whose GPU work is done.
+    struct ReleasedMemory {
+        u64 bytes{};
+        u32 ring_blocks{};
+        u32 large_buffers{};
+    };
+    /// emergency (an allocation failed): everything the GPU is done with, no floor or idle time.
+    ReleasedMemory ReleaseIdleDeviceLocal(bool emergency = false);
+
+    /// Graphics card memory the pool holds now.
+    [[nodiscard]] u64 DeviceLocalBytes() const;
+
 private:
     struct Block {
         std::unique_ptr<VideoCore::StreamBuffer> buffer;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 
 #include <fmt/format.h>
@@ -22,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_fsr4_addon.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/vram_owners.h"
 
 #include <vk_mem_alloc.h>
 
@@ -192,6 +194,10 @@ Instance::~Instance() {
     dlss_ngx.reset();
     if (ImGui::GetCurrentContext()) {
         ImGui::Core::Shutdown(GetDevice());
+    }
+    if (low_priority_textures) {
+        VideoCore::VramOwners::low_priority_textures = VK_NULL_HANDLE;
+        vmaDestroyPool(allocator, low_priority_textures);
     }
     vmaDestroyAllocator(allocator);
 }
@@ -365,6 +371,17 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (EmulatorSettings.IsBbMoreVram() && EmulatorSettings.IsBbVramPastBudget()) {
+        const auto priority_features =
+            physical_device
+                .getFeatures2<vk::PhysicalDeviceFeatures2,
+                              vk::PhysicalDeviceMemoryPriorityFeaturesEXT>()
+                .get<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+        memory_priority = priority_features.memoryPriority &&
+                          add_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        LOG_INFO(Render_Vulkan, "Memory priorities (Go past the budget): {}",
+                 memory_priority ? "on" : "not supported by the driver");
+    }
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -615,6 +632,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceImageViewMinLodFeaturesEXT{
             .minLod = true,
         },
+        vk::PhysicalDeviceMemoryPriorityFeaturesEXT{
+            .memoryPriority = true,
+        },
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
@@ -677,6 +697,9 @@ bool Instance::CreateDevice() {
     }
     if (!image_view_min_lod) {
         device_chain.unlink<vk::PhysicalDeviceImageViewMinLodFeaturesEXT>();
+    }
+    if (!memory_priority) {
+        device_chain.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
     }
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -759,7 +782,8 @@ void Instance::CreateAllocator() {
     };
 
     const VmaAllocatorCreateInfo allocator_info = {
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
+                 (memory_priority ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_PRIORITY_BIT : 0u),
         .physicalDevice = physical_device,
         .device = *device,
         // 64 MiB blocks instead of 256: textures freed by the cache leave less half-empty
@@ -775,6 +799,50 @@ void Instance::CreateAllocator() {
         UNREACHABLE_MSG("Failed to initialize VMA with error {}",
                         vk::to_string(vk::Result{result}));
     }
+    if (memory_priority) {
+        CreateLowPriorityTexturePool();
+    }
+}
+
+// "Go past the budget": block-compressed textures (the game's and a texture pack's, never drawn
+// into) get a pool of their own at a low priority; everything else stays at the default one and
+// guest buffers ask for the highest. Past the budget, Windows then moves texture copies to system
+// RAM first (slower to sample, nothing else breaks) if it moves any of the emulator's memory.
+void Instance::CreateLowPriorityTexturePool() {
+    const VkImageCreateInfo sample_image = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_BC1_RGBA_SRGB_BLOCK,
+        .extent = {2048, 2048, 1},
+        .mipLevels = 12,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+    };
+    const VmaAllocationCreateInfo sample_alloc = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    u32 memory_type = 0;
+    if (vmaFindMemoryTypeIndexForImageInfo(allocator, &sample_image, &sample_alloc, &memory_type) !=
+        VK_SUCCESS) {
+        LOG_WARNING(Render_Vulkan, "Memory priorities: no memory type for textures found");
+        return;
+    }
+    const VmaPoolCreateInfo pool_info = {
+        .memoryTypeIndex = memory_type,
+        .blockSize = 64_MB,
+        .priority = LowTexturePriority,
+    };
+    if (vmaCreatePool(allocator, &pool_info, &low_priority_textures) != VK_SUCCESS) {
+        LOG_WARNING(Render_Vulkan, "Memory priorities: the texture pool could not be created");
+        low_priority_textures = VK_NULL_HANDLE;
+        return;
+    }
+    VideoCore::VramOwners::low_priority_textures = low_priority_textures;
+    LOG_INFO(Render_Vulkan,
+             "Memory priorities: compressed textures in a pool of their own (memory type {}, "
+             "priority {}), guest buffers at {}",
+             memory_type, LowTexturePriority, HighBufferPriority);
 }
 
 void Instance::CollectDeviceParameters() {
@@ -834,6 +902,7 @@ void Instance::CollectPhysicalMemoryInfo() {
     }
     // The graphics card's own memory, for the graphics heap F1's Auto picks (BbResolution).
     // The VRAM budget test setting stands in for it.
+    device_local_heap_bytes = local_memory;
     const int test_mb = EmulatorSettings.GetBbVramBudgetTestMb();
     Common::BbTuning::vram_bytes.store(test_mb > 0 ? u64(test_mb) << 20 : local_memory,
                                        std::memory_order_relaxed);
@@ -930,6 +999,42 @@ u64 Instance::GetDeviceMemoryUsage() const {
         total_usage += memory_budget_props.heapUsage[heap];
     }
     return total_usage;
+}
+
+Instance::AllocatorUsage Instance::GetAllocatorUsage() const {
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    AllocatorUsage usage{};
+    const auto& memory_props = GetMemoryProperties();
+    for (u32 i = 0; i < memory_props.memoryHeapCount; ++i) {
+        if (memory_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            usage.held += budgets[i].statistics.blockBytes;
+            usage.in_use += budgets[i].statistics.allocationBytes;
+        }
+    }
+    return usage;
+}
+
+Instance::VramLimits Instance::GetLiveVramLimits() const {
+    // Below the driver's budget: Windows, the overlay and other programs are outside it already.
+    constexpr u64 LimitMargin = 256_MB;
+    VramLimits limits{};
+    const u64 test_budget = GetTotalMemoryBudget();
+    limits.budget =
+        test_budget != total_memory_budget ? test_budget : GetMemoryHeapReport().local_budget;
+    limits.limit = limits.budget - std::min(limits.budget, LimitMargin);
+    // "Go past the budget": up to the card's own memory less a reserve for Windows' desktop and
+    // the programs it moves out (it raises the budget as it does). Never below the usual limit.
+    constexpr u64 WindowsReserve = 512_MB;
+    if (EmulatorSettings.IsBbVramPastBudget() && test_budget == total_memory_budget &&
+        device_local_heap_bytes > WindowsReserve) {
+        limits.limit = std::max(limits.limit, device_local_heap_bytes - WindowsReserve);
+    }
+    limits.pressure =
+        limits.limit - std::min(limits.limit, std::max<u64>(384_MB, limits.limit / 12));
+    limits.critical =
+        limits.limit - std::min(limits.limit, std::max<u64>(128_MB, limits.limit / 32));
+    return limits;
 }
 
 Instance::MemoryHeapReport Instance::GetMemoryHeapReport() const {

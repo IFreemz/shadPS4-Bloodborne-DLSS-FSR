@@ -9,4 +9,8 @@ namespace Core::BbGameFixes {
 // the game's bytes first and is left out when they differ (another version, or a patch there).
 void Install();
 
+// True while the game shows a loading screen (respawn, travel, loading a save, quitting to the
+// title). Always false when the game's code differs from 1.09's there.
+bool IsLoadingScreen();
+
 } // namespace Core::BbGameFixes

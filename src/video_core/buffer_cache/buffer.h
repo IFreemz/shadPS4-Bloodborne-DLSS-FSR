@@ -60,7 +60,8 @@ struct UniqueBuffer {
         : device{other.device}, buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
           bda_addr{std::exchange(other.bda_addr, 0)},
           allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
-          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)} {}
+          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
+          vram_owner{std::exchange(other.vram_owner, ~0u)} {}
 
     UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
         if (this != &other) {
@@ -70,12 +71,13 @@ struct UniqueBuffer {
             bda_addr = std::exchange(other.bda_addr, 0);
             allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
             allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+            vram_owner = std::exchange(other.vram_owner, ~0u);
         }
         return *this;
     }
 
     void Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
-                VmaAllocationInfo* out_alloc_info);
+                VmaAllocationInfo* out_alloc_info, std::string_view owner_name = {});
 
     void Destroy();
 
@@ -84,6 +86,7 @@ struct UniqueBuffer {
     vk::DeviceAddress bda_addr{};
     VmaAllocator allocator;
     VmaAllocation allocation{};
+    u32 vram_owner{~0u}; ///< VramOwners slot of a device-local allocation
 };
 
 struct Buffer {

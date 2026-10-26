@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <optional>
+#include <source_location>
 
 #include "common/enum.h"
 #include "common/incremental_id.h"
@@ -37,6 +39,9 @@ enum ImageFlagBits : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
 
+/// Texture quality: an image a shader reads at its exact size keeps all its levels from now on.
+void KeepFullQuality(VAddr guest_address);
+
 struct UniqueImage {
     explicit UniqueImage() = default;
     explicit UniqueImage(vk::Device device, VmaAllocator allocator)
@@ -49,16 +54,20 @@ struct UniqueImage {
     UniqueImage(UniqueImage&& other)
         : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
+          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
+          vram_owner{std::exchange(other.vram_owner, ~0u)} {}
     UniqueImage& operator=(UniqueImage&& other) {
         image = std::exchange(other.image, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
+        vram_owner = std::exchange(other.vram_owner, ~0u);
         return *this;
     }
 
-    void Create(const vk::ImageCreateInfo& image_ci);
+    /// `owner`: who made it, for the VRAM report (by default the calling file and line).
+    void Create(const vk::ImageCreateInfo& image_ci,
+                std::source_location owner = std::source_location::current());
 
     void Destroy();
 
@@ -77,6 +86,7 @@ public:
     vk::Image image{};
     vk::ImageCreateInfo image_ci{};
     vk::DeviceSize size_bytes{};
+    u32 vram_owner{~0u}; ///< VramOwners slot of a device-local allocation
 };
 
 struct Image : public Common::LRUNode<> {
@@ -127,6 +137,29 @@ struct Image : public Common::LRUNode<> {
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
+    /// The levels the Vulkan image has: the guest's less those left out by texture quality.
+    SubresourceExtent HostResources() const {
+        return {static_cast<u16>(info.resources.levels - dropped_levels), info.resources.layers};
+    }
+
+    /// A range of guest levels as levels of the Vulkan image (the guest levels left out read
+    /// the largest one kept).
+    SubresourceRange HostRange(const SubresourceRange& range) const {
+        if (dropped_levels == 0) {
+            return range;
+        }
+        const u32 host_levels = info.resources.levels - dropped_levels;
+        const u32 base = std::min<u32>(
+            range.base.level >= dropped_levels ? range.base.level - dropped_levels : 0,
+            host_levels - 1);
+        const u32 end = std::min<u32>(
+            std::max<u32>(range.base.level + range.extent.levels, dropped_levels + 1) -
+                dropped_levels,
+            host_levels);
+        return {.base = {static_cast<u16>(base), range.base.layer},
+                .extent = {static_cast<u16>(std::max<u32>(end - base, 1)), range.extent.layers}};
+    }
+
     using Barriers = SmallVector<vk::ImageMemoryBarrier2, 32>;
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,
@@ -173,6 +206,11 @@ public:
     u64 tick_accessed_last{};
     u64 last_use_gc_tick{}; ///< VRAM cleanup: GC tick of the last use (atomic_ref access)
     u64 hash{};
+    /// Shader::ExactTexelRead bits of the shaders that read it (atomic_ref access).
+    u8 exact_texel_reads{};
+    /// Texture quality: the largest guest levels the Vulkan image leaves out (it is that much
+    /// smaller, and its level 0 is guest level dropped_levels).
+    u32 dropped_levels{};
 
     struct {
         u32 texture : 1;

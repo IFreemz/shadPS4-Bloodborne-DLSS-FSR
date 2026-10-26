@@ -77,6 +77,9 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbFlipWhenReadySetting = EmulatorSettings.IsBbFlipWhenReady();
     bbVramReclaimSetting = EmulatorSettings.IsBbVramReclaim();
     bbBufferEvictionSetting = EmulatorSettings.IsBbBufferEviction();
+    bbLoadScreenCleanupSetting = EmulatorSettings.IsBbLoadScreenCleanup();
+    bbMoreVramSetting = EmulatorSettings.IsBbMoreVram();
+    bbVramPastBudgetSetting = EmulatorSettings.IsBbVramPastBudget();
     bbBackgroundTextureCopiesSetting = EmulatorSettings.IsBbBackgroundTextureCopies();
     bbGeometryInPlaceSetting = EmulatorSettings.IsBbGeometryInPlace();
     bbSkipEmptyDrawsSetting = EmulatorSettings.IsBbSkipEmptyDraws();
@@ -103,6 +106,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
                                              : 0;
     }
     bbDrawDataMemorySetting = std::clamp(EmulatorSettings.GetBbDrawDataMemory(), 0, 2);
+    bbTextureQualitySetting = std::clamp(EmulatorSettings.GetBbTextureQuality(), 0, 2);
     bbStutterDetailSetting = EmulatorSettings.IsBbStutterDetail();
     bbVramBudgetTestSetting = EmulatorSettings.GetBbVramBudgetTestMb();
 
@@ -173,6 +177,9 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbFlipWhenReady(bbFlipWhenReadySetting, isSpecific);
     EmulatorSettings.SetBbVramReclaim(bbVramReclaimSetting, isSpecific);
     EmulatorSettings.SetBbBufferEviction(bbBufferEvictionSetting, isSpecific);
+    EmulatorSettings.SetBbLoadScreenCleanup(bbLoadScreenCleanupSetting, isSpecific);
+    EmulatorSettings.SetBbMoreVram(bbMoreVramSetting, isSpecific);
+    EmulatorSettings.SetBbVramPastBudget(bbVramPastBudgetSetting, isSpecific);
     EmulatorSettings.SetBbBackgroundTextureCopies(bbBackgroundTextureCopiesSetting, isSpecific);
     EmulatorSettings.SetBbGeometryInPlace(bbGeometryInPlaceSetting, isSpecific);
     EmulatorSettings.SetBbSkipEmptyDraws(bbSkipEmptyDrawsSetting, isSpecific);
@@ -192,6 +199,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbAnisotropy(bbAnisotropySetting == 0 ? 0 : 1 << bbAnisotropySetting,
                                      isSpecific);
     EmulatorSettings.SetBbDrawDataMemory(bbDrawDataMemorySetting, isSpecific);
+    EmulatorSettings.SetBbTextureQuality(bbTextureQualitySetting, isSpecific);
     EmulatorSettings.SetBbStutterDetail(bbStutterDetailSetting, isSpecific);
     EmulatorSettings.SetBbVramBudgetTestMb(bbVramBudgetTestSetting, isSpecific);
 
@@ -872,6 +880,13 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             }
             // Sharper ground and stairs at an angle; applies after a restart.
             AddSettingCombo("Anisotropic filtering", bbAnisotropySetting, anisotropyOptions);
+            AddSettingCombo("Texture quality", bbTextureQualitySetting, textureQualityOptions);
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Less VRAM for big textures (the BB Remaster mod's) by leaving "
+                                  "out their sharpest level:\nHigh: textures over 2048, Medium: "
+                                  "over 1024 (about 500 MB less in busy areas).\nApplies to "
+                                  "textures loaded after a change: from the next loading screen.");
+            }
             // The per-draw data the CPU writes every frame: in graphics card memory with Resizable
             // BAR / Smart Access Memory, else system memory. The log says which was used.
             AddSettingCombo("Resizable BAR / Smart Access Memory (restart)",
@@ -892,6 +907,15 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox(
                     "    Also free idle buffers", bbBufferEvictionSetting,
                     "Buffer memory unused for 30 s near the limit (needs a restart)");
+                AddSettingCheckbox("    Clean up at loading screens", bbLoadScreenCleanupSetting,
+                                   "Frees what the last area used; the next one loads its own");
+                AddSettingCheckbox("    Use more VRAM (testing)", bbMoreVramSetting,
+                                   "Cleans up only close to the driver's VRAM budget");
+                if (bbMoreVramSetting) {
+                    AddSettingCheckbox("        Go past the budget (testing, restart)",
+                                       bbVramPastBudgetSetting,
+                                       "Up to the card's size; Windows moves other programs out");
+                }
             }
             AddSettingSection("Diagnostics", "For troubleshooting. Slower when on: leave off.",
                               false);

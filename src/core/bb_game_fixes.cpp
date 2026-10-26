@@ -124,6 +124,33 @@ bool InstallFxInitClear() {
     return true;
 }
 
+// The game's loading-screen flag: a byte the game sets to 1 when a loading screen starts and
+// back to 0 when it ends. Two places set it, each with `mov byte ptr [flag], 1`: one when any
+// transition starts (also quitting to the title), one when an area load starts.
+constexpr u64 LoadingFlag = 0x556286b;
+constexpr std::array<u64, 2> LoadingFlagWriters{0x1940d3c, 0x1929011};
+
+std::atomic<bool> loading_flag_found{false};
+
+bool FindLoadingFlag() {
+    if (!Fits(LoadingFlag, 1)) {
+        return false;
+    }
+    for (const u64 site : LoadingFlagWriters) {
+        constexpr u64 Size = 7;
+        if (!Fits(site, Size) || At(site)[0] != 0xc6 || At(site)[1] != 0x05 ||
+            At(site)[6] != 0x01) {
+            return false;
+        }
+        s32 rel;
+        std::memcpy(&rel, At(site) + 2, sizeof(rel));
+        if (s64(site + Size) + rel != s64(LoadingFlag)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 void Install() {
@@ -132,6 +159,18 @@ void Install() {
     }
     LOG_INFO(Loader, "Game fix: save-load command buffer race {}",
              InstallFxInitClear() ? "on" : "not installed (other code there)");
+    loading_flag_found.store(FindLoadingFlag(), std::memory_order_release);
+    LOG_INFO(Loader, "Loading screen detection: {}",
+             loading_flag_found.load(std::memory_order_relaxed)
+                 ? "on"
+                 : "off (the game's code differs there)");
+}
+
+bool IsLoadingScreen() {
+    if (!loading_flag_found.load(std::memory_order_acquire)) {
+        return false;
+    }
+    return *reinterpret_cast<const volatile u8*>(At(LoadingFlag)) != 0;
 }
 
 } // namespace Core::BbGameFixes

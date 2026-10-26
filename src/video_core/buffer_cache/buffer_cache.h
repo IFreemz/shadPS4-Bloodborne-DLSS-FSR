@@ -92,6 +92,11 @@ public:
 
     void TickFrame();
 
+    /// Loading screen: frees buffer memory idle since before it. False: try again next frame.
+    bool EvictIdleBuffersAtLoadScreen() {
+        return GarbageCollectResidentMemory(true);
+    }
+
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
@@ -136,6 +141,21 @@ public:
         return resident_bytes.load(std::memory_order_relaxed);
     }
 
+    /// Buffer eviction's memory slabs: allocated, and of it free for reuse (the driver counts all
+    /// of it as used). Call on the thread running the collectors.
+    struct PoolUsage {
+        u64 allocated{};
+        u64 free{};
+    };
+    [[nodiscard]] PoolUsage GetPoolUsage() const {
+        PoolUsage usage{};
+        for (const auto& [raw, slab] : resident_slabs) {
+            usage.allocated += slab.size_blocks << block_shift;
+            usage.free += (slab.size_blocks - slab.live_blocks) << block_shift;
+        }
+        return usage;
+    }
+
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
@@ -157,7 +177,9 @@ private:
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
-    void GarbageCollectResidentMemory();
+    /// load_screen: at a loading screen, every buffer range idle for a couple of seconds goes,
+    /// whatever the VRAM use. False when it couldn't run yet (binds still pending).
+    bool GarbageCollectResidentMemory(bool load_screen = false);
 
     bool DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 

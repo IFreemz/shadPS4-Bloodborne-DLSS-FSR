@@ -1,10 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <bit>
 #include <chrono>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -14,6 +21,7 @@
 #include "common/guest_stats.h"
 #include "common/hash.h"
 #include "common/scope_exit.h"
+#include "core/bb_game_fixes.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -26,6 +34,7 @@
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
+#include "video_core/vram_owners.h"
 
 namespace VideoCore {
 
@@ -122,7 +131,8 @@ void TextureCache::ProcessDownloadImages() {
 
 bool TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     Image& image = slot_images[image_id];
-    if (False(image.flags & ImageFlagBits::GpuModified)) {
+    // (Texture quality: an image without its largest level can't give the guest's contents.)
+    if (False(image.flags & ImageFlagBits::GpuModified) || image.dropped_levels != 0) {
         return true;
     }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
@@ -180,7 +190,7 @@ bool TextureCache::SafeToWriteBack(const Image& image) {
 // has done it. False when the image can't be written back completely.
 bool TextureCache::BeginWriteBack(ImageId image_id) {
     Image& image = slot_images[image_id];
-    if (False(image.flags & ImageFlagBits::GpuModified)) {
+    if (False(image.flags & ImageFlagBits::GpuModified) || image.dropped_levels != 0) {
         return false;
     }
     const auto& info = image.info;
@@ -303,6 +313,14 @@ void TextureCache::CompleteWriteBacks() {
     if (pending_writebacks.empty()) {
         return;
     }
+    const auto start = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        Common::GuestStats::gc_writeback_done_ns.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 start)
+                .count(),
+            std::memory_order_relaxed);
+    };
     auto pending = std::move(pending_writebacks);
     pending_writebacks.clear();
     for (PendingWriteBack& writeback : pending) {
@@ -325,6 +343,9 @@ void TextureCache::CompleteWriteBacks() {
                 if (written) {
                     ++gc_written_back;
                     ++gc_evicted;
+                    Common::GuestStats::gc_writeback_written_bytes.fetch_add(
+                        writeback.size, std::memory_order_relaxed);
+                    NoteEvicted(image);
                     FreeImage(writeback.image_id);
                 } else {
                     writeback_retry[writeback.image_id.index] = gc_tick + WRITEBACK_RETRY_TICKS;
@@ -987,6 +1008,22 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
     stencil_image.AssociateDepth(depth_id, slot_images[depth_id].image_uid);
 }
 
+// Texture quality: the copies of the guest levels the image leaves out are dropped, the rest go
+// to the image's levels.
+static void DropLeftOutLevels(const Image& image, SmallVector<vk::BufferImageCopy, 14>& copies) {
+    if (image.dropped_levels == 0) {
+        return;
+    }
+    copies.erase(std::remove_if(copies.begin(), copies.end(),
+                                [&](const vk::BufferImageCopy& copy) {
+                                    return copy.imageSubresource.mipLevel < image.dropped_levels;
+                                }),
+                 copies.end());
+    for (auto& copy : copies) {
+        copy.imageSubresource.mipLevel -= image.dropped_levels;
+    }
+}
+
 bool TextureCache::PrepareRefresh(Image& image,
                                   SmallVector<vk::BufferImageCopy, 14>& image_copies) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
@@ -1044,6 +1081,7 @@ bool TextureCache::PrepareRefresh(Image& image,
             .imageExtent = {extent_width, extent_height, depth},
         });
     }
+    DropLeftOutLevels(image, image_copies);
 
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
@@ -1127,6 +1165,7 @@ bool TextureCache::DeferUpload(Image& image) {
                                 mip_height ? std::min<u32>(mip_height, height) : height, depth},
             });
         }
+        DropLeftOutLevels(image, copies);
         // UploadImage marks the image clean: it still needs its real upload.
         const auto dirty = image.flags & ImageFlagBits::Dirty;
         runtime.UploadImage(&image, zero_buffer.get(), copies);
@@ -1164,6 +1203,7 @@ void TextureCache::RefreshImage(Image& image) {
     namespace GS = Common::GuestStats;
     GS::image_uploads.fetch_add(1, std::memory_order_relaxed);
     GS::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    NoteUpload(image);
     GS::image_upload_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       std::chrono::steady_clock::now() - upload_start)
                                       .count(),
@@ -1278,6 +1318,7 @@ void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
             GSD::image_uploads.fetch_add(1, std::memory_order_relaxed);
             GSD::image_upload_bytes.fetch_add(job.image->info.guest_size,
                                               std::memory_order_relaxed);
+            NoteUpload(*job.image);
         }
     }
     GSD::image_upload_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1446,8 +1487,61 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
 }
 
 void TextureCache::GarbageCollectImages() {
+    namespace GS = Common::GuestStats;
+    // VRAM cleanup measures the memory in use: free space inside the allocator's blocks and the
+    // buffer slabs, and images freed but not yet released (the GPU may still use them), take new
+    // data without more from the driver, which counts them as used. Measured with them, every
+    // pass saw the space freed by the last ones as still full and freed more (in pressure mode
+    // most of the time on a 6 GB card with a texture pack). At the budget itself, the driver's
+    // figure decides: past it, the driver moves memory to system RAM.
+    UpdateVramLimits();
+    bool over_budget = false;
+    const auto measure = [&] {
+        const auto query_start = std::chrono::steady_clock::now();
+        const u64 driver_usage = instance.GetDeviceMemoryUsage();
+        u64 usage = driver_usage;
+        if (vram_reclaim) {
+            const auto allocator = instance.GetAllocatorUsage();
+            const u64 unused = (allocator.held - std::min(allocator.held, allocator.in_use)) +
+                               buffer_cache.GetPoolUsage().free +
+                               pending_free_bytes.load(std::memory_order_relaxed);
+            usage -= std::min(usage, unused);
+            over_budget =
+                driver_usage >= (live_limits_active ? live_limit : instance.GetTotalMemoryBudget());
+        }
+        total_used_memory = usage;
+        GS::gc_usage_query_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - query_start)
+                                            .count(),
+                                        std::memory_order_relaxed);
+    };
     if (instance.CanReportMemoryUsage()) {
-        total_used_memory = instance.GetDeviceMemoryUsage();
+        measure();
+        ReportPastBudget();
+        // Under pressure, idle upload scratch in graphics card memory goes before any texture:
+        // a streaming burst grew it (hundreds of MiB, kept for seconds after each use), and the
+        // collector was evicting textures the game used instead.
+        if (vram_reclaim && (total_used_memory >= pressure_gc_memory || over_budget)) {
+            const u64 before = total_used_memory;
+            const auto released = runtime.GetStagingPool().ReleaseIdleDeviceLocal();
+            if (released.bytes != 0) {
+                GS::scratch_releases.fetch_add(1, std::memory_order_relaxed);
+                GS::scratch_released_bytes.fetch_add(released.bytes, std::memory_order_relaxed);
+                measure();
+                const auto now = std::chrono::steady_clock::now();
+                if (now - scratch_report_time >= std::chrono::seconds(2)) {
+                    scratch_report_time = now;
+                    LOG_INFO(Render,
+                             "Under VRAM pressure: released {} MiB of idle upload scratch ({} "
+                             "blocks, {} large buffers), {} MiB still held | in use {} MiB "
+                             "before, {} MiB after (pressure {}, critical {})",
+                             released.bytes >> 20, released.ring_blocks, released.large_buffers,
+                             runtime.GetStagingPool().DeviceLocalBytes() >> 20, before >> 20,
+                             total_used_memory.load() >> 20, pressure_gc_memory >> 20,
+                             critical_gc_memory >> 20);
+                }
+            }
+        }
     }
     if (total_used_memory < trigger_gc_memory) {
         return;
@@ -1462,7 +1556,9 @@ void TextureCache::GarbageCollectImages() {
     // Loading an area (a respawn in the DLC: 430 MiB of new textures in one frame) arrives while
     // the old area's textures are still there, and VRAM went over budget (the driver then moved
     // memory out: 200 ms GPU waits). So after a burst of uploads, textures unused for 2 s go
-    // from LoadHeadroom below the pressure mark, for LoadSeconds.
+    // from LoadHeadroom below the pressure mark, for LoadSeconds. Only textures new to the cache
+    // count: re-uploads of ones the collector freed (it brought back half the uploads in a 6 GB
+    // card's session) aren't an area load, and counting them kept it freeing ahead.
     constexpr u64 LoadBurstBytes = 192_MB;
     constexpr u64 LoadSeconds = 10;
     constexpr u64 LoadIdleSeconds = 2;
@@ -1476,24 +1572,48 @@ void TextureCache::GarbageCollectImages() {
         }
         gc_second = second;
         gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
-        load_window_bytes = Common::GuestStats::image_upload_bytes.load(std::memory_order_relaxed);
+        load_window_bytes = GS::image_upload_bytes.load(std::memory_order_relaxed);
+        load_window_reupload_bytes = GS::gc_reupload_bytes.load(std::memory_order_relaxed);
     }
-    if (vram_reclaim && Common::GuestStats::image_upload_bytes.load(std::memory_order_relaxed) -
-                                load_window_bytes >=
-                            LoadBurstBytes) {
-        if (second >= load_until_second) {
-            ++gc_loads;
+    if (vram_reclaim) {
+        const u64 reuploaded =
+            GS::gc_reupload_bytes.load(std::memory_order_relaxed) - load_window_reupload_bytes;
+        const u64 uploaded =
+            GS::image_upload_bytes.load(std::memory_order_relaxed) - load_window_bytes;
+        const u64 new_bytes = uploaded - std::min(uploaded, reuploaded);
+        const bool after_cleanup = std::chrono::steady_clock::now() < free_ahead_paused_until;
+        if (new_bytes >= LoadBurstBytes && after_cleanup) {
+            if (load_burst_ignored_second != second) {
+                load_burst_ignored_second = second;
+                LOG_INFO(Render,
+                         "Upload burst not taken as an area load: {} MiB uploaded this second, "
+                         "just after a loading screen's cleanup made room",
+                         uploaded >> 20);
+            }
+        } else if (new_bytes >= LoadBurstBytes) {
+            if (second >= load_until_second) {
+                ++gc_loads;
+            }
+            load_until_second = second + LoadSeconds;
+        } else if (uploaded >= LoadBurstBytes && load_burst_ignored_second != second) {
+            load_burst_ignored_second = second;
+            LOG_INFO(Render,
+                     "Upload burst not taken as an area load: {} MiB uploaded this second, {} MiB "
+                     "of it textures the cleanup had freed",
+                     uploaded >> 20, reuploaded >> 20);
         }
-        load_until_second = second + LoadSeconds;
     }
     const bool loading = vram_reclaim && second < load_until_second;
     const auto tick_seconds_ago = [&](u64 seconds) {
         return gc_tick_at_second[(second - seconds) % gc_tick_at_second.size()];
     };
+    const auto pass_start = std::chrono::steady_clock::now();
+    const u64 writeback_done_before = GS::gc_writeback_done_ns.load(std::memory_order_relaxed);
     ++gc_runs;
     CompleteWriteBacks();
     bool pressured = false;
     bool aggresive = false;
+    int worst_mode = 0;
     u64 ticks_to_destroy = 0;
     u64 below_tick = 0;
     size_t num_deletions = 0;
@@ -1507,7 +1627,7 @@ void TextureCache::GarbageCollectImages() {
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory ||
                     (loading && total_used_memory + LoadHeadroom >= pressure_gc_memory);
-        aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
+        aggresive = allow_aggressive && (total_used_memory >= critical_gc_memory || over_budget);
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         below_tick = gc_tick - ticks_to_destroy;
@@ -1519,6 +1639,7 @@ void TextureCache::GarbageCollectImages() {
             below_tick = std::min(below_tick, tick_seconds_ago(idle));
         }
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+        worst_mode = std::max(worst_mode, aggresive ? 2 : pressured ? 1 : 0);
     };
     // An image that cannot go in this mode moves to the back of the queue (after bbport):
     // otherwise every pass scans the same oldest ones again (thousands a second).
@@ -1529,6 +1650,8 @@ void TextureCache::GarbageCollectImages() {
     // VRAM cleanup off: the original collector. On: tiled images are written back too (so they
     // can be freed at all), and only images whose write-back completed are freed.
     size_t writebacks = 0;
+    u64 free_ns = 0;
+    u64 begin_writeback_ns = 0;
     const auto clean_up = [&](Image& image) {
         if (num_deletions == 0) {
             return true;
@@ -1603,12 +1726,20 @@ void TextureCache::GarbageCollectImages() {
                 }
                 ++writebacks;
                 writeback_budget -= static_cast<double>(image.info.guest_size);
-                if (!BeginWriteBack(image_id)) {
+                const auto begin_start = std::chrono::steady_clock::now();
+                const bool began = BeginWriteBack(image_id);
+                begin_writeback_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - begin_start)
+                                          .count();
+                if (!began) {
                     writeback_budget += static_cast<double>(image.info.guest_size);
                     writeback_retry[image_id.index] = gc_tick + WRITEBACK_RETRY_TICKS;
                     ++failed_writebacks;
                     return false;
                 }
+                GS::gc_writebacks_started.fetch_add(1, std::memory_order_relaxed);
+                GS::gc_writeback_started_bytes.fetch_add(image.info.guest_size,
+                                                         std::memory_order_relaxed);
                 if (retry != writeback_retry.end()) {
                     writeback_retry.erase(retry);
                 }
@@ -1616,16 +1747,37 @@ void TextureCache::GarbageCollectImages() {
             }
         }
         ++gc_evicted;
+        NoteEvicted(image);
+        const auto free_start = std::chrono::steady_clock::now();
         FreeImage(image_id);
+        free_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - free_start)
+                       .count();
         if (vram_reclaim) {
             --num_deletions;
             ++deleted;
+        }
+        if (vram_reclaim) {
+            // Freed only until back under the mark of its mode (the least recently used first):
+            // the next pass measures again. Going on with the mode's short idle time freed
+            // textures in use, which came back a few seconds later.
+            if (num_deletions == 0) {
+                return true;
+            }
+            if (aggresive) {
+                return total_used_memory < critical_gc_memory && !over_budget;
+            }
+            if (pressured) {
+                return total_used_memory < pressure_gc_memory &&
+                       (!loading || total_used_memory + LoadHeadroom < pressure_gc_memory);
+            }
+            return false;
         }
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
                 aggresive = false;
-                return vram_reclaim && num_deletions == 0;
+                return false;
             }
             if (pressured && total_used_memory < pressure_gc_memory &&
                 (!loading || total_used_memory + LoadHeadroom < pressure_gc_memory)) {
@@ -1633,7 +1785,7 @@ void TextureCache::GarbageCollectImages() {
                 pressured = false;
             }
         }
-        return vram_reclaim && num_deletions == 0;
+        return false;
     };
     const auto collect = [&] {
         if (vram_reclaim) {
@@ -1642,13 +1794,49 @@ void TextureCache::GarbageCollectImages() {
             image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
         }
     };
+    SCOPE_EXIT {
+        constexpr u64 SlowPassNs = 2'000'000;
+        constexpr std::array<const char*, 3> mode_names{"normal", "pressure", "aggressive"};
+        const auto now = std::chrono::steady_clock::now();
+        const u64 pass_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - pass_start).count();
+        GS::gc_passes.fetch_add(1, std::memory_order_relaxed);
+        GS::gc_ns.fetch_add(pass_ns, std::memory_order_relaxed);
+        if (worst_mode == 2) {
+            GS::gc_aggressive_passes.fetch_add(1, std::memory_order_relaxed);
+        } else if (worst_mode == 1) {
+            GS::gc_pressure_passes.fetch_add(1, std::memory_order_relaxed);
+        }
+        u64 slowest = GS::gc_slowest_ns.load(std::memory_order_relaxed);
+        while (pass_ns > slowest && !GS::gc_slowest_ns.compare_exchange_weak(
+                                        slowest, pass_ns, std::memory_order_relaxed)) {
+        }
+        if (pass_ns < SlowPassNs || now - slow_pass_report_time < std::chrono::milliseconds(500)) {
+            return;
+        }
+        slow_pass_report_time = now;
+        const u64 finishing_ns =
+            GS::gc_writeback_done_ns.load(std::memory_order_relaxed) - writeback_done_before;
+        LOG_WARNING(Render,
+                    "Slow image cleanup pass: {:.1f} ms in {} mode{} | VRAM {} MiB (pressure {}, "
+                    "critical {}) | scanned {}, freed {} images in {:.1f} ms, {} write-backs "
+                    "started in {:.1f} ms ({} failed), finishing earlier write-backs {:.1f} ms, {} "
+                    "pending",
+                    pass_ns / 1e6, mode_names[worst_mode], loading ? " (loading an area)" : "",
+                    observed_usage >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20,
+                    scanned, deleted, free_ns / 1e6, writebacks, begin_writeback_ns / 1e6,
+                    failed_writebacks, finishing_ns / 1e6, pending_writebacks.size());
+    };
 
     // Try to remove anything old enough and not high priority.
     configure(false);
     collect();
 
-    if (total_used_memory >= critical_gc_memory) {
+    if (total_used_memory >= critical_gc_memory || over_budget) {
         // If we are still over the critical limit, run an aggressive GC
+        if (over_budget && total_used_memory < critical_gc_memory) {
+            GS::gc_budget_limit_passes.fetch_add(1, std::memory_order_relaxed);
+        }
         configure(true);
         collect();
     }
@@ -1658,6 +1846,633 @@ void TextureCache::GarbageCollectImages() {
                   "retained_surface={} retained_until_pressure={} writeback_rejected={}",
                   observed_usage >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20, scanned,
                   deleted, skipped_surface, skipped_pressure, failed_writebacks);
+    }
+}
+
+static constexpr size_t MaxRecentlyEvicted = 16384;
+static constexpr auto ReuploadWindow = std::chrono::seconds(60);
+
+void TextureCache::NoteEvicted(const Image& image) {
+    namespace GS = Common::GuestStats;
+    GS::gc_freed_images.fetch_add(1, std::memory_order_relaxed);
+    GS::gc_freed_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now();
+    std::scoped_lock lock{evicted_mutex};
+    if (recently_evicted.size() >= MaxRecentlyEvicted) {
+        std::erase_if(recently_evicted,
+                      [&](const auto& entry) { return now - entry.second.time > ReuploadWindow; });
+        if (recently_evicted.size() >= MaxRecentlyEvicted) {
+            recently_evicted.clear();
+        }
+    }
+    recently_evicted[image.info.guest_address] = {now, image.info.guest_size};
+}
+
+static size_t SizeClassOf(u64 bytes) {
+    return bytes < 256_KB ? 0 : bytes < 1_MB ? 1 : bytes < 4_MB ? 2 : bytes < 16_MB ? 3 : 4;
+}
+
+static constexpr std::array<const char*, 5> SizeClassNames{"under 256 KiB", "256 KiB-1 MiB",
+                                                           "1-4 MiB", "4-16 MiB", "16 MiB+"};
+
+void TextureCache::NoteUpload(const Image& image) {
+    const size_t size_class = SizeClassOf(image.info.guest_size);
+    upload_count_by_size[size_class].fetch_add(1, std::memory_order_relaxed);
+    upload_bytes_by_size[size_class].fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    std::scoped_lock lock{evicted_mutex};
+    const auto it = recently_evicted.find(image.info.guest_address);
+    if (it == recently_evicted.end()) {
+        return;
+    }
+    const auto age = std::chrono::steady_clock::now() - it->second.time;
+    recently_evicted.erase(it);
+    if (age > ReuploadWindow) {
+        return;
+    }
+    namespace GS = Common::GuestStats;
+    GS::gc_reuploads.fetch_add(1, std::memory_order_relaxed);
+    GS::gc_reupload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    GS::gc_reupload_age_ms.fetch_add(
+        std::chrono::duration_cast<std::chrono::milliseconds>(age).count(),
+        std::memory_order_relaxed);
+}
+
+TextureCache::CleanupCounters TextureCache::ReadCleanupCounters() {
+    namespace GS = Common::GuestStats;
+    const auto read = [](const std::atomic<u64>& counter) {
+        return counter.load(std::memory_order_relaxed);
+    };
+    return {
+        .passes = read(GS::gc_passes),
+        .pressure_passes = read(GS::gc_pressure_passes),
+        .aggressive_passes = read(GS::gc_aggressive_passes),
+        .ns = read(GS::gc_ns),
+        .usage_query_ns = read(GS::gc_usage_query_ns),
+        .freed_images = read(GS::gc_freed_images),
+        .freed_bytes = read(GS::gc_freed_bytes),
+        .writebacks = read(GS::gc_writebacks_started),
+        .writeback_bytes = read(GS::gc_writeback_started_bytes),
+        .writeback_done_ns = read(GS::gc_writeback_done_ns),
+        .written_bytes = read(GS::gc_writeback_written_bytes),
+        .reuploads = read(GS::gc_reuploads),
+        .reupload_bytes = read(GS::gc_reupload_bytes),
+        .reupload_age_ms = read(GS::gc_reupload_age_ms),
+        .buffer_evictions = read(GS::buffer_evictions),
+        .buffer_eviction_bytes = read(GS::buffer_eviction_bytes),
+        .buffer_eviction_ns = read(GS::buffer_eviction_ns),
+        .buffer_eviction_unbind_ns = read(GS::buffer_eviction_unbind_ns),
+        .uploaded_bytes = read(GS::image_upload_bytes),
+        .budget_limit_passes = read(GS::gc_budget_limit_passes),
+        .scratch_releases = read(GS::scratch_releases),
+        .scratch_released_bytes = read(GS::scratch_released_bytes),
+        .scratch_allocations = read(GS::scratch_allocations),
+        .scratch_allocation_bytes = read(GS::scratch_allocation_bytes),
+    };
+}
+
+void TextureCache::LogCleanupReport() {
+    const auto now = std::chrono::steady_clock::now();
+    if (cleanup_report_time == std::chrono::steady_clock::time_point{}) {
+        cleanup_report_time = now;
+        cleanup_last = ReadCleanupCounters();
+        cleanup_host_usage = instance.GetMemoryHeapReport().host_usage;
+        return;
+    }
+    if (now - cleanup_report_time < std::chrono::seconds(1)) {
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - cleanup_report_time).count();
+    cleanup_report_time = now;
+    const CleanupCounters current = ReadCleanupCounters();
+    const CleanupCounters last = std::exchange(cleanup_last, current);
+    const u64 slowest_ns = Common::GuestStats::gc_slowest_ns.exchange(0, std::memory_order_relaxed);
+    const u64 pressure = current.pressure_passes - last.pressure_passes;
+    const u64 aggressive = current.aggressive_passes - last.aggressive_passes;
+    const u64 freed = current.freed_images - last.freed_images;
+    const u64 started = current.writebacks - last.writebacks;
+    const u64 reuploads = current.reuploads - last.reuploads;
+    const u64 evictions = current.buffer_evictions - last.buffer_evictions;
+    const u64 scratch = current.scratch_releases - last.scratch_releases;
+    constexpr u64 QuietFreedImages = 16;
+    if (pressure + aggressive + started + reuploads + evictions + scratch == 0 &&
+        freed < QuietFreedImages) {
+        return;
+    }
+    const auto heaps = instance.GetMemoryHeapReport();
+    const auto mib = [](u64 bytes) { return bytes >> 20; };
+    const auto ms = [](u64 ns) { return ns / 1e6; };
+    const double reupload_seconds =
+        reuploads != 0 ? (current.reupload_age_ms - last.reupload_age_ms) / 1000.0 / reuploads
+                       : 0.0;
+    const std::string text = fmt::format(
+        "VRAM cleanup, last {:.1f} s: image collector {} passes ({} under pressure, {} "
+        "aggressive, {} of those only for being at the budget) taking {:.1f} ms, slowest {:.1f} "
+        "ms, reading memory use {:.1f} ms | freed {} "
+        "images ({} MiB), {} write-backs started ({} MiB), {} MiB copied to guest memory in {:.1f} "
+        "ms, {} pending | uploaded again at an address freed in the last 60 s: {} images ({} "
+        "MiB, {:.1f} s after being freed on average) of {} MiB uploaded | buffer evictions {} ({} "
+        "MiB, {:.1f} ms, unbind {:.1f} ms) | upload scratch in VRAM: released {} MiB ({} times), "
+        "allocated {} MiB ({}), {} MiB held | VRAM {} of {} MiB, {} MiB of it in use (pressure "
+        "{}, critical {}), system memory {} MiB ({:+} MiB)",
+        seconds, current.passes - last.passes, pressure, aggressive,
+        current.budget_limit_passes - last.budget_limit_passes, ms(current.ns - last.ns),
+        ms(slowest_ns), ms(current.usage_query_ns - last.usage_query_ns), freed,
+        mib(current.freed_bytes - last.freed_bytes), started,
+        mib(current.writeback_bytes - last.writeback_bytes),
+        mib(current.written_bytes - last.written_bytes),
+        ms(current.writeback_done_ns - last.writeback_done_ns), pending_writebacks.size(),
+        reuploads, mib(current.reupload_bytes - last.reupload_bytes), reupload_seconds,
+        mib(current.uploaded_bytes - last.uploaded_bytes), evictions,
+        mib(current.buffer_eviction_bytes - last.buffer_eviction_bytes),
+        ms(current.buffer_eviction_ns - last.buffer_eviction_ns),
+        ms(current.buffer_eviction_unbind_ns - last.buffer_eviction_unbind_ns),
+        mib(current.scratch_released_bytes - last.scratch_released_bytes),
+        current.scratch_releases - last.scratch_releases,
+        mib(current.scratch_allocation_bytes - last.scratch_allocation_bytes),
+        current.scratch_allocations - last.scratch_allocations,
+        mib(runtime.GetStagingPool().DeviceLocalBytes()), mib(heaps.local_usage),
+        mib(heaps.local_budget), mib(total_used_memory.load()), mib(pressure_gc_memory),
+        mib(critical_gc_memory), mib(heaps.host_usage),
+        (static_cast<s64>(heaps.host_usage) - static_cast<s64>(cleanup_host_usage)) / (1 << 20));
+    const bool urgent = aggressive != 0 || slowest_ns >= 4'000'000 || reuploads >= 8;
+    if (urgent) {
+        LOG_WARNING(Render, "{}", text);
+    } else {
+        LOG_INFO(Render, "{}", text);
+    }
+}
+
+// "Go past the budget": whether Windows makes room (the budget rises) or moves the emulator's
+// own memory to system RAM (system memory rises), every 5 s while past the budget.
+void TextureCache::ReportPastBudget() {
+    if (!live_limits_active || !EmulatorSettings.IsBbVramPastBudget()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - past_budget_report_time < std::chrono::seconds(5)) {
+        return;
+    }
+    const auto heaps = instance.GetMemoryHeapReport();
+    if (past_budget_first_budget == 0) {
+        past_budget_first_budget = heaps.local_budget;
+        past_budget_first_host = heaps.host_usage;
+    }
+    if (heaps.local_usage <= heaps.local_budget) {
+        return;
+    }
+    past_budget_report_time = now;
+    const auto mib = [](u64 bytes) { return static_cast<s64>(bytes >> 20); };
+    LOG_INFO(Render,
+             "Past the driver's VRAM budget by {} MiB: {} of {} MiB (budget {:+} MiB since the "
+             "start, Windows making room), system memory {} MiB ({:+} MiB since the start, the "
+             "emulator's memory moved out) | limit {} MiB, in use {} MiB",
+             mib(heaps.local_usage) - mib(heaps.local_budget), mib(heaps.local_usage),
+             mib(heaps.local_budget), mib(heaps.local_budget) - mib(past_budget_first_budget),
+             mib(heaps.host_usage), mib(heaps.host_usage) - mib(past_budget_first_host),
+             mib(live_limit), mib(total_used_memory.load()));
+}
+
+void TextureCache::UpdateVramLimits() {
+    if (!vram_reclaim || !instance.CanReportMemoryUsage()) {
+        return;
+    }
+    if (!standard_limits_saved) {
+        standard_limits_saved = true;
+        standard_trigger = trigger_gc_memory;
+        standard_pressure = pressure_gc_memory;
+        standard_critical = critical_gc_memory;
+    }
+    const auto mib = [](u64 bytes) { return bytes >> 20; };
+    if (!more_vram_enabled) {
+        if (live_limits_active) {
+            live_limits_active = false;
+            trigger_gc_memory = standard_trigger;
+            pressure_gc_memory = standard_pressure;
+            critical_gc_memory = standard_critical;
+            LOG_INFO(Render,
+                     "VRAM limits: the usual marks again (pressure {} MiB, critical {} MiB)",
+                     mib(pressure_gc_memory), mib(critical_gc_memory));
+        }
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (live_limits_active && now - limits_time < std::chrono::seconds(1)) {
+        return;
+    }
+    limits_time = now;
+    const auto limits = instance.GetLiveVramLimits();
+    trigger_gc_memory = 0;
+    pressure_gc_memory = limits.pressure;
+    critical_gc_memory = limits.critical;
+    live_limit = limits.limit;
+    const u64 change =
+        live_limit > logged_limit ? live_limit - logged_limit : logged_limit - live_limit;
+    if (!live_limits_active || change >= 64_MB) {
+        logged_limit = live_limit;
+        LOG_INFO(Render,
+                 "VRAM limits (Use more VRAM{}): driver budget {} MiB, so the limit is {} MiB, "
+                 "pressure {} MiB, critical {} MiB (usual marks: pressure {}, critical {})",
+                 EmulatorSettings.IsBbVramPastBudget() ? ", past the budget" : "",
+                 mib(limits.budget), mib(limits.limit), mib(limits.pressure), mib(limits.critical),
+                 mib(standard_pressure), mib(standard_critical));
+    }
+    live_limits_active = true;
+}
+
+// Cleanup at loading screens. The game's flag goes up as the transition starts, while the fade
+// still draws the area; a second later only the loading screen draws. Images not used since then
+// are the area's: the clean ones (copies of guest memory) are freed, a few hundred a frame, and
+// so are buffer ranges idle since. GPU-written images stay (their data isn't in guest memory).
+static constexpr auto LoadScreenMarkDelay = std::chrono::seconds(1);
+static constexpr auto LoadScreenCleanupDelay = std::chrono::seconds(2);
+static constexpr u64 LoadScreenImagesPerPass = 256;
+static constexpr auto LoadScreenFreeAheadPause = std::chrono::seconds(15);
+
+void TextureCache::LoadScreenCleanup() {
+    const bool loading = Core::BbGameFixes::IsLoadingScreen();
+    const auto now = std::chrono::steady_clock::now();
+    const auto mib = [](u64 bytes) { return bytes >> 20; };
+    LoadScreen& screen = load_screen;
+    const bool enabled = vram_reclaim && load_screen_cleanup_enabled;
+    if (loading && !screen.active) {
+        screen = LoadScreen{
+            .active = true,
+            .start = now,
+            .start_vram = instance.GetMemoryHeapReport().local_usage,
+        };
+        Common::Crumbs::Add("loading screen: started (VRAM MiB)", mib(screen.start_vram));
+        LOG_INFO(Render, "Loading screen started | VRAM {} MiB{}", mib(screen.start_vram),
+                 !vram_reclaim                  ? " (VRAM cleanup is off: nothing freed)"
+                 : !load_screen_cleanup_enabled ? " (cleanup at loading screens is off)"
+                                                : "");
+        return;
+    }
+    if (!loading && screen.active) {
+        screen.active = false;
+        Common::Crumbs::Add("loading screen: ended");
+        if (screen.reported) {
+            free_ahead_paused_until = now + LoadScreenFreeAheadPause;
+            load_until_second = 0;
+        }
+        LOG_INFO(Render, "Loading screen ended after {:.1f} s | VRAM {} MiB, {} MiB at its start{}",
+                 std::chrono::duration<double>(now - screen.start).count(),
+                 mib(instance.GetMemoryHeapReport().local_usage), mib(screen.start_vram),
+                 enabled && !screen.reported ? " (too short for the cleanup to finish)" : "");
+        return;
+    }
+    if (!screen.active || !enabled || screen.reported) {
+        return;
+    }
+    if (!screen.marked) {
+        if (now - screen.start >= LoadScreenMarkDelay) {
+            screen.marked = true;
+            screen.mark_tick = gc_tick;
+        }
+        return;
+    }
+    if (now - screen.start < LoadScreenCleanupDelay) {
+        return;
+    }
+    if (!screen.images_done) {
+        Common::Crumbs::Add("loading screen: freeing textures (freed so far)", screen.freed);
+        const auto pass_start = std::chrono::steady_clock::now();
+        u64 freed_now = 0;
+        bool more = false;
+        screen.kept_written = 0;
+        screen.kept_written_bytes = 0;
+        image_lru_cache.ForEachItemBelow(screen.mark_tick, [&](Image& image) {
+            if (freed_now >= LoadScreenImagesPerPass) {
+                more = true;
+                return true;
+            }
+            if (image.SafeToDownload()) {
+                ++screen.kept_written;
+                screen.kept_written_bytes += image.info.guest_size;
+                return false;
+            }
+            ++freed_now;
+            ++screen.freed;
+            screen.freed_bytes += image.info.guest_size;
+            FreeImage(slot_images.GetSlotId(image));
+            return false;
+        });
+        screen.free_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now() - pass_start)
+                              .count();
+        ++screen.passes;
+        screen.images_done = !more;
+        if (!screen.images_done) {
+            return;
+        }
+    }
+    if (!screen.buffers_done) {
+        Common::Crumbs::Add("loading screen: freeing idle buffers");
+        screen.buffers_done = buffer_cache.EvictIdleBuffersAtLoadScreen();
+        if (!screen.buffers_done) {
+            return;
+        }
+        const auto released = runtime.GetStagingPool().ReleaseIdleDeviceLocal();
+        screen.scratch_bytes = released.bytes;
+        if (released.bytes != 0) {
+            namespace GS = Common::GuestStats;
+            GS::scratch_releases.fetch_add(1, std::memory_order_relaxed);
+            GS::scratch_released_bytes.fetch_add(released.bytes, std::memory_order_relaxed);
+        }
+    }
+    screen.reported = true;
+    LOG_INFO(Render,
+             "Loading screen cleanup: freed {} textures ({} MiB) in {:.1f} ms over {} frames, kept "
+             "{} GPU-written ones ({} MiB), released {} MiB of idle upload scratch | VRAM {} MiB "
+             "now, {} MiB when the loading screen started",
+             screen.freed, mib(screen.freed_bytes), screen.free_ns / 1e6, screen.passes,
+             screen.kept_written, mib(screen.kept_written_bytes), mib(screen.scratch_bytes),
+             mib(instance.GetMemoryHeapReport().local_usage), mib(screen.start_vram));
+}
+
+// Every 10 s with VRAM cleanup on: where VRAM goes, how much of the cached textures the game used
+// lately (if that is more than fits, no collector avoids uploading some again), and textures by
+// size.
+void TextureCache::LogVramBreakdown() {
+    if (!vram_reclaim || !instance.CanReportMemoryUsage()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const u64 second = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
+    if (second != breakdown_second) {
+        if (breakdown_second == 0) {
+            breakdown_tick_at_second.fill(gc_tick);
+        }
+        breakdown_second = second;
+        breakdown_tick_at_second[second % breakdown_tick_at_second.size()] = gc_tick;
+    }
+    if (breakdown_time == std::chrono::steady_clock::time_point{}) {
+        breakdown_time = now;
+        return;
+    }
+    if (now - breakdown_time < std::chrono::seconds(10)) {
+        return;
+    }
+    breakdown_time = now;
+    const auto tick_seconds_ago = [&](u64 seconds) {
+        return breakdown_tick_at_second[(second - seconds) % breakdown_tick_at_second.size()];
+    };
+    const u64 tick_5 = tick_seconds_ago(5);
+    const u64 tick_30 = tick_seconds_ago(30);
+    const u64 tick_60 = tick_seconds_ago(60);
+
+    u64 clean_bytes = 0, written_bytes = 0, image_count = 0;
+    u64 used_5 = 0, used_30 = 0, used_60 = 0;
+    std::array<u64, SizeClasses> cached_count{}, cached_bytes{};
+    image_lru_cache.ForEachItemBelow(gc_tick, [&](Image& image) {
+        u64 bytes = 0;
+        for (const auto& backing : image.backing_images) {
+            bytes += backing.image.size_bytes;
+        }
+        ++image_count;
+        (image.SafeToDownload() ? written_bytes : clean_bytes) += bytes;
+        const u64 last_use =
+            std::atomic_ref<u64>(image.last_use_gc_tick).load(std::memory_order_relaxed);
+        used_5 += last_use >= tick_5 ? bytes : 0;
+        used_30 += last_use >= tick_30 ? bytes : 0;
+        used_60 += last_use >= tick_60 ? bytes : 0;
+        const size_t size_class = SizeClassOf(bytes);
+        ++cached_count[size_class];
+        cached_bytes[size_class] += bytes;
+    });
+
+    const auto mib = [](u64 bytes) { return bytes >> 20; };
+    const auto heaps = instance.GetMemoryHeapReport();
+    const auto allocator = instance.GetAllocatorUsage();
+    const auto pool = buffer_cache.GetPoolUsage();
+    const u64 images = clean_bytes + written_bytes;
+    const u64 other_allocator = allocator.in_use - std::min(allocator.in_use, images);
+    const u64 known = allocator.held + pool.allocated;
+    const s64 rest = static_cast<s64>(heaps.local_usage) - static_cast<s64>(known);
+    LOG_INFO(Render,
+             "VRAM breakdown: {} of {} MiB (driver), {} MiB in system memory | textures {} MiB "
+             "in {} (copies of game memory {} MiB, GPU-written {} MiB), other emulator memory {} "
+             "MiB (upload scratch {} MiB), free inside the allocator {} MiB | guest buffers {} MiB "
+             "in {} MiB of slabs "
+             "({} MiB free inside) | driver and the rest {} MiB | freed, released once the GPU "
+             "is done {} MiB | in use {} MiB (pressure {}, critical {})",
+             mib(heaps.local_usage), mib(heaps.local_budget), mib(heaps.host_usage), mib(images),
+             image_count, mib(clean_bytes), mib(written_bytes), mib(other_allocator),
+             mib(runtime.GetStagingPool().DeviceLocalBytes()),
+             mib(allocator.held - std::min(allocator.held, allocator.in_use)),
+             mib(buffer_cache.ResidentBytes()), mib(pool.allocated), mib(pool.free),
+             rest / (1 << 20), mib(pending_free_bytes.load(std::memory_order_relaxed)),
+             mib(total_used_memory.load()), mib(pressure_gc_memory), mib(critical_gc_memory));
+
+    std::string cached;
+    std::string uploaded;
+    for (size_t i = 0; i < SizeClasses; ++i) {
+        const u64 count = upload_count_by_size[i].exchange(0, std::memory_order_relaxed);
+        const u64 bytes = upload_bytes_by_size[i].exchange(0, std::memory_order_relaxed);
+        fmt::format_to(std::back_inserter(cached), "{}{} {} ({} MiB)", i ? ", " : "",
+                       SizeClassNames[i], cached_count[i], mib(cached_bytes[i]));
+        fmt::format_to(std::back_inserter(uploaded), "{}{} {} ({} MiB)", i ? ", " : "",
+                       SizeClassNames[i], count, mib(bytes));
+    }
+    LOG_INFO(Render,
+             "VRAM textures: used in the last 5 s {} MiB, 30 s {} MiB, 60 s {} MiB, of {} MiB "
+             "cached | cached by size: {} | uploaded in the last 10 s by size: {}",
+             mib(used_5), mib(used_30), mib(used_60), mib(images), cached, uploaded);
+
+    u64 tracked = 0;
+    std::string by_owner;
+    for (const auto& owner : VramOwners::Snapshot()) {
+        tracked += owner.bytes;
+        if (owner.bytes >= 1_MB) {
+            fmt::format_to(std::back_inserter(by_owner), "{}{} {} MiB ({})",
+                           by_owner.empty() ? "" : ", ", owner.name, mib(owner.bytes), owner.count);
+        }
+    }
+    LOG_INFO(Render,
+             "VRAM by owner: {} MiB of the allocator's {} MiB in use, the rest not tracked {} "
+             "MiB | {}",
+             mib(tracked), mib(allocator.in_use),
+             mib(allocator.in_use - std::min(allocator.in_use, tracked)), by_owner);
+    if (quality_report_count++ % 3 == 0) {
+        LogTextureQualityEstimate(tick_30);
+    }
+}
+
+// Estimate only (nothing changes): what a texture quality setting would save. Each step leaves
+// out a texture's sharpest level, so it is stored at half the width and height: "High" for
+// textures larger than 2048, "Medium" also for those larger than 1024. Only textures the game
+// samples qualify: not drawn into, written by the GPU, used for storage or shown, with a smaller
+// level to take the top one's place. Whether a shader reads one by texel position or asks its
+// size (those would need the full one) is not known here.
+static bool IsQualityCandidate(const Image& image) {
+    const auto& info = image.info;
+    if (image.usage.render_target || image.usage.depth_target || image.usage.storage ||
+        image.usage.vo_surface || info.props.is_depth || image.SafeToDownload()) {
+        return false;
+    }
+    return info.resources.levels >= 2 && info.guest_size != 0 &&
+           std::max(info.size.width, info.size.height) > 1024;
+}
+
+static std::string DescribeExactTexelReads(u8 reads) {
+    std::string text;
+    const auto add = [&](u8 bit, std::string_view name) {
+        if (reads & bit) {
+            fmt::format_to(std::back_inserter(text), "{}{}", text.empty() ? "" : ", ", name);
+        }
+    };
+    add(Shader::ExactTexelFetch, "texel fetch");
+    add(Shader::ExactTexelSizeQuery, "size query");
+    add(Shader::ExactTexelLodQuery, "LOD query");
+    add(Shader::ExactTexelUnnormalized, "pixel coordinates");
+    return text;
+}
+
+void TextureCache::NoteExactTexelReads(ImageId image_id, u8 reads, u64 pgm_hash) {
+    Image& image = slot_images[image_id];
+    std::atomic_ref<u8> image_reads{image.exact_texel_reads};
+    const u8 before = image_reads.fetch_or(reads, std::memory_order_relaxed);
+    if ((before | reads) == before || !IsQualityCandidate(image)) {
+        return;
+    }
+    if (image.dropped_levels != 0) {
+        KeepFullQuality(image.info.guest_address);
+        std::scoped_lock lock{restore_mutex};
+        restore_full_quality.emplace_back(image_id, image.image_uid);
+    }
+    LOG_INFO(Render,
+             "Texture quality: {}x{} {} ({} levels) at {:#x} needs its exact size, read by "
+             "shader {:#x} with {}",
+             image.info.size.width, image.info.size.height, vk::to_string(image.info.pixel_format),
+             image.info.resources.levels, image.info.guest_address, pgm_hash,
+             DescribeExactTexelReads(reads & ~before));
+}
+
+void TextureCache::RestoreFullQuality() {
+    std::vector<std::pair<ImageId, u64>> pending;
+    {
+        std::scoped_lock lock{restore_mutex};
+        pending.swap(restore_full_quality);
+    }
+    for (const auto& [image_id, uid] : pending) {
+        if (!slot_images.IsAllocated(image_id)) {
+            continue;
+        }
+        const Image& image = slot_images[image_id];
+        if (image.image_uid != uid || False(image.flags & ImageFlagBits::Registered)) {
+            continue;
+        }
+        LOG_INFO(Render, "Texture quality: {}x{} at {:#x} loaded again at full size",
+                 image.info.size.width, image.info.size.height, image.info.guest_address);
+        FreeImage(image_id);
+    }
+}
+
+void TextureCache::LogTextureQualityEstimate(u64 tick_30) {
+    struct Group {
+        u64 count{};
+        u64 bytes{};
+        u64 saved{};
+        u64 recent_saved{};
+    };
+    Group high, medium, medium_safe, medium_exact, reduced;
+    std::array<u64, 4> exact_saved_by_read{};
+    u64 total = 0, recent_total = 0;
+    u64 targets = 0, gpu_written = 0, single_level = 0, small = 0;
+    std::map<std::string, Group> formats;
+    image_lru_cache.ForEachItemBelow(gc_tick, [&](Image& image) {
+        u64 bytes = 0;
+        for (const auto& backing : image.backing_images) {
+            bytes += backing.image.size_bytes;
+        }
+        total += bytes;
+        const u64 last_use =
+            std::atomic_ref<u64>(image.last_use_gc_tick).load(std::memory_order_relaxed);
+        const bool recent = last_use >= tick_30;
+        recent_total += recent ? bytes : 0;
+        const auto& info = image.info;
+        if (image.dropped_levels != 0) {
+            const u64 kept_guest = info.guest_size - info.mips_layout[0].size;
+            const u64 saved = kept_guest ? bytes * info.mips_layout[0].size / kept_guest : 0;
+            ++reduced.count;
+            reduced.bytes += bytes;
+            reduced.saved += saved;
+            reduced.recent_saved += recent ? saved : 0;
+            return;
+        }
+        if (image.usage.render_target || image.usage.depth_target || image.usage.storage ||
+            image.usage.vo_surface || info.props.is_depth) {
+            targets += bytes;
+            return;
+        }
+        if (image.SafeToDownload()) {
+            gpu_written += bytes;
+            return;
+        }
+        if (info.resources.levels < 2 || info.guest_size == 0) {
+            single_level += bytes;
+            return;
+        }
+        const u32 largest = std::max(info.size.width, info.size.height);
+        if (largest <= 1024) {
+            small += bytes;
+            return;
+        }
+        const u64 saved = bytes * info.mips_layout[0].size / info.guest_size;
+        const auto add = [&](Group& group) {
+            ++group.count;
+            group.bytes += bytes;
+            group.saved += saved;
+            group.recent_saved += recent ? saved : 0;
+        };
+        add(medium);
+        const u8 reads =
+            std::atomic_ref<u8>(image.exact_texel_reads).load(std::memory_order_relaxed);
+        add(reads ? medium_exact : medium_safe);
+        for (u32 bit = 0; bit < exact_saved_by_read.size(); ++bit) {
+            exact_saved_by_read[bit] += (reads >> bit) & 1 ? saved : 0;
+        }
+        if (largest > 2048) {
+            add(high);
+        }
+        add(formats[fmt::format("{}x{} {}", info.size.width, info.size.height,
+                                vk::to_string(info.pixel_format))]);
+    });
+    std::vector<std::pair<std::string, Group>> sorted(formats.begin(), formats.end());
+    std::ranges::sort(sorted, std::greater{}, [](const auto& entry) { return entry.second.bytes; });
+    const auto mib = [](u64 bytes) { return bytes >> 20; };
+    std::string top;
+    for (size_t i = 0; i < std::min<size_t>(sorted.size(), 8); ++i) {
+        const auto& [name, group] = sorted[i];
+        fmt::format_to(std::back_inserter(top), "{}{} x{} ({} MiB)", i ? ", " : "", name,
+                       group.count, mib(group.bytes));
+    }
+    LOG_INFO(Render,
+             "Texture quality estimate (nothing changed): High would halve {} textures ({} MiB) "
+             "and save {} MiB, Medium {} textures ({} MiB) saving {} MiB, of {} MiB cached | of "
+             "the {} MiB used in the last 30 s, High saves {} MiB, Medium {} MiB | left out: "
+             "render targets, depth and storage {} MiB, GPU-written {} MiB, one level only {} "
+             "MiB, 1024 or smaller {} MiB | largest candidates: {}",
+             high.count, mib(high.bytes), mib(high.saved), medium.count, mib(medium.bytes),
+             mib(medium.saved), mib(total), mib(recent_total), mib(high.recent_saved),
+             mib(medium.recent_saved), mib(targets), mib(gpu_written), mib(single_level),
+             mib(small), top);
+    LOG_INFO(Render,
+             "Texture quality estimate, shader reads: of Medium's {} MiB saving, {} MiB from {} "
+             "textures only sampled (safe to halve), {} MiB from {} textures some shader needs at "
+             "their exact size: texel fetch {} MiB, size query {} MiB, LOD query {} MiB, pixel "
+             "coordinates {} MiB (a texture can count under several)",
+             mib(medium.saved), mib(medium_safe.saved), medium_safe.count, mib(medium_exact.saved),
+             medium_exact.count, mib(exact_saved_by_read[0]), mib(exact_saved_by_read[1]),
+             mib(exact_saved_by_read[2]), mib(exact_saved_by_read[3]));
+    if (const int quality = EmulatorSettings.GetBbTextureQuality(); quality > 0 || reduced.count) {
+        const char* quality_name = quality >= 2 ? "Medium" : quality == 1 ? "High" : "Full";
+        LOG_INFO(Render,
+                 "Texture quality {}: {} textures stored without their largest level ({} MiB), "
+                 "saving about {} MiB ({} MiB of it in textures used in the last 30 s); the "
+                 "estimate above counts only the textures still at full size",
+                 quality_name, reduced.count, mib(reduced.bytes), mib(reduced.saved),
+                 mib(reduced.recent_saved));
     }
 }
 
@@ -1754,12 +2569,18 @@ void TextureCache::GarbageCollectSamplers() {
 
 void TextureCache::RunGarbageCollector() {
     spread_loads_enabled = EmulatorSettings.IsBbSpreadLoads();
+    load_screen_cleanup_enabled = EmulatorSettings.IsBbLoadScreenCleanup();
+    more_vram_enabled = EmulatorSettings.IsBbMoreVram();
     SCOPE_EXIT {
         // Atomic: UpdateImage's fast path reads it without the lock.
         std::atomic_ref<u64>(gc_tick).store(gc_tick + 1, std::memory_order_release);
     };
 
+    RestoreFullQuality();
+    LoadScreenCleanup();
     GarbageCollectImages();
+    LogCleanupReport();
+    LogVramBreakdown();
     GarbageCollectSamplers();
 }
 
@@ -1790,7 +2611,12 @@ void TextureCache::DeleteImage(ImageId image_id) {
     }
 
     // Reclaim image and any image views it references.
-    scheduler.DeferOperation([this, image_id] {
+    u64 image_bytes = 0;
+    for (const auto& backing : image.backing_images) {
+        image_bytes += backing.image.size_bytes;
+    }
+    pending_free_bytes.fetch_add(image_bytes, std::memory_order_relaxed);
+    scheduler.DeferOperation([this, image_id, image_bytes] {
         Image& image = slot_images[image_id];
         for (auto& backing : image.backing_images) {
             for (const ImageViewId image_view_id : backing.image_view_ids) {
@@ -1798,6 +2624,7 @@ void TextureCache::DeleteImage(ImageId image_id) {
             }
         }
         slot_images.Erase(image_id);
+        pending_free_bytes.fetch_sub(image_bytes, std::memory_order_relaxed);
     });
 }
 

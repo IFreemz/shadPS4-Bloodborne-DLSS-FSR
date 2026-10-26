@@ -42,6 +42,21 @@ constexpr size_t MIN_UPLOAD_BLOCKS_SMALL = 24;
 constexpr size_t MIN_UPLOAD_BLOCKS_LARGE = 64;
 constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
 constexpr u64 BLOCK_SIZE = 16_MB;
+// Graphics card memory released under VRAM pressure once unused this long (~3 s): taking it back
+// costs an allocation, keeping it cost textures the game was using. Streaming keeps ~300 MiB of
+// it busy, so released below a floor it was allocated again within seconds (3.5 of 3.9 GiB
+// released in a session): the floor stays.
+constexpr u64 RELEASE_IDLE_FRAMES = 180;
+constexpr size_t RELEASE_FLOOR_BLOCKS = 12;
+
+void CountDeviceLocalAllocation(MemoryType type, u64 bytes) {
+    if (type != MemoryType::DeviceLocal) {
+        return;
+    }
+    namespace GS = Common::GuestStats;
+    GS::scratch_allocations.fetch_add(1, std::memory_order_relaxed);
+    GS::scratch_allocation_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
 
 u64 RoundAllocationSize(u64 size) {
     const u64 step = std::max(std::bit_floor(size) / 4, LARGE_MIN_GRANULARITY);
@@ -111,6 +126,7 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
                 .last_used_frame = frame,
             });
             CountAllocation(BLOCK_SIZE, start);
+            CountDeviceLocalAllocation(type, BLOCK_SIZE);
             ring.current = ring.blocks.size() - 1;
             best_offset = *best->buffer->Reserve(size, alignment, false);
         }
@@ -158,6 +174,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
             .held = false,
         });
         CountAllocation(RoundAllocationSize(size), start);
+        CountDeviceLocalAllocation(type, RoundAllocationSize(size));
     }
 
     best->tick = scheduler.CurrentTick();
@@ -217,6 +234,56 @@ void StagingBufferPool::TickFrame() {
         TrimLarge(cache);
     }
     PublishStats();
+}
+
+StagingBufferPool::ReleasedMemory StagingBufferPool::ReleaseIdleDeviceLocal(bool emergency) {
+    ReleasedMemory released{};
+    const size_t floor_blocks = emergency ? 0 : RELEASE_FLOOR_BLOCKS;
+    const u64 idle_frames = emergency ? 0 : RELEASE_IDLE_FRAMES;
+    Ring& ring = rings[u32(MemoryType::DeviceLocal)];
+    auto& blocks = ring.blocks;
+    for (size_t i = blocks.size(); i-- > 0;) {
+        if (blocks.size() <= floor_blocks) {
+            break;
+        }
+        const Block& block = blocks[i];
+        if (frame - block.last_used_frame < idle_frames ||
+            !scheduler.IsFree(block.buffer->LastTick())) {
+            continue;
+        }
+        released.bytes += block.buffer->SizeBytes();
+        ++released.ring_blocks;
+        blocks.erase(blocks.begin() + i);
+        if (i < ring.current) {
+            --ring.current;
+        } else if (i == ring.current) {
+            ring.current = 0;
+        }
+    }
+    if (ring.current >= blocks.size()) {
+        ring.current = 0;
+    }
+    std::erase_if(large_caches[u32(MemoryType::DeviceLocal)], [&](const LargeBuffer& entry) {
+        if (entry.held || frame - entry.last_used_frame < idle_frames ||
+            !scheduler.IsFree(entry.tick)) {
+            return false;
+        }
+        released.bytes += entry.buffer->SizeBytes();
+        ++released.large_buffers;
+        return true;
+    });
+    return released;
+}
+
+u64 StagingBufferPool::DeviceLocalBytes() const {
+    u64 bytes = 0;
+    for (const Block& block : rings[u32(MemoryType::DeviceLocal)].blocks) {
+        bytes += block.buffer->SizeBytes();
+    }
+    for (const LargeBuffer& entry : large_caches[u32(MemoryType::DeviceLocal)]) {
+        bytes += entry.buffer->SizeBytes();
+    }
+    return bytes;
 }
 
 void StagingBufferPool::TrimRing(Ring& ring, size_t min_blocks) {

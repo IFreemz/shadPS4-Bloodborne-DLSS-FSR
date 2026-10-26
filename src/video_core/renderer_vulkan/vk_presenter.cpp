@@ -34,6 +34,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_retro_hdr.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/vram_owners.h"
 
 #include <algorithm>
 #include <array>
@@ -59,6 +60,20 @@
 #include "common/frame_pacing.h"
 
 namespace Vulkan {
+
+namespace {
+
+u32 FrameImagesOwner() {
+    static const u32 owner = VideoCore::VramOwners::Register("presentation frames");
+    return owner;
+}
+
+u32 HudlessImagesOwner() {
+    static const u32 owner = VideoCore::VramOwners::Register("HUD-less frame copies");
+    return owner;
+}
+
+} // namespace
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
@@ -557,6 +572,8 @@ Presenter::~Presenter() {
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
         DestroyHudless(frame);
+        VideoCore::VramOwners::Track(FrameImagesOwner(), instance.GetAllocator(), frame.allocation,
+                                     false);
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
@@ -581,8 +598,11 @@ void Presenter::DestroyHudless(Frame& frame) {
         ImGui::Vulkan::RemoveTexture(frame.hudless_texture);
     if (frame.hudless_view)
         instance.GetDevice().destroyImageView(frame.hudless_view);
-    if (frame.hudless_image)
+    if (frame.hudless_image) {
+        VideoCore::VramOwners::Track(HudlessImagesOwner(), instance.GetAllocator(),
+                                     frame.hudless_allocation, false);
         vmaDestroyImage(instance.GetAllocator(), frame.hudless_image, frame.hudless_allocation);
+    }
     frame.hudless_texture = nullptr;
     frame.hudless_view = vk::ImageView{};
     frame.hudless_image = vk::Image{};
@@ -599,6 +619,8 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
         device.destroyImageView(frame->image_view);
     }
     if (frame->image) {
+        VideoCore::VramOwners::Track(FrameImagesOwner(), instance.GetAllocator(), frame->allocation,
+                                     false);
         vmaDestroyImage(instance.GetAllocator(), frame->image, frame->allocation);
     }
 
@@ -635,6 +657,8 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
         UNREACHABLE();
     }
     frame->image = vk::Image{unsafe_image};
+    VideoCore::VramOwners::Track(FrameImagesOwner(), instance.GetAllocator(), frame->allocation,
+                                 true);
     SetObjectName(device, frame->image, "Frame image #{}", frame->id);
 
     const vk::ImageViewCreateInfo view_info = {
@@ -1080,6 +1104,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 frame->has_hudless = false;
             } else {
                 frame->hudless_image = vk::Image{hudless_image};
+                VideoCore::VramOwners::Track(HudlessImagesOwner(), instance.GetAllocator(),
+                                             frame->hudless_allocation, true);
                 frame->hudless_view =
                     Check<"create HUD-less frame view">(instance.GetDevice().createImageView(
                         vk::ImageViewCreateInfo{.image = frame->hudless_image,

@@ -55,6 +55,34 @@ inline std::atomic<u64> staging_allocation_bytes{0};
 inline std::atomic<u64> staging_allocation_ns{0};
 /// Time spent making buffer memory resident (allocation and page table updates).
 inline std::atomic<u64> resident_ns{0};
+/// VRAM cleanup: the image collector's passes (the modes they reached and their time), what it
+/// freed and wrote back, uploads at addresses it had freed, and buffer evictions.
+inline std::atomic<u64> gc_passes{0};
+inline std::atomic<u64> gc_pressure_passes{0};
+inline std::atomic<u64> gc_aggressive_passes{0};
+inline std::atomic<u64> gc_budget_limit_passes{0}; ///< aggressive only for the driver's figure
+inline std::atomic<u64> gc_ns{0};
+inline std::atomic<u64> gc_slowest_ns{0}; ///< slowest single pass since the last cleanup report
+inline std::atomic<u64> gc_usage_query_ns{0};
+inline std::atomic<u64> gc_freed_images{0};
+inline std::atomic<u64> gc_freed_bytes{0};
+inline std::atomic<u64> gc_writebacks_started{0};
+inline std::atomic<u64> gc_writeback_started_bytes{0};
+inline std::atomic<u64> gc_writeback_done_ns{0}; ///< finishing write-backs (copy to guest memory)
+inline std::atomic<u64> gc_writeback_written_bytes{0};
+inline std::atomic<u64> gc_reuploads{0};
+inline std::atomic<u64> gc_reupload_bytes{0};
+inline std::atomic<u64> gc_reupload_age_ms{0}; ///< summed time between the free and the upload
+inline std::atomic<u64> buffer_evictions{0};
+inline std::atomic<u64> buffer_eviction_bytes{0};
+inline std::atomic<u64> buffer_eviction_ns{0};
+inline std::atomic<u64> buffer_eviction_unbind_ns{0};
+/// Upload scratch in graphics card memory (detiling, copies): released under VRAM pressure, and
+/// allocated (again) when needed.
+inline std::atomic<u64> scratch_releases{0};
+inline std::atomic<u64> scratch_released_bytes{0};
+inline std::atomic<u64> scratch_allocations{0};
+inline std::atomic<u64> scratch_allocation_bytes{0};
 /// Background texture copies: started, and time spent waiting for them (submission, fences).
 inline std::atomic<u64> async_copies{0};
 /// Presentation (the swap thread): time in acquiring a window image, in presenting it, and

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <string>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -12,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/vram_owners.h"
 
 #include <vk_mem_alloc.h>
 
@@ -98,6 +100,8 @@ UniqueBuffer::~UniqueBuffer() {
 
 void UniqueBuffer::Destroy() {
     if (allocation) {
+        VramOwners::Track(vram_owner, allocator, allocation, false);
+        vram_owner = VramOwners::NoOwner;
         vmaDestroyBuffer(allocator, buffer, allocation);
     } else if (buffer) {
         device.destroyBuffer(buffer);
@@ -108,7 +112,7 @@ void UniqueBuffer::Destroy() {
 }
 
 void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
-                          VmaAllocationInfo* out_alloc_info) {
+                          VmaAllocationInfo* out_alloc_info, std::string_view owner_name) {
     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
     if (mem_type != MemoryType::Sparse) {
         const VmaAllocationCreateFlags bda_flag =
@@ -130,6 +134,11 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};
+        const std::string name = owner_name.empty()
+                                     ? fmt::format("{} buffers", BufferTypeName(mem_type))
+                                     : fmt::format("{} ({})", owner_name, BufferTypeName(mem_type));
+        vram_owner = VramOwners::Register(name);
+        VramOwners::Track(vram_owner, allocator, allocation, true);
     } else {
         buffer_ci.flags |=
             vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
@@ -162,7 +171,7 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         .pQueueFamilyIndices = families.size() > 1 ? families.data() : nullptr,
     };
     VmaAllocationInfo alloc_info{};
-    buffer.Create(buffer_ci, mem_type, &alloc_info);
+    buffer.Create(buffer_ci, mem_type, &alloc_info, debug_name);
 
     const auto device = instance.GetDevice();
     if (!debug_name.empty()) {

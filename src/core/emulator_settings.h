@@ -465,6 +465,21 @@ struct GPUSettings {
     Setting<bool> bb_vram_reclaim{true};
     // With VRAM cleanup: also free guest buffer memory unused for 30 s (applies at start).
     Setting<bool> bb_buffer_eviction{true};
+    // With VRAM cleanup: at each loading screen, free the textures and buffers not used since it
+    // started, so play continues with more free VRAM (the next area uploads what it needs).
+    Setting<bool> bb_load_screen_cleanup{true};
+    // With VRAM cleanup (testing): marks from the driver's current VRAM budget, a small margin
+    // below it, instead of an eighth of the card kept free. Off: the usual marks.
+    Setting<bool> bb_more_vram{false};
+    // With "Use more VRAM" (testing, applies at start): up to the card's size less a reserve for
+    // Windows, past the driver's budget (Windows then makes room by moving other programs' memory
+    // to system RAM), with memory priorities so texture copies are the first to go if it moves any
+    // of the emulator's.
+    Setting<bool> bb_vram_past_budget{false};
+    // Texture quality: 0 = full, 1 = High (textures over 2048 stored at half size), 2 = Medium
+    // (over 1024). Only block-compressed textures with mip levels that the GPU never writes: their
+    // largest level is left out. Applies to textures loaded after a change.
+    Setting<int> bb_texture_quality{0};
     // Testing: the VRAM budget the caches assume, in MiB (0 = the GPU's real budget; at start).
     Setting<int> bb_vram_budget_test_mb{0};
     // Threaded renderer: textures and large buffer uploads copied from guest memory on background
@@ -566,6 +581,11 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_flip_when_ready", &GPUSettings::bb_flip_when_ready),
             make_override<GPUSettings>("bb_vram_reclaim", &GPUSettings::bb_vram_reclaim),
             make_override<GPUSettings>("bb_buffer_eviction", &GPUSettings::bb_buffer_eviction),
+            make_override<GPUSettings>("bb_load_screen_cleanup",
+                                       &GPUSettings::bb_load_screen_cleanup),
+            make_override<GPUSettings>("bb_more_vram", &GPUSettings::bb_more_vram),
+            make_override<GPUSettings>("bb_vram_past_budget", &GPUSettings::bb_vram_past_budget),
+            make_override<GPUSettings>("bb_texture_quality", &GPUSettings::bb_texture_quality),
             make_override<GPUSettings>("bb_background_texture_copies",
                                        &GPUSettings::bb_background_texture_copies),
             make_override<GPUSettings>("bb_vram_budget_test_mb",
@@ -605,6 +625,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     userfaultfd, inline_fetch_shader, threaded_renderer, threaded_renderer_diagnostics,
     threaded_renderer_gpu_profile, bb_object_motion, bb_readback_queue, bb_streaming,
     bb_merged_copies, bb_fast_locks, bb_flip_when_ready, bb_vram_reclaim, bb_buffer_eviction,
+    bb_load_screen_cleanup, bb_more_vram, bb_vram_past_budget, bb_texture_quality,
     bb_vram_budget_test_mb, bb_background_texture_copies, bb_geometry_in_place, bb_skip_empty_draws,
     bb_background_pipelines, bb_anisotropy, bb_exact_protection, bb_batched_uploads,
     bb_texture_set_memo, bb_ring_geometry, bb_submit_overlap, bb_stutter_detail, bb_defaults,
@@ -917,6 +938,9 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbFlipWhenReady, bb_flip_when_ready)
     SETTING_FORWARD_BOOL(m_gpu, BbVramReclaim, bb_vram_reclaim)
     SETTING_FORWARD_BOOL(m_gpu, BbBufferEviction, bb_buffer_eviction)
+    SETTING_FORWARD_BOOL(m_gpu, BbLoadScreenCleanup, bb_load_screen_cleanup)
+    SETTING_FORWARD_BOOL(m_gpu, BbMoreVram, bb_more_vram)
+    SETTING_FORWARD_BOOL(m_gpu, BbVramPastBudget, bb_vram_past_budget)
     SETTING_FORWARD_BOOL(m_gpu, BbBackgroundTextureCopies, bb_background_texture_copies)
     SETTING_FORWARD_BOOL(m_gpu, BbGeometryInPlace, bb_geometry_in_place)
     SETTING_FORWARD_BOOL(m_gpu, BbSkipEmptyDraws, bb_skip_empty_draws)
@@ -936,6 +960,7 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbSpreadLoads, bb_spread_loads)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)
+    SETTING_FORWARD(m_gpu, BbTextureQuality, bb_texture_quality)
     SETTING_FORWARD(m_gpu, BbAnisotropy, bb_anisotropy)
     SETTING_FORWARD(m_gpu, BbDrawDataMemory, bb_draw_data_memory)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
