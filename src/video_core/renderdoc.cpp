@@ -6,6 +6,7 @@
 #include "core/emulator_settings.h"
 #include "video_core/renderdoc.h"
 
+#include <algorithm>
 #include <atomic>
 #include <renderdoc_app.h>
 
@@ -25,6 +26,8 @@ enum class CaptureState {
     InProgress,
 };
 static CaptureState capture_state{CaptureState::Idle};
+/// Frames the capture in progress still takes (several frames go into one file).
+static u32 capture_frames_left{};
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
 
@@ -110,15 +113,27 @@ void EndCapture() {
     }
 
     if (capture_state == CaptureState::InProgress) {
+        if (capture_frames_left > 1) {
+            --capture_frames_left;
+            return;
+        }
         rdoc_api->EndFrameCapture(nullptr, nullptr);
         capture_state = CaptureState::Idle;
+        LOG_INFO(Render, "RenderDoc capture written");
     }
 }
 
 void TriggerCapture() {
     if (capture_state == CaptureState::Idle) {
+        capture_frames_left =
+            static_cast<u32>(std::clamp(EmulatorSettings.GetBbRdocCaptureFrames(), 1, 120));
         capture_state = CaptureState::Triggered;
+        LOG_INFO(Render, "RenderDoc capture of the next {} frame(s)", capture_frames_left);
     }
+}
+
+bool IsCapturing() {
+    return capture_state == CaptureState::InProgress;
 }
 
 void SetOutputDir(const std::filesystem::path& path, const std::string& prefix) {

@@ -33,6 +33,10 @@ struct VideoOutPort;
 
 namespace AmdGpu {
 
+/// Diagnostics: the graphics packet the GPU command thread is running (its opcode; ~0 between
+/// packets).
+inline thread_local u32 current_packet_opcode = ~0u;
+
 struct PM4CmdWaitRegMem;
 
 /// Threaded renderer: which 32-word blocks of the register file were written since the draw

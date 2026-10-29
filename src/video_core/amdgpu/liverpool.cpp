@@ -6,7 +6,10 @@
 #include <atomic>
 #include <cstdlib>
 #include <iterator>
+#include <mutex>
 #include <string>
+#include <tuple>
+#include <vector>
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -279,11 +282,16 @@ void Liverpool::Process(std::stop_token stoken) {
         RetireFrames();
 
         if (submit_done) {
-            VideoCore::EndCapture();
             if (rasterizer) {
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
+                if (VideoCore::IsCapturing()) {
+                    // The frame's last work is in the capture too.
+                    rasterizer->DrainDrawPipe();
+                    rasterizer->Flush();
+                }
             }
+            VideoCore::EndCapture();
             submit_done = false;
         }
 
@@ -299,6 +307,35 @@ void Liverpool::Process(std::stop_token stoken) {
         }
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
+}
+
+// Stutter detail: the first kinds of constant dumps that wait for the draw recorder (address,
+// size, why), up to 32 lines.
+static void LogConstantDumpWait(VAddr address, u32 size, const Vulkan::Rasterizer::QueuedUse& use) {
+    if (!Common::GuestStats::detail_timing.load(std::memory_order_relaxed)) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::vector<std::tuple<VAddr, u32, u32>> seen;
+    const u32 why = u32(use.read_later) | u32(use.written) << 1 | u32(use.overflow) << 2;
+    {
+        std::scoped_lock lock{mutex};
+        if (seen.size() >= 32 ||
+            std::ranges::find(seen, std::tuple{address, size, why}) != seen.end()) {
+            return;
+        }
+        seen.emplace_back(address, size, why);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Constant dump waits for the draw recorder: {:#x}, {} bytes | queued draws read it "
+             "later: {} | too many queued reads to tell: {} | queued work writes it: {}{}",
+             address, size, use.read_later && !use.overflow, use.overflow, use.written,
+             use.written ? fmt::format(" ({}{}, {} bytes, queued {} packets earlier)",
+                                       use.writer ? use.writer : "not tracked",
+                                       use.writer_shader ? fmt::format(" {:#x}", use.writer_shader)
+                                                         : std::string{},
+                                       use.writer_bytes, use.writer_packets_back)
+                         : std::string{});
 }
 
 Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
@@ -332,15 +369,49 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             // Queued draws may still read the memory the dump overwrites, or queued tasks (DMA,
             // fences) write it after. The draws copy what they read when they are queued, so
             // without either the dump is written now, without waiting for them.
+            namespace GS = Common::GuestStats;
+            const bool timed = GS::detail_timing.load(std::memory_order_relaxed);
+            const auto now_if = [timed] {
+                return timed ? std::chrono::steady_clock::now()
+                             : std::chrono::steady_clock::time_point{};
+            };
+            const auto ns_since = [](std::chrono::steady_clock::time_point start) {
+                return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - start)
+                                            .count());
+            };
+            GS::ce_dumps.fetch_add(1, std::memory_order_relaxed);
             if (rasterizer) {
                 const auto use =
                     rasterizer->CheckQueuedUse(dump_const->Address<VAddr>(), dump_const->Size());
-                if (!EmulatorSettings.IsBbConstantsNoWait() || use.read_later || use.written) {
+                const bool must_wait =
+                    !EmulatorSettings.IsBbConstantsNoWait() || use.read_later || use.written;
+                if (!must_wait && use.huge_writes_skipped != 0) {
+                    GS::ce_huge_write_skips.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (must_wait) {
+                    GS::ce_wait_reads.fetch_add(use.read_later && !use.overflow,
+                                                std::memory_order_relaxed);
+                    GS::ce_wait_writes.fetch_add(use.written, std::memory_order_relaxed);
+                    GS::ce_wait_overflow.fetch_add(use.overflow, std::memory_order_relaxed);
+                    LogConstantDumpWait(dump_const->Address<VAddr>(), dump_const->Size(), use);
+                }
+                if (must_wait) {
+                    const auto drain_start = now_if();
                     rasterizer->DrainDrawPipe();
+                    GS::ce_dump_drains.fetch_add(1, std::memory_order_relaxed);
+                    if (timed) {
+                        GS::ce_dump_drain_ns.fetch_add(ns_since(drain_start),
+                                                       std::memory_order_relaxed);
+                    }
                 }
             }
+            const auto write_start = now_if();
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), dump_const->Size());
+            if (timed) {
+                GS::ce_dump_write_ns.fetch_add(ns_since(write_start), std::memory_order_relaxed);
+            }
             break;
         }
         case PM4ItOpcode::IncrementCeCounter: {
@@ -481,7 +552,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     if (!ccb.empty()) {
         // In case of CCB provided kick off CE asap to have the constant heap ready to use
         ce_task = ProcessCeUpdate(ccb);
+        const auto ce_start = std::chrono::steady_clock::now();
         RESUME_GFX(ce_task);
+        if (Common::GuestStats::detail_timing.load(std::memory_order_relaxed)) {
+            Common::GuestStats::ce_outside_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - ce_start)
+                    .count(),
+                std::memory_order_relaxed);
+        }
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
@@ -489,6 +568,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const u64 commands_hash = HashCommands(commands);
     PacketTrail trail;
     while (!dcb.empty()) {
+        current_packet_opcode = ~0u;
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
@@ -520,25 +600,60 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            current_packet_opcode = static_cast<u32>(opcode);
+            // Stutter detail: this packet's time on the command thread, by type.
+            const bool time_packet =
+                Common::GuestStats::detail_timing.load(std::memory_order_relaxed);
             if (rasterizer && !KeepsDrawPipe(opcode)) {
+                const auto drain_start = time_packet ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
                 rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                if (time_packet) {
+                    Common::GuestStats::cmd_drain_ns.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - drain_start)
+                            .count(),
+                        std::memory_order_relaxed);
+                }
             }
+            const auto packet_start = time_packet ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
                 if (nop->header.count.Value() == 0) {
                     break;
                 }
-                if (rasterizer && (guest_markers_enabled ||
-                                   nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip)) {
+                const bool is_flip = nop->data_block[0] == PM4CmdNop::PayloadType::PatchedFlip;
+                const auto flip_start = time_packet && is_flip
+                                            ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
+                if (rasterizer && (guest_markers_enabled || is_flip)) {
                     rasterizer->DrainDrawPipe();
                 }
+                const auto signal_start = time_packet && is_flip
+                                              ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
 
                 switch (nop->data_block[0]) {
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    if (time_packet) {
+                        namespace GS = Common::GuestStats;
+                        const auto end = std::chrono::steady_clock::now();
+                        GS::flips.fetch_add(1, std::memory_order_relaxed);
+                        GS::flip_drain_ns.fetch_add(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(signal_start -
+                                                                                 flip_start)
+                                .count(),
+                            std::memory_order_relaxed);
+                        GS::flip_signal_ns.fetch_add(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(end - signal_start)
+                                .count(),
+                            std::memory_order_relaxed);
+                    }
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
@@ -1002,9 +1117,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             // count once the GPU has run the test (until then: not ready).
                             rasterizer->OcclusionDump(dump.results, dump.value, dump.pairs);
                         } else if (rasterizer && EmulatorSettings.IsBbOcclusionInOrder()) {
-                            rasterizer->RunInOrder(write, &dump, sizeof(dump),
-                                                   reinterpret_cast<VAddr>(dump.results),
-                                                   u64(dump.pairs) * 2 * sizeof(u64));
+                            rasterizer->RunInOrder(
+                                write, &dump, sizeof(dump), reinterpret_cast<VAddr>(dump.results),
+                                u64(dump.pairs) * 2 * sizeof(u64), "occlusion result");
                         } else {
                             // Off: wait here for every queued draw, then write (as before).
                             if (rasterizer) {
@@ -1033,7 +1148,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 });
                         },
                         event_eos, sizeof(PM4CmdEventWriteEos),
-                        reinterpret_cast<VAddr>(event_eos->Address()), sizeof(u32));
+                        reinterpret_cast<VAddr>(event_eos->Address()), sizeof(u32),
+                        "EventWriteEos fence");
                     NotePendingFence(packet, reinterpret_cast<VAddr>(event_eos->Address()),
                                      event_eos->DataDWord());
                     break;
@@ -1075,7 +1191,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 });
                         },
                         event_eop, sizeof(PM4CmdEventWriteEop),
-                        reinterpret_cast<VAddr>(event_eop->Address<u8>()), sizeof(u64));
+                        reinterpret_cast<VAddr>(event_eop->Address<u8>()), sizeof(u64),
+                        "EventWriteEop fence");
                     const auto address = reinterpret_cast<VAddr>(event_eop->Address<u8>());
                     switch (event_eop->data_sel.Value()) {
                     case DataSelect::Data32Low:
@@ -1113,7 +1230,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             ExecuteDmaData(r, *reinterpret_cast<const PM4DmaData*>(data));
                         },
                         dma_data, sizeof(PM4DmaData), to_memory ? dma_data->DstAddress<VAddr>() : 0,
-                        to_memory ? dma_data->NumBytes() : 0);
+                        to_memory ? dma_data->NumBytes() : 0, "DmaData");
                     break;
                 }
                 rasterizer->DrainDrawPipe();
@@ -1135,7 +1252,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             std::memcpy(packet->Address<u64*>(), packet->data, bytes);
                         },
                         write_data, (header->type3.NumWords() + 1) * sizeof(u32),
-                        reinterpret_cast<VAddr>(address), data_size);
+                        reinterpret_cast<VAddr>(address), data_size, "WriteData");
                     for (u32 i = 0; i < std::min<u32>(data_size / 4, 4); ++i) {
                         NotePendingFence(packet, reinterpret_cast<VAddr>(address) + i * 4,
                                          write_data->data[i]);
@@ -1202,6 +1319,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
+                if (rasterizer &&
+                    wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+                    // The game waits for an occlusion test's start counters to land: known
+                    // here, as the PS4's GPU has them a moment after the test starts (reading
+                    // the results here let them go to the game before their answers).
+                    if (const auto word = rasterizer->OcclusionKnownWord(
+                            wait_reg_mem->Address<VAddr>(),
+                            static_cast<u32>(wait_reg_mem->function.Value()), wait_reg_mem->ref,
+                            wait_reg_mem->mask);
+                        word && wait_reg_mem->TestValue(*word)) {
+                        break;
+                    }
+                }
                 if (rasterizer && !wait_reg_mem->Test(regs.reg_array)) {
                     if (MetByPendingFence(*wait_reg_mem)) {
                         break;
@@ -1285,14 +1415,31 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                                 static_cast<u32>(opcode), count);
             }
+            if (time_packet) {
+                const auto index = static_cast<size_t>(opcode) & 0xff;
+                Common::GuestStats::cmd_opcode_ns[index].fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - packet_start)
+                        .count(),
+                    std::memory_order_relaxed);
+                Common::GuestStats::cmd_opcode_count[index].fetch_add(1, std::memory_order_relaxed);
+            }
             dcb = NextPacket(dcb, header->type3.NumWords() + 1);
             break;
         }
     }
 
     if (ce_task.handle) {
+        const auto ce_start = std::chrono::steady_clock::now();
         while (!ce_task.handle.done()) {
             RESUME_GFX(ce_task);
+        }
+        if (Common::GuestStats::detail_timing.load(std::memory_order_relaxed)) {
+            Common::GuestStats::ce_outside_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - ce_start)
+                    .count(),
+                std::memory_order_relaxed);
         }
         ce_task.handle.destroy();
     }
@@ -1358,9 +1505,22 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         const PM4ItOpcode opcode = header->type3.opcode;
 
         // Threaded renderer: compute queues run with the draw recording thread idle.
+        const bool time_packet = Common::GuestStats::detail_timing.load(std::memory_order_relaxed);
         if (rasterizer && opcode != PM4ItOpcode::Nop) {
+            const auto drain_start = time_packet ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
             rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+            if (time_packet) {
+                Common::GuestStats::cmd_drain_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - drain_start)
+                        .count(),
+                    std::memory_order_relaxed);
+            }
         }
+        // Stutter detail: compute queue packets' time (an indirect buffer's are counted inside).
+        const auto packet_start = time_packet ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1566,6 +1726,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                             static_cast<u32>(opcode), header->type3.NumWords());
         }
 
+        if (time_packet && opcode != PM4ItOpcode::IndirectBuffer) {
+            Common::GuestStats::cmd_compute_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - packet_start)
+                    .count(),
+                std::memory_order_relaxed);
+            Common::GuestStats::cmd_compute_packets.fetch_add(1, std::memory_order_relaxed);
+        }
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {
@@ -1639,12 +1807,15 @@ void Liverpool::RetireFrames() {
     }
     // What the end of a frame and GPU idle did before: the frame's cache work, then everything
     // queued for the draw recorder recorded.
-    VideoCore::EndCapture();
     if (rasterizer) {
         rasterizer->OnSubmit();
         rasterizer->Flush();
         rasterizer->DrainDrawPipe();
+        if (VideoCore::IsCapturing()) {
+            rasterizer->Flush(); // the frame's last work is in the capture too
+        }
     }
+    VideoCore::EndCapture();
     if (on_frame_retired) {
         on_frame_retired(frame);
     }

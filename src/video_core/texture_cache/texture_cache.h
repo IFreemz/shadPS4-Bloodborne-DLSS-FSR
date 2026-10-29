@@ -26,6 +26,7 @@
 #include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
@@ -138,6 +139,10 @@ public:
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
+    /// The image of which [address, +size) is exactly one layer (an array or cube face, one
+    /// level, all levels kept): `layer` is set to which. Null when none.
+    [[nodiscard]] ImageId FindImageLayer(VAddr address, size_t size, u32& layer);
+
     /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
@@ -163,11 +168,22 @@ public:
             return;
         }
         TouchImage(image);
+        // Protection on a helper thread: the protection calls of newly tracked pages go with the
+        // upload's background copies (applied here when there is none).
+        ProtectRanges deferred;
+        const bool defer = ProtectOnHelperThread();
         {
             Common::GuestStats::DetailTimer timer{Common::GuestStats::Detail::TexTrack};
-            TrackImage(image_id);
+            TrackImage(image_id, defer ? &deferred : nullptr);
         }
-        RefreshImage(image);
+        if (defer) {
+            pending_protect = &deferred;
+            RefreshImage(image);
+            pending_protect = nullptr;
+            ApplyProtection(deferred);
+        } else {
+            RefreshImage(image);
+        }
         // Under the image's lock: a fault handler untracking it (and clearing clean_tick) must
         // not be overwritten by a stale "clean".
         std::scoped_lock lk{image.mutex};
@@ -182,22 +198,50 @@ public:
     /// UpdateImage for a sampled texture: while an area load is spread over frames, its upload
     /// may wait for a later frame (it stays dirty: the next draw binding it tries again).
     void UpdateTexture(ImageId image_id) {
+        if (slot_images[image_id].detail_pending) {
+            TryRestoreDetail(slot_images[image_id]);
+        }
+        // Lower detail first applies to the uploads of sampled textures only.
         if (spread_loads_enabled && !IsClean(image_id) && DeferUpload(slot_images[image_id])) {
             TouchImage(slot_images[image_id]);
             return;
         }
+        const bool was_sampled = std::exchange(sampled_update, true);
+        Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Texture};
         UpdateImage(image_id);
+        sampled_update = was_sampled;
     }
 
     /// Spread area loading: the per-frame upload budget starts again (each game frame).
     void OnGameFrame() {
         spread_frame_bytes.store(0, std::memory_order_relaxed);
+        detail_frame_bytes.store(0, std::memory_order_relaxed);
+        detail_frame_restores.store(0, std::memory_order_relaxed);
     }
 
     /// UpdateImage for the images a draw binds, with the uploads of those that need one recorded
     /// together (Batched texture uploads setting): detiles after one barrier, copies after
     /// another, one render pass break.
     void UpdateImages(std::span<const ImageId> image_ids);
+
+    /// Protection on a helper thread (setting, threaded renderer with background copies).
+    [[nodiscard]] static bool ProtectOnHelperThread();
+
+    /// Applies deferred protection calls now (none left over afterwards).
+    void ApplyProtection(ProtectRanges& ranges);
+
+    /// Lower detail first: uploads the largest level an image still waits for, now (before a
+    /// use other than sampling: render target, storage, copy source).
+    void EnsureFullDetail(Image& image);
+
+    /// Clear new shader-written images: the image's first contents are zeros cleared on the GPU
+    /// instead of its guest memory (a shader about to overwrite all of it).
+    void ClearInsteadOfUpload(Image& image);
+
+    /// The slot holds an image (it may have been freed since an id was taken).
+    [[nodiscard]] bool IsImageAllocated(ImageId image_id) const {
+        return slot_images.IsAllocated(image_id);
+    }
 
     /// UpdateImage would return at once: the image was found clean, fully tracked and touched
     /// in this GC tick (threaded renderer memos reuse what it resolved).
@@ -234,6 +278,17 @@ public:
     /// Spread area loading: whether this texture's upload waits for a later frame. A new
     /// texture is filled with zeros (black) meanwhile.
     bool DeferUpload(Image& image);
+
+    /// Lower detail first: for a new sampled texture in a burst, drops the copies of its
+    /// largest level (it waits, the image is marked detail_pending). Returns the guest bytes in
+    /// front an upload does not need to copy (LeftOutBytes, or up to the next level).
+    u32 UploadSkip(Image& image, SmallVector<vk::BufferImageCopy, 14>& copies);
+
+    /// UpdateImages' work (with lower detail first's sampled-upload mark set).
+    void UpdateImagesSampled(std::span<const ImageId> image_ids);
+
+    /// Lower detail first: uploads the waiting largest level when this frame's budget allows.
+    void TryRestoreDetail(Image& image);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
@@ -507,7 +562,8 @@ private:
     void UnregisterImage(ImageId image);
 
     /// Track CPU reads and writes for image
-    void TrackImage(ImageId image_id);
+    /// With `deferred`, the protection calls are added to it instead (ApplyProtection).
+    void TrackImage(ImageId image_id, ProtectRanges* deferred = nullptr);
 
     /// Stop tracking CPU reads and writes for image
     void UntrackImage(ImageId image_id);
@@ -550,6 +606,7 @@ private:
     void NoteEvicted(const Image& image);
     void NoteUpload(Image& image);
     void LoadScreenCleanup();
+    void ReloadTexturesFromGuest();
     void UpdateVramLimits();
     void ReportPastBudget();
 
@@ -602,6 +659,11 @@ private:
     u64 gc_loads = 0;
     bool spread_loads_enabled = false;
     std::atomic<u64> spread_frame_bytes{0}; ///< uploaded this game frame while spreading
+    std::atomic<u64> detail_frame_bytes{0}; ///< texture bytes uploaded this game frame
+    std::atomic<u32> detail_frame_restores{0}; ///< largest levels uploaded later this frame
+    static inline thread_local bool sampled_update = false; ///< in UpdateTexture/UpdateImages
+    /// Protection on a helper thread: the image being refreshed's deferred protection calls.
+    static inline thread_local ProtectRanges* pending_protect = nullptr;
     u64 spread_window_second = 0, spread_window_uploads = 0, spread_window_bytes = 0;
     u64 spread_until_second = 0;
     std::unique_ptr<Buffer> zero_buffer; ///< zeros a new texture is filled from

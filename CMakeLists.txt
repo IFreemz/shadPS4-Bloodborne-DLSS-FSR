@@ -1230,6 +1230,10 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_bb_object_motion.h
                src/video_core/renderer_vulkan/vk_bb_velocity_mirror.cpp
                src/video_core/renderer_vulkan/vk_bb_velocity_mirror.h
+               src/video_core/renderer_vulkan/vk_bb_occlusion_depth.cpp
+               src/video_core/renderer_vulkan/vk_bb_occlusion_depth.h
+               src/video_core/renderer_vulkan/vk_bb_vbao.cpp
+               src/video_core/renderer_vulkan/vk_bb_vbao.h
                src/video_core/renderer_vulkan/vk_dlss_ngx.cpp
                src/video_core/renderer_vulkan/vk_dlss_ngx.h
                src/video_core/renderer_vulkan/vk_hdr_mod.cpp

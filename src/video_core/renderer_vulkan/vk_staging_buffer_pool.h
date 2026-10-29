@@ -103,6 +103,12 @@ private:
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
     u64 frame = 0;
     size_t min_upload_blocks = 0;
+    /// The memory texture uploads are staged in (BufferCache::ObtainBufferForImage): its ring
+    /// keeps min_upload_blocks.
+    VideoCore::MemoryType TextureStagingType() const;
+    /// Blocks each ring keeps (TrimRing): min_upload_blocks for texture staging, a few for
+    /// buffer uploads.
+    size_t KeptBlocks(VideoCore::MemoryType type) const;
     std::chrono::steady_clock::time_point frame_time{};
 };
 

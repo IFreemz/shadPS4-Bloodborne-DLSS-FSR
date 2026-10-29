@@ -3,6 +3,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -56,6 +60,10 @@ struct PageManager::Impl {
         }
 
         Core::MemoryPermission Perms() const noexcept {
+            // Reads watched: no access at all (a page can't be write-only).
+            if (num_read_watchers != 0) {
+                return Core::MemoryPermission::None;
+            }
             return ReadPerm() | WritePerm();
         }
 
@@ -73,7 +81,9 @@ struct PageManager::Impl {
                                                 bool update_read = false) {
             if (update_read) {
                 if (read_op == PageOp::Track) {
-                    ASSERT_MSG(num_read_watchers == 0, "Too many watchers");
+                    // (A count: the buffer cache's readbacks and occlusion answers can both
+                    // watch a page's reads.)
+                    ASSERT_MSG(num_read_watchers < 255, "Too many watchers");
                 } else if (read_op == PageOp::Untrack) {
                     ASSERT_MSG(num_read_watchers > 0, "Not enough watchers");
                 }
@@ -118,7 +128,7 @@ struct PageManager::Impl {
         locks.reserve(start_page, end_page);
     }
 
-    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
+    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op, ProtectRanges* deferred) {
         const u64 page_start = addr >> PM_PAGE_BITS;
         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
 
@@ -128,10 +138,26 @@ struct PageManager::Impl {
         u64 potential_pages = 0;
         // Windows' protection cost is per page: only runs of pages whose protection changes.
         const bool exact = EmulatorSettings.IsBbExactProtection();
+        // Deferred protection: tracking only (a page made writable again is never left for
+        // later).
+        if (write_op != PageOp::Track) {
+            deferred = nullptr;
+        }
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
-                Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                const VAddr range_addr = range_begin << PM_PAGE_BITS;
+                const u64 range_size = range_pages << PM_PAGE_BITS;
+                if (deferred) {
+                    if (!deferred->empty() &&
+                        deferred->back().first + deferred->back().second == range_addr) {
+                        deferred->back().second += range_size;
+                    } else {
+                        deferred->emplace_back(range_addr, range_size);
+                    }
+                } else {
+                    Protect(range_addr, range_size, perms);
+                }
                 range_pages = 0;
                 potential_pages = 0;
             }
@@ -190,6 +216,66 @@ struct PageManager::Impl {
 
         for (u64 page = page_start; page != page_end; ++page) {
             if (auto* lock = locks.find(page)) {
+                lock->unlock();
+            }
+        }
+    }
+
+    bool UpdatePageReadWatcher(VAddr addr, PageOp read_op) {
+        const u64 page = addr >> PM_PAGE_BITS;
+        PageState* state = cached_pages.find(page);
+        auto* lock = locks.find(page);
+        if (!state || !lock) {
+            return false;
+        }
+        lock->lock();
+        const auto old_perms = state->Perms();
+        const auto new_perms = state->Update(PageOp::None, false, read_op, true);
+        if (new_perms != old_perms) {
+            Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, new_perms);
+        }
+        lock->unlock();
+        return true;
+    }
+
+    void ApplyProtection(VAddr addr, u64 size) {
+        const u64 page_start = addr >> PM_PAGE_BITS;
+        const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+        // Under the pages' locks: the protection matches their states as they are now (a fault or
+        // an untrack since the deferred tracking already changed them).
+        for (u64 page = page_start; page != page_end; ++page) {
+            if (auto* lock = locks.find(page); lock && cached_pages.find(page)) {
+                lock->lock();
+            }
+        }
+        Core::MemoryPermission perms{};
+        u64 run_begin = page_start;
+        u64 run_pages = 0;
+        const auto release = [&] {
+            if (run_pages > 0) {
+                Protect(run_begin << PM_PAGE_BITS, run_pages << PM_PAGE_BITS, perms);
+                run_pages = 0;
+            }
+        };
+        for (u64 page = page_start; page != page_end; ++page) {
+            const PageState* state = cached_pages.find(page);
+            if (!state || !locks.find(page)) {
+                release();
+                continue;
+            }
+            const auto page_perms = state->Perms();
+            if (run_pages != 0 && page_perms != perms) {
+                release();
+            }
+            if (run_pages == 0) {
+                run_begin = page;
+                perms = page_perms;
+            }
+            ++run_pages;
+        }
+        release();
+        for (u64 page = page_start; page != page_end; ++page) {
+            if (auto* lock = locks.find(page); lock && cached_pages.find(page)) {
                 lock->unlock();
             }
         }
@@ -450,8 +536,31 @@ struct SignalImpl : public PageManager::Impl {
             std::memory_order_relaxed);
         Common::GuestStats::protect_calls.fetch_add(1, std::memory_order_relaxed);
         Common::GuestStats::protect_pages.fetch_add(size >> 12, std::memory_order_relaxed);
+        if (Common::GuestStats::on_protect_helper) {
+            namespace GS = Common::GuestStats;
+            GS::helper_protect_calls.fetch_add(1, std::memory_order_relaxed);
+            GS::helper_protect_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                std::chrono::steady_clock::now() - start)
+                                                .count(),
+                                            std::memory_order_relaxed);
+        }
+        if (Common::GuestStats::is_cmd_thread) {
+            namespace GS = Common::GuestStats;
+            GS::cmd_protect_calls.fetch_add(1, std::memory_order_relaxed);
+            GS::cmd_protect_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - start)
+                                             .count(),
+                                         std::memory_order_relaxed);
+        }
         if (Common::GuestStats::on_recorder) {
             namespace GS = Common::GuestStats;
+            const auto by = static_cast<size_t>(GS::current_detail);
+            GS::recorder_protect_calls_by[by].fetch_add(1, std::memory_order_relaxed);
+            GS::recorder_protect_ns_by[by].fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count(),
+                std::memory_order_relaxed);
             GS::recorder_protect_calls.fetch_add(1, std::memory_order_relaxed);
             GS::detail_ns[static_cast<size_t>(GS::Detail::RecorderProtect)].fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -465,6 +574,10 @@ struct SignalImpl : public PageManager::Impl {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
+        // Occlusion results kept from the game until answered (first: no other wait).
+        if (rasterizer->OcclusionTrapFault(addr, Common::IsWriteError(context))) {
+            return true;
+        }
         if (Common::IsWriteError(context)) {
             const Common::GameWaits::Scope wait{"write fault"};
             return rasterizer->OnWriteFault(addr, size, is_gpu_thread);
@@ -474,6 +587,15 @@ struct SignalImpl : public PageManager::Impl {
         }
         return false;
     }
+};
+
+struct PageManager::ProtectWorker {
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    std::deque<std::pair<u64, ProtectRanges>> jobs;
+    u64 queued{};
+    std::atomic<u64> done{};
+    std::jthread thread;
 };
 
 PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
@@ -502,8 +624,65 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
 }
 
-void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const {
-    impl->UpdatePageWatchers(addr, size, write_op);
+void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op,
+                                     ProtectRanges* deferred) const {
+    impl->UpdatePageWatchers(addr, size, write_op, deferred);
+}
+
+bool PageManager::UpdatePageReadWatcher(VAddr addr, PageOp read_op) const {
+    return impl->UpdatePageReadWatcher(addr, read_op);
+}
+
+void PageManager::ApplyProtection(VAddr addr, u64 size) const {
+    impl->ApplyProtection(addr, size);
+}
+
+u64 PageManager::QueueProtection(ProtectRanges ranges) {
+    if (!protect_worker) {
+        protect_worker = std::make_unique<ProtectWorker>();
+        protect_worker->thread = std::jthread([this](std::stop_token stop) {
+            Common::SetCurrentThreadName("shadPS4:PageProtect");
+            Common::GuestStats::on_protect_helper = true;
+            auto& worker = *protect_worker;
+            while (true) {
+                std::pair<u64, ProtectRanges> job;
+                {
+                    std::unique_lock lock{worker.mutex};
+                    worker.cv.wait(lock, stop, [&] { return !worker.jobs.empty(); });
+                    if (worker.jobs.empty()) {
+                        return; // stop requested
+                    }
+                    job = std::move(worker.jobs.front());
+                    worker.jobs.pop_front();
+                }
+                for (const auto& [address, size] : job.second) {
+                    impl->ApplyProtection(address, size);
+                }
+                worker.done.store(job.first, std::memory_order_release);
+                worker.done.notify_all();
+            }
+        });
+    }
+    auto& worker = *protect_worker;
+    u64 ticket;
+    {
+        std::scoped_lock lock{worker.mutex};
+        ticket = ++worker.queued;
+        worker.jobs.emplace_back(ticket, std::move(ranges));
+    }
+    worker.cv.notify_one();
+    return ticket;
+}
+
+void PageManager::WaitProtection(u64 ticket) {
+    if (!protect_worker) {
+        return;
+    }
+    auto& done = protect_worker->done;
+    for (u64 seen = done.load(std::memory_order_acquire); seen < ticket;
+         seen = done.load(std::memory_order_acquire)) {
+        done.wait(seen, std::memory_order_acquire);
+    }
 }
 
 void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,

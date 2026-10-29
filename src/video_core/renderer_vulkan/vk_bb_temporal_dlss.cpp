@@ -2108,6 +2108,12 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
 BbTemporalDlss::BbTemporalDlss() : impl{std::make_unique<Impl>()} {}
 BbTemporalDlss::~BbTemporalDlss() = default;
 
+std::string BbTemporalDlss::DescribeBlur() const {
+    if (!impl->requested)
+        return "(no upscaler requested: motion blur watch off)";
+    return impl->DescribeBlurFrame(impl->CameraChange());
+}
+
 bool BbTemporalDlss::Requested() const {
     return impl->requested;
 }

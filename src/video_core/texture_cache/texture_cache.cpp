@@ -494,6 +494,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         auto new_info = requested_info;
         new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
         new_info.UpdateSize();
+        EnsureFullDetail(cache_image);
         const auto new_image_id = slot_images.Insert(instance, runtime, slot_image_views, new_info);
         RegisterImage(new_image_id);
 
@@ -503,6 +504,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         if (new_info.num_samples == 1 &&
             (new_info.resources.layers > cache_image.info.resources.layers ||
              new_info.resources.levels > cache_image.info.resources.levels)) {
+            Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Overlap};
             RefreshImage(new_image);
         }
         new_image.flags &= ~ImageFlagBits::Dirty;
@@ -741,6 +743,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 // We need to have a larger, already allocated image to copy this one into
                 if (merged_image_id) {
                     auto& merged_image = slot_images[merged_image_id];
+                    EnsureFullDetail(cache_image);
                     runtime.CopyMip(&cache_image, &merged_image, mip, slice);
                     FreeImage(cache_image_id);
                 }
@@ -758,6 +761,8 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
+    EnsureFullDetail(src_image);
+    Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Overlap};
     RefreshImage(new_image);
     runtime.CopyImage(&src_image, &new_image);
 
@@ -886,18 +891,55 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
+ImageId TextureCache::FindImageLayer(VAddr address, size_t size, u32& layer) {
+    // (After bbport 0.7: the point lights' shadow cube is cleared a face at a time.)
+    ImageId found{};
+    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+        const auto& info = image.info;
+        const u32 layers = info.resources.layers;
+        if (found || image.dropped_levels != 0 || info.resources.levels != 1 || layers < 2 ||
+            info.guest_size % layers != 0 || address < info.guest_address) {
+            return;
+        }
+        const u64 layer_size = info.guest_size / layers;
+        const u64 offset = address - info.guest_address;
+        if (size == layer_size && offset % layer_size == 0 && offset / layer_size < layers) {
+            layer = u32(offset / layer_size);
+            found = image_id;
+        }
+    });
+    return found;
+}
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
+        Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Storage};
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
             download_images.emplace(image_id);
         }
+        EnsureFullDetail(image);
         UpdateImage(image_id);
     } else {
         UpdateTexture(image_id);
+        if (image.detail_pending) {
+            // Lower detail first: sampled from the next level down until the largest arrives
+            // (a view of the largest level alone, or exact texel reads, need it now).
+            const SubresourceRange host = image.HostRange(desc.view_info.range);
+            if (host.base.level == 0 && host.extent.levels >= 2 &&
+                std::atomic_ref<u8>(image.exact_texel_reads).load(std::memory_order_relaxed) == 0) {
+                ImageViewInfo soft = desc.view_info;
+                soft.min_lod = std::max(soft.min_lod, (image.dropped_levels + 1) * 256);
+                Common::GuestStats::DetailTimer timer{Common::GuestStats::Detail::TexView};
+                return image.FindView(soft);
+            }
+            if (host.base.level == 0) {
+                EnsureFullDetail(image);
+            }
+        }
     }
     Common::GuestStats::DetailTimer timer{Common::GuestStats::Detail::TexView};
     return image.FindView(desc.view_info);
@@ -930,6 +972,8 @@ void TextureCache::UnregisterMeta(VAddr address, u64 owner_uid) {
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+    Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Target};
+    EnsureFullDetail(image);
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
@@ -972,6 +1016,8 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
+    Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Target};
+    EnsureFullDetail(image);
     image.flags |= ImageFlagBits::GpuModified;
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
@@ -1041,25 +1087,157 @@ static void DropLeftOutLevels(const Image& image, SmallVector<vk::BufferImageCop
     }
 }
 
-// Copy only kept texture levels: the guest bytes in front of the first level the image keeps
-// (its left-out levels), which an upload does not need to copy. 0 when a left-out level lies
-// after a kept one, or with the setting off.
-static u32 LeftOutBytes(const Image& image) {
+// Guest bytes in front of guest level `first` when every level before it lies there (an upload
+// starting at `first` does not need to copy them); 0 otherwise.
+static u32 BytesBeforeLevel(const Image& image, u32 first) {
     const u32 levels = image.info.resources.levels;
-    if (image.dropped_levels == 0 || image.dropped_levels >= levels ||
-        !EmulatorSettings.IsBbSkipLeftOutLevels()) {
+    if (first == 0 || first >= levels) {
         return 0;
     }
     u32 kept_start = image.info.guest_size;
-    for (u32 m = image.dropped_levels; m < levels; ++m) {
+    for (u32 m = first; m < levels; ++m) {
         kept_start = std::min(kept_start, image.info.mips_layout[m].offset);
     }
-    for (u32 m = 0; m < image.dropped_levels; ++m) {
+    for (u32 m = 0; m < first; ++m) {
         if (image.info.mips_layout[m].offset >= kept_start) {
             return 0;
         }
     }
     return kept_start;
+}
+
+// Copy only kept texture levels: the guest bytes in front of the first level the image keeps
+// (its left-out levels), which an upload does not need to copy. 0 when a left-out level lies
+// after a kept one, or with the setting off.
+static u32 LeftOutBytes(const Image& image) {
+    if (!EmulatorSettings.IsBbSkipLeftOutLevels()) {
+        return 0;
+    }
+    return BytesBeforeLevel(image, image.dropped_levels);
+}
+
+static u64 SteadyNowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+// Upload staging and detile output only from the first level copied: the bytes in front (whole
+// levels left out or waiting) get no memory when aligned for it (256 bytes; tiled, 64 texels for
+// the detile dispatch).
+static u32 TrimBytes(const Image& image, u32 skip) {
+    if (skip == 0 || skip >= image.info.guest_size || skip % 256 != 0) {
+        return 0;
+    }
+    if (image.info.props.is_tiled) {
+        const u32 bytes_per_texel = image.info.num_bits / 8;
+        if (bytes_per_texel == 0 || (skip / bytes_per_texel) % 64 != 0) {
+            return 0;
+        }
+    }
+    return skip;
+}
+
+u32 TextureCache::UploadSkip(Image& image, SmallVector<vk::BufferImageCopy, 14>& copies) {
+    // A burst: this game frame already uploaded this much (a traversal load uploads 200-440 MiB
+    // of new textures in one frame; usual frames a few MiB). Only textures this large wait.
+    constexpr u64 BurstFrameBytes = 32_MB;
+    constexpr u32 MinImageBytes = 1_MB;
+    namespace GS = Common::GuestStats;
+    if (image.detail_pending) {
+        // This upload includes the largest level again.
+        image.detail_pending = false;
+        const u64 soft_ns = SteadyNowNs() - image.detail_pending_since_ns;
+        GS::detail_restored.fetch_add(1, std::memory_order_relaxed);
+        GS::detail_restored_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+        GS::detail_soft_ns.fetch_add(soft_ns, std::memory_order_relaxed);
+        if (soft_ns > GS::detail_soft_max_ns.load(std::memory_order_relaxed)) {
+            GS::detail_soft_max_ns.store(soft_ns, std::memory_order_relaxed);
+        }
+    }
+    const u32 left_out = LeftOutBytes(image);
+    u32 skip = left_out;
+    const u32 host_levels = image.info.resources.levels - image.dropped_levels;
+    if (sampled_update && host_levels >= 2 &&
+        detail_frame_bytes.load(std::memory_order_relaxed) >= BurstFrameBytes &&
+        EmulatorSettings.IsBbLowerDetailFirst() && instance.IsImageViewMinLodSupported() &&
+        image.info.guest_size >= MinImageBytes && True(image.flags & ImageFlagBits::CpuDirty) &&
+        False(image.flags & ImageFlagBits::GpuModified) && image.info.num_samples == 1 &&
+        !image.info.props.is_depth && !image.info.props.has_stencil && !image.info.stencil_addr &&
+        !image.info.props.is_volume && !image.usage.render_target && !image.usage.depth_target &&
+        !image.usage.storage &&
+        std::atomic_ref<u8>(image.exact_texel_reads).load(std::memory_order_relaxed) == 0 &&
+        image.backing && image.backing->state.layout == vk::ImageLayout::eUndefined &&
+        image.backing->subresource_states.empty()) {
+        // A new texture (never written): its largest level waits.
+        const u32 next = BytesBeforeLevel(image, image.dropped_levels + 1);
+        if (next > left_out) {
+            copies.erase(std::remove_if(copies.begin(), copies.end(),
+                                        [](const vk::BufferImageCopy& copy) {
+                                            return copy.imageSubresource.mipLevel == 0;
+                                        }),
+                         copies.end());
+            skip = next;
+            image.detail_pending = true;
+            image.detail_pending_since_ns = SteadyNowNs();
+            GS::detail_deferred.fetch_add(1, std::memory_order_relaxed);
+            GS::detail_deferred_bytes.fetch_add(next - left_out, std::memory_order_relaxed);
+        }
+    }
+    detail_frame_bytes.fetch_add(image.info.guest_size - skip, std::memory_order_relaxed);
+    return skip;
+}
+
+void TextureCache::TryRestoreDetail(Image& image) {
+    // The largest levels arrive in frames that upload little else: up to this much a frame
+    // (~2-3 ms of copying), or one a frame once a texture waited this long.
+    constexpr u64 RestoreFrameBytes = 24_MB;
+    constexpr u64 OverdueNs = 500'000'000;
+    const bool fits = detail_frame_bytes.load(std::memory_order_relaxed) + image.info.guest_size <=
+                      RestoreFrameBytes;
+    const bool overdue = detail_frame_restores.load(std::memory_order_relaxed) == 0 &&
+                         SteadyNowNs() - image.detail_pending_since_ns >= OverdueNs;
+    if (!fits && !overdue && EmulatorSettings.IsBbLowerDetailFirst()) {
+        return;
+    }
+    detail_frame_restores.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::scoped_lock lk{image.mutex};
+        image.flags |= ImageFlagBits::CpuDirty;
+        ClearCleanTick(image);
+    }
+    const bool was_sampled = std::exchange(sampled_update, false);
+    RefreshImage(image);
+    sampled_update = was_sampled;
+    image.detail_pending = false;
+}
+
+void TextureCache::ClearInsteadOfUpload(Image& image) {
+    runtime.SetBackingSamples(&image, image.info.num_samples, false);
+    const SubresourceRange range{
+        .base = {0, 0},
+        .extent = {static_cast<u16>(image.info.resources.levels),
+                   static_cast<u16>(image.info.resources.layers)},
+    };
+    runtime.ClearImage(&image, range, vk::ClearValue{});
+    Common::GuestStats::new_storage_cleared_bytes.fetch_add(image.info.guest_size,
+                                                            std::memory_order_relaxed);
+}
+
+void TextureCache::EnsureFullDetail(Image& image) {
+    if (!image.detail_pending) {
+        return;
+    }
+    Common::GuestStats::detail_forced.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::scoped_lock lk{image.mutex};
+        image.flags |= ImageFlagBits::CpuDirty;
+        ClearCleanTick(image);
+    }
+    const bool was_sampled = std::exchange(sampled_update, false);
+    RefreshImage(image);
+    sampled_update = was_sampled;
+    image.detail_pending = false;
 }
 
 bool TextureCache::PrepareRefresh(Image& image,
@@ -1227,10 +1405,19 @@ void TextureCache::RefreshImage(Image& image) {
     const auto upload_start = std::chrono::steady_clock::now();
     namespace GSD = Common::GuestStats;
     std::optional<GSD::DetailTimer> timer{std::in_place, GSD::Detail::TexStaging};
+    const u32 skip = UploadSkip(image, image_copies);
+    const u32 trim = TrimBytes(image, skip);
+    // Protection on a helper thread: the copies protect the pages they read first.
+    ProtectRanges protect;
+    if (pending_protect) {
+        protect = std::move(*pending_protect);
+        pending_protect->clear();
+    }
     const auto [in_buffer, in_offset] = buffer_cache.ObtainBufferForImage(
-        image.info.guest_address, image.info.guest_size, LeftOutBytes(image));
+        image.info.guest_address, image.info.guest_size, skip, trim, std::move(protect));
     timer.emplace(GSD::Detail::TexDetile);
-    const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
+    const auto [buffer, offset] =
+        tile_manager.DetileImage(in_buffer, in_offset, image.info, true, trim);
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
     }
@@ -1241,6 +1428,7 @@ void TextureCache::RefreshImage(Image& image) {
     namespace GS = Common::GuestStats;
     GS::image_uploads.fetch_add(1, std::memory_order_relaxed);
     GS::image_upload_bytes.fetch_add(image.info.guest_size, std::memory_order_relaxed);
+    GS::NoteUploadPath(image.info.guest_size);
     NoteUpload(image);
     GS::image_upload_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       std::chrono::steady_clock::now() - upload_start)
@@ -1249,6 +1437,18 @@ void TextureCache::RefreshImage(Image& image) {
 }
 
 void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
+    for (const ImageId image_id : image_ids) {
+        if (image_id && slot_images[image_id].detail_pending) {
+            TryRestoreDetail(slot_images[image_id]);
+        }
+    }
+    const bool was_sampled = std::exchange(sampled_update, true);
+    Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Texture};
+    UpdateImagesSampled(image_ids);
+    sampled_update = was_sampled;
+}
+
+void TextureCache::UpdateImagesSampled(std::span<const ImageId> image_ids) {
     // Spread area loading: uploads past this frame's budget wait (the image stays dirty, so a
     // later draw binding it tries again).
     SmallVector<ImageId, 16> deferred;
@@ -1297,11 +1497,14 @@ void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
         return;
     }
 
-    // Protected before their contents are read (as UpdateImage does).
-    for (const ImageId image_id : pending) {
-        TouchImage(slot_images[image_id]);
+    // Protected before their contents are read (as UpdateImage does); with protection on a
+    // helper thread, by that thread (the copies wait for it).
+    const bool defer_protect = ProtectOnHelperThread();
+    SmallVector<ProtectRanges, 16> deferred_protect(pending.size());
+    for (size_t i = 0; i < pending.size(); ++i) {
+        TouchImage(slot_images[pending[i]]);
         Common::GuestStats::DetailTimer timer{Common::GuestStats::Detail::TexTrack};
-        TrackImage(image_id);
+        TrackImage(pending[i], defer_protect ? &deferred_protect[i] : nullptr);
     }
 
     struct Job {
@@ -1309,6 +1512,7 @@ void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
         SmallVector<vk::BufferImageCopy, 14> copies;
         const Buffer* buffer;
         u64 offset;
+        u32 trim;
     };
     SmallVector<Job, 16> jobs;
     scheduler.EndRendering();
@@ -1316,14 +1520,19 @@ void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
     namespace GSD = Common::GuestStats;
     {
         GSD::DetailTimer timer{GSD::Detail::TexStaging};
-        for (const ImageId image_id : pending) {
-            Image& image = slot_images[image_id];
+        for (size_t i = 0; i < pending.size(); ++i) {
+            Image& image = slot_images[pending[i]];
             Job job{.image = &image};
             if (!PrepareRefresh(image, job.copies)) {
+                ApplyProtection(deferred_protect[i]);
                 continue;
             }
-            const auto [buffer, offset] = buffer_cache.ObtainBufferForImage(
-                image.info.guest_address, image.info.guest_size, LeftOutBytes(image));
+            const u32 skip = UploadSkip(image, job.copies);
+            job.trim = TrimBytes(image, skip);
+            const auto [buffer, offset] =
+                buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size,
+                                                  skip, job.trim, std::move(deferred_protect[i]));
+            deferred_protect[i].clear();
             job.buffer = buffer;
             job.offset = offset;
             jobs.push_back(std::move(job));
@@ -1335,8 +1544,8 @@ void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
             GSD::DetailTimer timer{GSD::Detail::TexDetile};
             runtime.FlushBarriers();
             for (Job& job : jobs) {
-                const auto [buffer, offset] =
-                    tile_manager.DetileImage(job.buffer, job.offset, job.image->info, false);
+                const auto [buffer, offset] = tile_manager.DetileImage(
+                    job.buffer, job.offset, job.image->info, false, job.trim);
                 job.buffer = buffer;
                 for (auto& copy : job.copies) {
                     copy.bufferOffset += offset;
@@ -1356,6 +1565,7 @@ void TextureCache::UpdateImages(std::span<const ImageId> image_ids) {
             GSD::image_uploads.fetch_add(1, std::memory_order_relaxed);
             GSD::image_upload_bytes.fetch_add(job.image->info.guest_size,
                                               std::memory_order_relaxed);
+            GSD::NoteUploadPath(job.image->info.guest_size);
             NoteUpload(*job.image);
         }
     }
@@ -1442,7 +1652,19 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     });
 }
 
-void TextureCache::TrackImage(ImageId image_id) {
+bool TextureCache::ProtectOnHelperThread() {
+    return Common::BbTuning::Threaded() && EmulatorSettings.IsBbProtectHelperThread() &&
+           EmulatorSettings.IsBbBackgroundTextureCopies();
+}
+
+void TextureCache::ApplyProtection(ProtectRanges& ranges) {
+    for (const auto& [address, size] : ranges) {
+        tracker.ApplyProtection(address, size);
+    }
+    ranges.clear();
+}
+
+void TextureCache::TrackImage(ImageId image_id, ProtectRanges* deferred) {
     auto& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::Registered)) {
         return;
@@ -1455,14 +1677,15 @@ void TextureCache::TrackImage(ImageId image_id) {
 
     std::scoped_lock lk{image.mutex};
     if (image.IsUntracked()) {
-        tracker.UpdatePageWatchers(image_begin, image.info.guest_size, PageOp::Track);
+        tracker.UpdatePageWatchers(image_begin, image.info.guest_size, PageOp::Track, deferred);
     } else {
         if (image_begin < image.track_addr) {
-            tracker.UpdatePageWatchers(image_begin, image.track_addr - image_begin, PageOp::Track);
+            tracker.UpdatePageWatchers(image_begin, image.track_addr - image_begin, PageOp::Track,
+                                       deferred);
         }
         if (image.track_addr_end < image_end) {
             tracker.UpdatePageWatchers(image.track_addr_end, image_end - image.track_addr_end,
-                                       PageOp::Track);
+                                       PageOp::Track, deferred);
         }
     }
     image.track_addr = image_begin;
@@ -2631,11 +2854,60 @@ void TextureCache::RunGarbageCollector() {
     };
 
     RestoreFullQuality();
+    if (Common::GuestStats::texture_reload_requested.exchange(false, std::memory_order_relaxed))
+        [[unlikely]] {
+        ReloadTexturesFromGuest();
+    }
     LoadScreenCleanup();
     GarbageCollectImages();
     LogCleanupReport();
     LogVramBreakdown();
     GarbageCollectSamplers();
+}
+
+void TextureCache::ReloadTexturesFromGuest() {
+    u32 reloaded = 0, gpu_written = 0, pending = 0, pending_used = 0;
+    u64 reloaded_bytes = 0;
+    const u64 now = SteadyNowNs();
+    image_lru_cache.ForEachItemBelow(gc_tick + 1, [&](Image& image) {
+        if (False(image.flags & ImageFlagBits::Registered)) {
+            return false;
+        }
+        const ImageId image_id = slot_images.GetSlotId(image);
+        const bool used_recently =
+            gc_tick - std::atomic_ref<u64>(image.last_use_gc_tick).load(std::memory_order_relaxed) <
+            120;
+        if (image.detail_pending) {
+            ++pending;
+            pending_used += used_recently;
+            if (pending <= 32) {
+                LOG_INFO(Render_Vulkan,
+                         "Texture reload: {:#x} {}x{} {} ({} levels, {} KiB) still waits for its "
+                         "largest level after {} ms{}",
+                         image.info.guest_address, image.info.size.width, image.info.size.height,
+                         vk::to_string(image.info.pixel_format), image.info.resources.levels,
+                         image.info.guest_size / 1024,
+                         (now - image.detail_pending_since_ns) / 1'000'000,
+                         used_recently ? ", used in the last frames" : "");
+            }
+        }
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
+            ++gpu_written;
+            return false;
+        }
+        std::scoped_lock lk{image.mutex};
+        image.flags |= ImageFlagBits::CpuDirty;
+        ClearCleanTick(image);
+        UntrackImage(image_id);
+        ++reloaded;
+        reloaded_bytes += image.info.guest_size;
+        return false;
+    });
+    LOG_INFO(Render_Vulkan,
+             "Texture reload: {} textures ({} MiB) will be uploaded again from game memory as "
+             "they are used, {} written by the GPU kept | {} waiting for their largest level ({} "
+             "of them used in the last frames)",
+             reloaded, reloaded_bytes >> 20, gpu_written, pending, pending_used);
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {

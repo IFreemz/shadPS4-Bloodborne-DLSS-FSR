@@ -14,7 +14,9 @@
 #include "common/elf_info.h"
 #include "common/game_waits.h"
 #include "common/guest_stats.h"
+#include "common/hash.h"
 #include "common/scope_exit.h"
+#include "common/thread.h"
 #include "core/bb_resolution.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -22,6 +24,7 @@
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -33,6 +36,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -96,6 +100,15 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     }
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+        {
+            // The tick being submitted (already advanced past it).
+            const u64 tick = scheduler.CurrentTick() - 1;
+            auto& entry = submit_times[tick % submit_times.size()];
+            entry.ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                           std::memory_order_relaxed);
+            entry.tick.store(tick, std::memory_order_release);
+        }
+        occlusion_submit_pending.store(false, std::memory_order_relaxed);
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
@@ -124,6 +137,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             copy_thread = std::jthread([this](std::stop_token stop) { RunCopyThread(stop); });
         }
         draw_pipe = std::make_unique<DrawPipe>(&Rasterizer::RunDrawPacket, this);
+        draw_pipe->SetIdleHandler(&Rasterizer::OnDrawPipeIdle);
         state_sampler = std::jthread([this](std::stop_token stop) {
             Common::SetCurrentThreadName("shadPS4:StateSampler");
             while (!stop.stop_requested()) {
@@ -522,10 +536,14 @@ void Rasterizer::EliminateFastClear() {
     }
     auto& image = texture_cache.GetImage(image_id);
     const auto clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
+    if (BlurWatched(col_buf.Address())) {
+        LOG_INFO(Render_Vulkan, "[BB-BLUR] writer: fast clear of {:#x} carried out (cmask {:#x})",
+                 col_buf.Address(), col_buf.CmaskAddress());
+    }
 
     ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
                                  col_buf.CmaskAddress()));
-    runtime.ClearImage(&image, desc.view_info.range, clear_value);
+    ClearImageAs(image, desc.view_info.range, desc.view_info.format, clear_value);
     ScopeMarkerEnd();
 }
 
@@ -563,10 +581,33 @@ void Rasterizer::TemporalDlssDraw(const GraphicsPipeline* pipeline, bool indirec
     }
 }
 
+void Rasterizer::BetterAoAfterDraw(const GraphicsPipeline* pipeline) {
+    const auto* ps = pipeline->GetStages()[static_cast<u32>(Shader::SwStage::Fragment)];
+    if (!ps || !EmulatorSettings.IsBbVbao()) {
+        return;
+    }
+    // The G-buffer normals the game's SSAO reads: its pixel shader's texture 1. The temporal
+    // path's last pass (the upsample) reads others.
+    const VideoCore::ImageId texture1 =
+        ps->images.size() > 1 ? stage_texture1 : VideoCore::ImageId{};
+    if (ps->pgm_hash == BbVbao::SsaoShader) {
+        vbao->OnSsaoPass(texture1);
+        return;
+    }
+    if (!BbVbao::AoShader(ps->pgm_hash) ||
+        std::popcount(pipeline->GetGraphicsKey().mrt_mask) < 1) {
+        return;
+    }
+    vbao->OnAoPass(cb_descs[0].image_id,
+                   ps->pgm_hash == BbVbao::AoHalfShader ? texture1 : VideoCore::ImageId{},
+                   temporal_dlss.Requested());
+}
+
 // Fills color target 0 with a copy of another image of the same size and format, with the same
 // bookkeeping a draw into it gets.
 void Rasterizer::CopyInsteadOfDraw(const BbTemporalDlss::DrawReplacement& replacement) {
     auto& [target_id, desc] = cb_descs[0];
+    Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Target};
     texture_cache.UpdateImage(target_id);
     texture_cache.FindRenderTarget(target_id, desc);
     texture_cache.TouchMeta(Regs().color_buffers[0].CmaskAddress(), desc.view_info.range.base.layer,
@@ -770,6 +811,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             OcclusionRedirectEnd();
         }
     };
+    if (occlusion_a.open) {
+        // Diagnostics (one-frame hidden blips): the depth this box is drawn against.
+        const auto& regs = liverpool->regs;
+        occlusion_a.depth_address = regs.depth_buffer.DepthAddress();
+        occlusion_a.depth_extent = liverpool->last_db_extent.raw;
+        occlusion_a.depth_control = std::bit_cast<u32>(regs.depth_control);
+    }
 
     // Threaded renderer: stage A selects the pipeline and queues the rest of the draw. Draws
     // FilterDraw handles itself (fast clear elimination, resolve, depth copy, skips) run here.
@@ -818,6 +866,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     const u64 mirror_flushes = velocity_mirror.Flushes();
     mirror_rebind = false;
     occlusion_b.draws_seen += occlusion_b.open ? 1 : 0;
+    if (!occlusion_b.open && occlusion_submit_pending.load(std::memory_order_relaxed)) {
+        // The first draw after a group of tests: they go to the GPU now.
+        OcclusionEarlySubmit();
+    }
     if (DrawPipe::OnStageB()) {
         scheduler.PopPendingOperations();
         if (target_memo_enabled.load(std::memory_order_relaxed)) {
@@ -847,7 +899,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     }
     ProfileLap(Section::Dlss);
     Common::Crumbs::Add("draw: begin rendering");
-    const auto state = BeginRendering(pipeline);
+    auto state = BeginRendering(pipeline);
+    if (occlusion_b.open) {
+        UseTolerantOcclusionDepth(state);
+    } else if (occlusion_depth_built) {
+        // The group of tests is over: the next one gets a new copy.
+        occlusion_depth_built = false;
+    }
     ProfileLap(Section::BeginRendering);
 
     Common::Crumbs::Add("draw: vertex and index buffers");
@@ -900,10 +958,19 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     const auto draw = [&] { record_draw(scheduler.CommandBuffer()); };
     ReplayVelocityMirror(pipeline, state, is_indexed, [&] { scheduler.Record(record_draw); });
     RebindAfterMirror(pipeline, state, is_indexed, mirror_flushes);
+    if (occlusion_b.open) {
+        occlusion_b.depth_view = reinterpret_cast<u64>(
+            static_cast<VkImageView>(state.depth_stencil_attachment.image_view));
+        occlusion_b.render_size = u32(state.width) | u32(state.height) << 16;
+        occlusion_b.depth_clear = state.depth_stencil_attachment.depth_clear;
+    }
     const u32 query = occlusion_b.open ? OcclusionQueryBegin() : NoOcclusionQuery;
     scheduler.Record(record_draw);
     OcclusionQueryEnd(query);
     ReplayDisplayCopy(pipeline, state, draw);
+    if (vbao) {
+        BetterAoAfterDraw(pipeline);
+    }
     DebugState.IncDrawCall();
     draw_jitter = {};
     ProfileLap(Section::Record);
@@ -1075,12 +1142,48 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     Common::Crumbs::Add("dispatch (cs)", cs.pgm_hash);
+    // Diagnostics: a dispatch that held up the draw recorder over 2 ms (first 64): its shader,
+    // whether the HLE took it, and the buffers it binds.
+    const bool timed = diagnostics.load(std::memory_order_relaxed);
+    const auto dispatch_start =
+        timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto log_slow = [&](const char* how) {
+        static u32 logged = 0;
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - dispatch_start)
+                              .count();
+        if (ms < 2.0 || logged >= 64) {
+            return;
+        }
+        ++logged;
+        std::string buffers;
+        for (const auto& desc : cs.buffers) {
+            if (desc.IsSpecial()) {
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(cs);
+            buffers +=
+                fmt::format("{}{:#x} {} KiB{}", buffers.empty() ? "" : ", ", vsharp.base_address,
+                            vsharp.GetSize() >> 10, desc.is_written ? " written" : "");
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Slow dispatch: shader {:#x} took {:.1f} ms on the draw recorder ({}) | {}x{}x{} "
+                 "groups, {} images | buffers: {}",
+                 cs.pgm_hash, ms, how, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z,
+                 cs.images.size(), buffers.empty() ? std::string{"-"} : buffers);
+    };
     if (ExecuteShaderHLE(cs, Regs(), cs_program, *this)) {
+        if (timed) {
+            log_slow("done by the HLE");
+        }
         return;
     }
 
     if (!BindResources(pipeline)) {
         return;
+    }
+    if (timed) {
+        log_slow("binding its resources");
     }
 
     if (needs_barrier) {
@@ -1191,6 +1294,7 @@ void Rasterizer::Finish() {
 
 void Rasterizer::OnSubmit() {
     ++stat_frames;
+    occlusion_frame.fetch_add(1, std::memory_order_relaxed);
     DrainDrawPipe();
     // F1's Object motion vectors: the velocity draws are replayed only while an upscaler uses them.
     velocity_mirror.SetEnabled(temporal_dlss.ObjectMotionRequested());
@@ -1329,6 +1433,33 @@ void Rasterizer::LogVramReport() {
              "{} new textures shown black meanwhile ({} MiB)",
              images.spread_loads, images.spread_deferred, images.spread_zero_filled,
              mib(images.spread_zero_bytes));
+    {
+        namespace GS = Common::GuestStats;
+        const auto back = [](size_t i) {
+            return GS::evicted_returned_bytes[i].load(std::memory_order_relaxed) >> 20;
+        };
+        const u64 evicted = GS::evicted_bytes_total.load(std::memory_order_relaxed);
+        if (evicted != 0) {
+            LOG_INFO(Render,
+                     "Buffer eviction: {} MiB evicted so far; made resident again after under 10 "
+                     "s {} MiB, 10-60 s {} MiB, 1-5 min {} MiB, later {} MiB",
+                     mib(evicted), back(0), back(1), back(2), back(3));
+        }
+    }
+    if (EmulatorSettings.IsBbLowerDetailFirst()) {
+        namespace GS = Common::GuestStats;
+        const u64 restored = GS::detail_restored.load(std::memory_order_relaxed);
+        const u64 soft_ns = GS::detail_soft_ns.load(std::memory_order_relaxed);
+        LOG_INFO(Render,
+                 "Lower detail first: {} new textures sampled softer at first ({} MiB of largest "
+                 "levels put off), {} got their largest level later ({} at once for another "
+                 "use), softer for {:.0f} ms on average, longest {:.0f} ms",
+                 GS::detail_deferred.load(std::memory_order_relaxed),
+                 mib(GS::detail_deferred_bytes.load(std::memory_order_relaxed)), restored,
+                 GS::detail_forced.load(std::memory_order_relaxed),
+                 restored ? soft_ns / 1e6 / static_cast<double>(restored) : 0.0,
+                 GS::detail_soft_max_ns.load(std::memory_order_relaxed) / 1e6);
+    }
 }
 
 void Rasterizer::ReportHitch() {
@@ -1379,6 +1510,70 @@ void Rasterizer::ReportHitch() {
     now.alloc_ns = GS::image_alloc_ns.load(std::memory_order_relaxed);
     now.slow_allocs = GS::image_slow_allocs.load(std::memory_order_relaxed);
     now.slow_alloc_ns = GS::image_slow_alloc_ns.load(std::memory_order_relaxed);
+    now.detail_deferred = GS::detail_deferred.load(std::memory_order_relaxed);
+    now.detail_deferred_bytes = GS::detail_deferred_bytes.load(std::memory_order_relaxed);
+    now.detail_restored = GS::detail_restored.load(std::memory_order_relaxed);
+    now.detail_restored_bytes = GS::detail_restored_bytes.load(std::memory_order_relaxed);
+    now.detail_forced = GS::detail_forced.load(std::memory_order_relaxed);
+    now.cmd_protect_calls = GS::cmd_protect_calls.load(std::memory_order_relaxed);
+    now.cmd_protect_ns = GS::cmd_protect_ns.load(std::memory_order_relaxed);
+    now.cmd_resident_ns = GS::cmd_resident_ns.load(std::memory_order_relaxed);
+    now.cmd_buffer_upload_bytes = GS::cmd_buffer_upload_bytes.load(std::memory_order_relaxed);
+    now.cmd_buffer_upload_ns = GS::cmd_buffer_upload_ns.load(std::memory_order_relaxed);
+    now.a_hitch_draws = a_hitch_draws.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < now.protect_ns_by.size(); ++i) {
+        now.protect_ns_by[i] = GS::recorder_protect_ns_by[i].load(std::memory_order_relaxed);
+        now.protect_calls_by[i] = GS::recorder_protect_calls_by[i].load(std::memory_order_relaxed);
+    }
+    now.stream_copies = GS::stream_copies.load(std::memory_order_relaxed);
+    now.stream_copy_bytes = GS::stream_copy_bytes.load(std::memory_order_relaxed);
+    now.buffer_syncs = GS::buffer_syncs.load(std::memory_order_relaxed);
+    now.buffer_sync_ranges = GS::buffer_sync_ranges.load(std::memory_order_relaxed);
+    now.buffer_sync_inline_bytes = GS::buffer_sync_inline_bytes.load(std::memory_order_relaxed);
+    now.buffer_mem_allocs = GS::buffer_mem_allocs.load(std::memory_order_relaxed);
+    now.buffer_mem_alloc_ns = GS::buffer_mem_alloc_ns.load(std::memory_order_relaxed);
+    now.ce_dumps = GS::ce_dumps.load(std::memory_order_relaxed);
+    now.ce_dump_drains = GS::ce_dump_drains.load(std::memory_order_relaxed);
+    now.ce_dump_drain_ns = GS::ce_dump_drain_ns.load(std::memory_order_relaxed);
+    now.ce_dump_write_ns = GS::ce_dump_write_ns.load(std::memory_order_relaxed);
+    now.ce_outside_ns = GS::ce_outside_ns.load(std::memory_order_relaxed);
+    now.ce_wait_reads = GS::ce_wait_reads.load(std::memory_order_relaxed);
+    now.ce_wait_writes = GS::ce_wait_writes.load(std::memory_order_relaxed);
+    now.ce_wait_overflow = GS::ce_wait_overflow.load(std::memory_order_relaxed);
+    now.ce_huge_write_skips = GS::ce_huge_write_skips.load(std::memory_order_relaxed);
+    now.flips = GS::flips.load(std::memory_order_relaxed);
+    now.flip_drain_ns = GS::flip_drain_ns.load(std::memory_order_relaxed);
+    now.flip_signal_ns = GS::flip_signal_ns.load(std::memory_order_relaxed);
+    now.evicted_refills = GS::evicted_refills.load(std::memory_order_relaxed);
+    now.evicted_refill_bytes = GS::evicted_refill_bytes.load(std::memory_order_relaxed);
+    now.helper_protect_calls = GS::helper_protect_calls.load(std::memory_order_relaxed);
+    now.helper_protect_ns = GS::helper_protect_ns.load(std::memory_order_relaxed);
+    now.evicted_bytes_total = GS::evicted_bytes_total.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < now.evicted_returned.size(); ++i) {
+        now.evicted_returned[i] = GS::evicted_returned_bytes[i].load(std::memory_order_relaxed);
+    }
+    now.cmd_drain_ns = GS::cmd_drain_ns.load(std::memory_order_relaxed);
+    now.cmd_compute_ns = GS::cmd_compute_ns.load(std::memory_order_relaxed);
+    now.cmd_compute_packets = GS::cmd_compute_packets.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < now.cmd_opcode_ns.size(); ++i) {
+        now.cmd_opcode_ns[i] = GS::cmd_opcode_ns[i].load(std::memory_order_relaxed);
+        now.cmd_opcode_count[i] = GS::cmd_opcode_count[i].load(std::memory_order_relaxed);
+    }
+    static_assert(std::tuple_size_v<decltype(now.a_hitch_ns)> == ASectionNames.size());
+    for (size_t i = 0; i < now.a_hitch_ns.size(); ++i) {
+        now.a_hitch_ns[i] = a_hitch_ns[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < now.upload_paths.size(); ++i) {
+        now.upload_paths[i] = GS::upload_path_bytes[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < now.upload_packets.size(); ++i) {
+        now.upload_packets[i] = GS::upload_packet_bytes[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < now.new_storage.size(); ++i) {
+        now.new_storage[i] = GS::new_storage_bytes[i].load(std::memory_order_relaxed);
+    }
+    now.new_storage_zero = GS::new_storage_zero_bytes.load(std::memory_order_relaxed);
+    now.new_storage_cleared = GS::new_storage_cleared_bytes.load(std::memory_order_relaxed);
     for (size_t i = 0; i < now.upload_ages.size(); ++i) {
         now.upload_ages[i] = GS::upload_age_bytes[i].load(std::memory_order_relaxed);
     }
@@ -1536,6 +1731,53 @@ void Rasterizer::ReportHitch() {
                         "under 1 / 1-2 / 2-6 / 6-30 / 30+ frames): {}",
                         by_source);
         }
+        {
+            const auto mib_of = [](u64 bytes) { return bytes / 1048576.0; };
+            const auto path = [&](GS::UploadPath which) {
+                const auto i = static_cast<size_t>(which);
+                return mib_of(delta(now.upload_paths[i], last.upload_paths[i]));
+            };
+            const auto packet = [&](size_t i) {
+                return mib_of(delta(now.upload_packets[i], last.upload_packets[i]));
+            };
+            LOG_WARNING(Render_Vulkan,
+                        "Stutter uploads by path (MiB): textures drawn or dispatched with "
+                        "{:.1f}, storage images {:.1f}, render and depth targets {:.1f}, merged "
+                        "images {:.1f}, the displayed frame {:.1f}, other {:.1f} | by draw "
+                        "recorder packet: draws {:.1f}, indirect draws {:.1f}, dispatches {:.1f}, "
+                        "indirect dispatches {:.1f}, queued jobs (DMA and the like) {:.1f}, not on "
+                        "the draw recorder {:.1f}",
+                        path(GS::UploadPath::Texture), path(GS::UploadPath::Storage),
+                        path(GS::UploadPath::Target), path(GS::UploadPath::Overlap),
+                        path(GS::UploadPath::Display), path(GS::UploadPath::Other), packet(0),
+                        packet(1), packet(2), packet(3), packet(4), packet(5));
+        }
+        {
+            const auto use = [&](GS::NewStorageUse which) {
+                const auto i = static_cast<size_t>(which);
+                return delta(now.new_storage[i], last.new_storage[i]) / 1048576.0;
+            };
+            LOG_WARNING(Render_Vulkan,
+                        "Stutter new images written by shaders (MiB uploaded before the write): "
+                        "only written, whole image, enough threads {:.1f} | also read {:.1f} | "
+                        "only part bound {:.1f} | coverage unclear {:.1f} | of them guest memory "
+                        "looked all zero {:.1f} | cleared on the GPU instead {:.1f}",
+                        use(GS::NewStorageUse::Whole), use(GS::NewStorageUse::AlsoRead),
+                        use(GS::NewStorageUse::Part), use(GS::NewStorageUse::Unclear),
+                        delta(now.new_storage_zero, last.new_storage_zero) / 1048576.0,
+                        delta(now.new_storage_cleared, last.new_storage_cleared) / 1048576.0);
+        }
+        if (EmulatorSettings.IsBbLowerDetailFirst()) {
+            LOG_WARNING(Render_Vulkan,
+                        "Stutter lower detail first: {} new textures sampled softer for now "
+                        "({:.1f} MiB of largest levels put off) | {} got their largest level "
+                        "({:.1f} MiB uploaded), {} of them at once for another use",
+                        delta(now.detail_deferred, last.detail_deferred),
+                        delta(now.detail_deferred_bytes, last.detail_deferred_bytes) / 1048576.0,
+                        delta(now.detail_restored, last.detail_restored),
+                        delta(now.detail_restored_bytes, last.detail_restored_bytes) / 1048576.0,
+                        delta(now.detail_forced, last.detail_forced));
+        }
         const auto heaps = instance.GetMemoryHeapReport();
         const auto& cleanup_now = now.cleanup;
         const auto& cleanup_last = last.cleanup;
@@ -1603,6 +1845,98 @@ void Rasterizer::ReportHitch() {
                         "draws by section: {}",
                         by_kind.empty() ? "-" : by_kind, std::max(0.0, busy_ms - packets_ms),
                         by_section.empty() ? "-" : by_section);
+            {
+                // GPU command thread: the packet types it spent most time on, its draw sections
+                // and the work it did itself.
+                std::array<std::pair<u64, size_t>, 256> by_opcode{};
+                for (size_t i = 0; i < by_opcode.size(); ++i) {
+                    by_opcode[i] = {delta(now.cmd_opcode_ns[i], last.cmd_opcode_ns[i]), i};
+                }
+                std::ranges::sort(by_opcode, std::greater<>{});
+                std::string opcodes;
+                for (size_t i = 0; i < 6 && by_opcode[i].first >= 100'000; ++i) {
+                    const size_t op = by_opcode[i].second;
+                    const auto name = [&]() -> std::string_view {
+                        // magic_enum names values up to 127 only.
+                        switch (static_cast<AmdGpu::PM4ItOpcode>(op)) {
+                        case AmdGpu::PM4ItOpcode::LoadConstRam:
+                            return "LoadConstRam";
+                        case AmdGpu::PM4ItOpcode::WriteConstRam:
+                            return "WriteConstRam";
+                        case AmdGpu::PM4ItOpcode::DumpConstRam:
+                            return "DumpConstRam";
+                        case AmdGpu::PM4ItOpcode::IncrementCeCounter:
+                            return "IncrementCeCounter";
+                        case AmdGpu::PM4ItOpcode::IncrementDeCounter:
+                            return "IncrementDeCounter";
+                        case AmdGpu::PM4ItOpcode::WaitOnCeCounter:
+                            return "WaitOnCeCounter (constant engine, waits for the draw recorder "
+                                   "when it dumps constants)";
+                        case AmdGpu::PM4ItOpcode::WaitOnDeCounterDiff:
+                            return "WaitOnDeCounterDiff";
+                        case AmdGpu::PM4ItOpcode::GetLodStats:
+                            return "GetLodStats";
+                        case AmdGpu::PM4ItOpcode::DrawIndirectCountMulti:
+                            return "DrawIndirectCountMulti";
+                        case AmdGpu::PM4ItOpcode::DrawIndexIndirectCountMulti:
+                            return "DrawIndexIndirectCountMulti";
+                        default:
+                            return magic_enum::enum_name(static_cast<AmdGpu::PM4ItOpcode>(op));
+                        }
+                    }();
+                    opcodes +=
+                        fmt::format("{}{} {:.1f} ({})", opcodes.empty() ? "" : ", ",
+                                    name.empty() ? fmt::format("{:#x}", op) : std::string{name},
+                                    ms_of(by_opcode[i].first),
+                                    delta(now.cmd_opcode_count[op], last.cmd_opcode_count[op]));
+                }
+                std::string sections;
+                for (size_t i = 1; i < now.a_hitch_ns.size(); ++i) {
+                    sections += fmt::format(
+                        "{}{} {:.1f}", sections.empty() ? "" : ", ", ASectionNames[i],
+                        static_cast<double>(now.a_hitch_ns[i] - last.a_hitch_ns[i]) / 1e6);
+                }
+                LOG_WARNING(
+                    Render_Vulkan,
+                    "Stutter detail: GPU command thread by packet type (ms, count; waits for the "
+                    "game included): {} | compute queues {:.1f} ms ({} packets) | waits for the "
+                    "draw "
+                    "recorder before packets {:.1f} ms | constant engine: {} dumps, {} of them "
+                    "waiting for the draw recorder {:.1f} ms, writing {:.1f} ms, run at submission "
+                    "start/end {:.1f} ms; dumps that had to wait because queued draws read the "
+                    "memory "
+                    "later {}, queued work writes it {}, too many queued reads {}; written at once "
+                    "past "
+                    "huge shader writes {} | flips {}: waiting for the draw recorder {:.1f} ms, "
+                    "flip "
+                    "handling {:.1f} ms | {} draws "
+                    "queued: {} ms | on this thread: "
+                    "page "
+                    "protection {} calls {:.1f} ms, buffers made resident {:.1f} ms, buffer "
+                    "uploads {:.1f} MiB {:.1f} ms",
+                    opcodes.empty() ? "-" : opcodes,
+                    ms_of(delta(now.cmd_compute_ns, last.cmd_compute_ns)),
+                    delta(now.cmd_compute_packets, last.cmd_compute_packets),
+                    ms_of(delta(now.cmd_drain_ns, last.cmd_drain_ns)),
+                    delta(now.ce_dumps, last.ce_dumps),
+                    delta(now.ce_dump_drains, last.ce_dump_drains),
+                    ms_of(delta(now.ce_dump_drain_ns, last.ce_dump_drain_ns)),
+                    ms_of(delta(now.ce_dump_write_ns, last.ce_dump_write_ns)),
+                    ms_of(delta(now.ce_outside_ns, last.ce_outside_ns)),
+                    delta(now.ce_wait_reads, last.ce_wait_reads),
+                    delta(now.ce_wait_writes, last.ce_wait_writes),
+                    delta(now.ce_wait_overflow, last.ce_wait_overflow),
+                    delta(now.ce_huge_write_skips, last.ce_huge_write_skips),
+                    delta(now.flips, last.flips),
+                    ms_of(delta(now.flip_drain_ns, last.flip_drain_ns)),
+                    ms_of(delta(now.flip_signal_ns, last.flip_signal_ns)),
+                    delta(now.a_hitch_draws, last.a_hitch_draws), sections,
+                    delta(now.cmd_protect_calls, last.cmd_protect_calls),
+                    ms_of(delta(now.cmd_protect_ns, last.cmd_protect_ns)),
+                    ms_of(delta(now.cmd_resident_ns, last.cmd_resident_ns)),
+                    delta(now.cmd_buffer_upload_bytes, last.cmd_buffer_upload_bytes) / 1048576.0,
+                    ms_of(delta(now.cmd_buffer_upload_ns, last.cmd_buffer_upload_ns)));
+            }
             const auto detail = [&](GS::Detail which) {
                 const auto i = static_cast<size_t>(which);
                 return ms_of(delta(now.details[i], last.details[i]));
@@ -1623,6 +1957,41 @@ void Rasterizer::ReportHitch() {
                 detail(GS::Detail::BufCopy),
                 delta(now.recorder_protect_calls, last.recorder_protect_calls),
                 detail(GS::Detail::RecorderProtect));
+            const auto protect_by = [&](size_t i) {
+                return fmt::format("{} calls {:.1f} ms",
+                                   delta(now.protect_calls_by[i], last.protect_calls_by[i]),
+                                   ms_of(delta(now.protect_ns_by[i], last.protect_ns_by[i])));
+            };
+            constexpr auto by = [](GS::Detail which) { return static_cast<size_t>(which); };
+            LOG_WARNING(
+                Render_Vulkan,
+                "Stutter detail: buffers: {} small read-only copies ({:.1f} MiB, {:.1f} ms) | "
+                "arena lookups {:.1f} ms | made resident {:.1f} ms (memory asked from the driver: "
+                "{} "
+                "blocks, {:.1f} ms; evicted data uploaded again as it was {} times, {:.1f} MiB) | "
+                "{} "
+                "buffers with data to "
+                "upload in {} ranges ({:.1f} MiB copied right away, the rest on the copy "
+                "threads) | page protection on the draw recorder by step: new textures {}, "
+                "buffer uploads {}, elsewhere {} | on the protection helper thread {} calls {:.1f} "
+                "ms | evicted data back within 10 s {:.1f} MiB, 10-60 s {:.1f} MiB",
+                delta(now.stream_copies, last.stream_copies),
+                delta(now.stream_copy_bytes, last.stream_copy_bytes) / 1048576.0,
+                detail(GS::Detail::BufStream), detail(GS::Detail::BufArena),
+                detail(GS::Detail::BufResident),
+                delta(now.buffer_mem_allocs, last.buffer_mem_allocs),
+                ms_of(delta(now.buffer_mem_alloc_ns, last.buffer_mem_alloc_ns)),
+                delta(now.evicted_refills, last.evicted_refills),
+                delta(now.evicted_refill_bytes, last.evicted_refill_bytes) / 1048576.0,
+                delta(now.buffer_syncs, last.buffer_syncs),
+                delta(now.buffer_sync_ranges, last.buffer_sync_ranges),
+                delta(now.buffer_sync_inline_bytes, last.buffer_sync_inline_bytes) / 1048576.0,
+                protect_by(by(GS::Detail::TexTrack)), protect_by(by(GS::Detail::BufTrack)),
+                protect_by(by(GS::Detail::Count)),
+                delta(now.helper_protect_calls, last.helper_protect_calls),
+                ms_of(delta(now.helper_protect_ns, last.helper_protect_ns)),
+                delta(now.evicted_returned[0], last.evicted_returned[0]) / 1048576.0,
+                delta(now.evicted_returned[1], last.evicted_returned[1]) / 1048576.0);
         }
     } else if (ms < 200.0) {
         // Usual frame time, stutters (and long pauses such as loading) left out.
@@ -1671,10 +2040,33 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // they keep the detail of the output resolution (NVIDIA's DLSS programming guide). Shadows,
     // post-processing and UI keep the game's.
     scene_lod_bias = 0.0f;
+    bool gbuffer_draw = false;
     if (!pipeline->IsCompute() &&
         std::popcount(static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().mrt_mask &
                       0xffu) >= 5) {
         scene_lod_bias = BbSceneMipBias();
+        gbuffer_draw = true;
+    }
+    // Better AO: the G-buffer pass holds the scene's depth, and its constants the main camera
+    // (shadow passes bind the same constants with the light's camera).
+    if (EmulatorSettings.IsBbVbao() && !vbao) {
+        vbao = std::make_unique<BbVbao>(instance, scheduler, runtime, texture_cache);
+    }
+    if (vbao) {
+        if (gbuffer_draw && EmulatorSettings.IsBbVbao()) {
+            const auto& vp = Regs().viewports[0];
+            vbao->OnGBufferDraw(db_desc.image_id, vp.xscale < 0.0f ? -1.0f : 1.0f,
+                                vp.yscale < 0.0f ? -1.0f : 1.0f);
+        } else {
+            vbao->OnOtherDraw();
+        }
+    }
+
+    if (!blur_readbacks.empty()) [[unlikely]] {
+        ReadBackBlurTextures();
+    }
+    if (blur_watch_left != 0) [[unlikely]] {
+        LogBlurWatchWriters(pipeline);
     }
 
     // Bind resource buffers and textures.
@@ -1706,7 +2098,574 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
     ProfileLap(Section::Buffers);
 
+    if (Common::GuestStats::blur_dump_requested.load(std::memory_order_relaxed) ||
+        blur_dump_left != 0) [[unlikely]] {
+        DumpBlurInputs(pipeline);
+    }
     return true;
+}
+
+void Rasterizer::LogBlurWatchWriters(const Pipeline* pipeline) {
+    if (--blur_watch_left == 0) {
+        LOG_INFO(Render_Vulkan, "[BB-BLUR] writer watch over");
+        blur_watch.clear();
+        blur_watch_image = {};
+        blur_writer_checks_left = 0;
+        return;
+    }
+    const auto stage_hashes = [&] {
+        std::string out;
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage) {
+                out += fmt::format("{}{} {:#x}", out.empty() ? "" : ", ",
+                                   magic_enum::enum_name(stage->sw_stage), stage->pgm_hash);
+            }
+        }
+        return out;
+    };
+    const auto check_after = [&](VAddr address) {
+        if (blur_writer_checks_left == 0 || !blur_watch_image) {
+            return;
+        }
+        --blur_writer_checks_left;
+        std::string buffers;
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage) {
+                buffers += fmt::format(" | {} {:#x}: {}", magic_enum::enum_name(stage->sw_stage),
+                                       stage->pgm_hash, DescribeBufferNans(*stage));
+            }
+        }
+        if (!pipeline->IsCompute()) {
+            const auto& graphics = *static_cast<const GraphicsPipeline*>(pipeline);
+            buffers += fmt::format(" | vertex attributes: {} | character motion attachment {}",
+                                   DescribeVertexNans(graphics),
+                                   bool(graphics.GetGraphicsKey().motion_slot));
+        }
+        LOG_INFO(Render_Vulkan, "[BB-BLUR] writer inputs of {:#x}{}", address, buffers);
+        if (blur_writer_input_dumps_left != 0) {
+            --blur_writer_input_dumps_left;
+            // The textures it reads, as sampled and as cached (read back before the next draw).
+            for (const auto* stage : pipeline->GetStages()) {
+                for (u32 i = 0; stage && i < stage->images.size(); ++i) {
+                    if (stage->images[i].is_written) {
+                        continue;
+                    }
+                    const auto tsharp = stage->images[i].GetSharp(*stage);
+                    std::string cached;
+                    texture_cache.ForEachImageInRegion(
+                        tsharp.Address(), 1, [&](VideoCore::ImageId id, auto& image) {
+                            cached += fmt::format(
+                                "{}{:#x} {}x{} {}{}", cached.empty() ? "" : ", ",
+                                image.info.guest_address, image.info.size.width,
+                                image.info.size.height, vk::to_string(image.info.pixel_format),
+                                True(image.flags & VideoCore::ImageFlagBits::GpuModified)
+                                    ? " GPU-written"
+                                    : "");
+                            if (std::ranges::find(blur_readbacks, id, &BlurReadback::id) ==
+                                blur_readbacks.end()) {
+                                blur_readbacks.push_back({id, image.image_uid, {}, false});
+                            }
+                        });
+                    LOG_INFO(Render_Vulkan,
+                             "[BB-BLUR]   it reads ({} {:#x}) texture {}: {:#x} {}x{} as {} {} | "
+                             "cached as: {}",
+                             magic_enum::enum_name(stage->sw_stage), stage->pgm_hash, i,
+                             tsharp.Address(), tsharp.width + 1, tsharp.height + 1,
+                             magic_enum::enum_name(tsharp.GetDataFmt()),
+                             magic_enum::enum_name(tsharp.GetNumberFmt()),
+                             cached.empty() ? std::string{"nothing"} : cached);
+                }
+            }
+        }
+        blur_readbacks.push_back({blur_watch_image, blur_watch_uid, stage_hashes(), false});
+    };
+    if (!pipeline->IsCompute()) {
+        const auto& regs = Regs();
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            const auto& col_buf = regs.color_buffers[cb];
+            if (!col_buf || !regs.color_target_mask.GetMask(cb) ||
+                !BlurWatched(col_buf.Address())) {
+                continue;
+            }
+            check_after(col_buf.Address());
+            LOG_INFO(Render_Vulkan,
+                     "[BB-BLUR] writer: draw into {:#x} (target {}, format {} {}) by {} | fast "
+                     "clear {}, cmask {:#x}{} | blend {}",
+                     col_buf.Address(), cb, magic_enum::enum_name(col_buf.GetDataFmt()),
+                     magic_enum::enum_name(col_buf.GetNumberFmt()), stage_hashes(),
+                     bool(col_buf.info.fast_clear), col_buf.CmaskAddress(),
+                     col_buf.info.fast_clear && col_buf.CmaskAddress() &&
+                             texture_cache.IsMetaCleared(col_buf.CmaskAddress(),
+                                                         col_buf.view.slice_start)
+                         ? " (fast-cleared, clear pending)"
+                         : "",
+                     bool(regs.blend_control[cb].enable));
+        }
+        return;
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& image : stage->images) {
+            if (image.is_written && BlurWatched(image.GetSharp(*stage).Address())) {
+                LOG_INFO(Render_Vulkan, "[BB-BLUR] writer: dispatch storage write to {:#x} by {}",
+                         image.GetSharp(*stage).Address(), stage_hashes());
+                check_after(image.GetSharp(*stage).Address());
+            }
+        }
+    }
+}
+
+std::string Rasterizer::DescribeBufferNans(const Shader::Info& stage) {
+    std::string out;
+    u32 clean = 0;
+    for (u32 i = 0; i < stage.buffers.size(); ++i) {
+        const auto& desc = stage.buffers[i];
+        if (desc.IsSpecial()) {
+            continue;
+        }
+        const auto vsharp = desc.GetSharp(stage);
+        const VAddr address = vsharp.base_address;
+        const u64 bytes = std::min<u64>(vsharp.GetSize(), 4_MB) & ~3ull;
+        const bool gpu_written =
+            address && bytes && buffer_cache.IsRegionGpuModified(address, vsharp.GetSize());
+        // GPU-written: the GPU's copy (the guest copy may be older); else guest memory.
+        std::span<const u8> data;
+        if (gpu_written) {
+            data = ReadBackBuffer(address, std::min<u64>(bytes, 256_KB));
+        } else if (address && bytes && memory->IsReadableMapping(address, bytes)) {
+            data = {std::bit_cast<const u8*>(address), bytes};
+        }
+        if (data.empty()) {
+            out += fmt::format("{}b{} {:#x} not readable", out.empty() ? "" : ", ", i, address);
+            continue;
+        }
+        u64 nans = 0, infs = 0, first_bad = ~0ull;
+        for (u64 offset = 0; offset + 4 <= data.size(); offset += 4) {
+            float value;
+            std::memcpy(&value, data.data() + offset, sizeof(value));
+            if (!std::isfinite(value)) {
+                (std::isnan(value) ? nans : infs) += 1;
+                first_bad = std::min(first_bad, offset);
+            }
+        }
+        if (nans + infs == 0 && !gpu_written) {
+            ++clean;
+            continue;
+        }
+        out += fmt::format("{}b{} {:#x} {} bytes{}{}", out.empty() ? "" : ", ", i, address,
+                           vsharp.GetSize(), desc.is_written ? " written" : "",
+                           gpu_written ? " GPU-written (GPU copy read back)" : "");
+        if (nans + infs != 0) {
+            // The 16 floats from the 64 bytes holding the first bad one (a matrix).
+            const u64 row = first_bad & ~63ull;
+            std::string floats;
+            for (u64 offset = row; offset < std::min<u64>(row + 64, data.size()); offset += 4) {
+                float value;
+                std::memcpy(&value, data.data() + offset, sizeof(value));
+                u32 raw;
+                std::memcpy(&raw, &value, sizeof(raw));
+                floats += std::isfinite(value) ? fmt::format(" {:.4g}", value)
+                                               : fmt::format(" 0x{:08x}", raw);
+            }
+            out += fmt::format(": {} NaN, {} infinite, first at +{:#x} [+{:#x}:{}]", nans, infs,
+                               first_bad, row, floats);
+        } else {
+            out += ": finite";
+        }
+    }
+    out += fmt::format("{}{} buffers with only finite floats", out.empty() ? "" : ", ", clean);
+    return out;
+}
+
+std::string Rasterizer::DescribeVertexNans(const GraphicsPipeline& pipeline) {
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    VertexInputs<AmdGpu::Buffer> guest_buffers;
+    pipeline.GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                             Regs().vgt_instance_step_rate_0, Regs().vgt_instance_step_rate_1);
+    std::string out;
+    u32 other = 0;
+    for (u32 i = 0; i < guest_buffers.size(); ++i) {
+        const auto& buffer = guest_buffers[i];
+        const auto format = attributes[i].format;
+        u32 components = 0, component_bytes = 4;
+        switch (format) {
+        case vk::Format::eR32Sfloat:
+            components = 1;
+            break;
+        case vk::Format::eR32G32Sfloat:
+            components = 2;
+            break;
+        case vk::Format::eR32G32B32Sfloat:
+            components = 3;
+            break;
+        case vk::Format::eR32G32B32A32Sfloat:
+            components = 4;
+            break;
+        case vk::Format::eR16G16Sfloat:
+            components = 2;
+            component_bytes = 2;
+            break;
+        case vk::Format::eR16G16B16A16Sfloat:
+            components = 4;
+            component_bytes = 2;
+            break;
+        default:
+            break;
+        }
+        const VAddr address = buffer.base_address;
+        const u64 size = std::min<u64>(buffer.GetSize(), 1_MB);
+        const u32 stride = buffer.GetStride();
+        if (components == 0 || address == 0 || size == 0 || stride == 0) {
+            ++other;
+            continue;
+        }
+        const bool gpu_written = buffer_cache.IsRegionGpuModified(address, size);
+        std::span<const u8> data;
+        if (gpu_written) {
+            data = ReadBackBuffer(address, size);
+        } else if (memory->IsReadableMapping(address, size)) {
+            data = {std::bit_cast<const u8*>(address), size};
+        }
+        if (data.empty()) {
+            out += fmt::format("{}a{} {:#x} not readable", out.empty() ? "" : ", ", i, address);
+            continue;
+        }
+        u64 bad = 0, first_bad = ~0ull, elements = 0;
+        const u32 element_bytes = components * component_bytes;
+        for (u64 at = 0; at + element_bytes <= data.size(); at += stride, ++elements) {
+            for (u32 c = 0; c < components; ++c) {
+                bool finite;
+                if (component_bytes == 4) {
+                    float value;
+                    std::memcpy(&value, data.data() + at + c * 4, 4);
+                    finite = std::isfinite(value);
+                } else {
+                    u16 half;
+                    std::memcpy(&half, data.data() + at + c * 2, 2);
+                    finite = ((half >> 10) & 0x1f) != 0x1f;
+                }
+                if (!finite) {
+                    ++bad;
+                    first_bad = std::min(first_bad, elements);
+                }
+            }
+        }
+        out += fmt::format("{}a{} {} {:#x}{}: ", out.empty() ? "" : ", ", i, vk::to_string(format),
+                           address, gpu_written ? " GPU-written" : "");
+        out += bad == 0 ? fmt::format("{} finite", elements)
+                        : fmt::format("{} NaN/inf of {} (first in element {})", bad, elements,
+                                      first_bad);
+    }
+    out += fmt::format("{}{} non-float", out.empty() ? "" : ", ", other);
+    return out;
+}
+
+std::span<const u8> Rasterizer::ReadBackBuffer(VAddr address, u64 size) {
+    const auto [buffer, offset] = buffer_cache.ObtainBuffer(address, static_cast<u32>(size), false);
+    if (!buffer) {
+        return {};
+    }
+    if (!blur_buffer_readback || blur_buffer_readback->SizeBytes() < size) {
+        blur_buffer_readback = std::make_unique<VideoCore::Buffer>(
+            instance, 0, std::max<u64>(size, 1_MB), VideoCore::MemoryType::HostCached,
+            "BlurBufferReadback");
+    }
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::MemoryBarrier2 to_copy = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    };
+    cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_copy});
+    const vk::BufferCopy copy{.srcOffset = offset, .dstOffset = 0, .size = size};
+    cmdbuf.copyBuffer(buffer->Handle(), blur_buffer_readback->Handle(), copy);
+    const vk::MemoryBarrier2 to_host = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+    scheduler.Finish();
+    blur_buffer_readback->Invalidate(0, size);
+    return {blur_buffer_readback->mapped_data.data(), size};
+}
+
+void Rasterizer::ReadBackBlurTextures() {
+    auto readbacks = std::move(blur_readbacks);
+    blur_readbacks.clear();
+    for (const auto& [image_id, uid, after_writer, read_as_bytes] : readbacks) {
+        if (!texture_cache.IsImageAllocated(image_id)) {
+            continue;
+        }
+        auto& image = texture_cache.GetImage(image_id);
+        const auto& info = image.info;
+        if (image.image_uid != uid || info.num_samples > 1 || info.props.is_block ||
+            info.props.is_depth || info.num_bits == 0) {
+            continue;
+        }
+        const u32 width = std::max(info.size.width >> image.dropped_levels, 1u);
+        const u32 height = std::max(info.size.height >> image.dropped_levels, 1u);
+        const u32 texel_bytes = info.num_bits / 8;
+        const u64 bytes = u64(width) * height * texel_bytes;
+        if (!blur_readback_buffer || blur_readback_buffer->SizeBytes() < bytes) {
+            blur_readback_buffer = std::make_unique<VideoCore::Buffer>(
+                instance, 0, std::max<u64>(bytes, 16_MB), VideoCore::MemoryType::HostCached,
+                "BlurReadback");
+        }
+        const vk::BufferImageCopy copy{
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {width, height, 1},
+        };
+        runtime.DownloadImage(&image, blur_readback_buffer.get(), std::span{&copy, 1});
+        scheduler.Finish();
+        blur_readback_buffer->Invalidate(0, bytes);
+        const u8* data = blur_readback_buffer->mapped_data.data();
+        // Components as floats (16- or 32-bit float formats), else as unsigned bytes.
+        const auto format = info.pixel_format;
+        const bool half = format == vk::Format::eR16G16B16A16Sfloat ||
+                          format == vk::Format::eR16G16Sfloat || format == vk::Format::eR16Sfloat;
+        const bool single = format == vk::Format::eR32G32B32A32Sfloat ||
+                            format == vk::Format::eR32G32Sfloat || format == vk::Format::eR32Sfloat;
+        u64 nans = 0, infs = 0, count = 0;
+        double sum = 0.0, max = 0.0;
+        if (half) {
+            for (u64 i = 0; i + 2 <= bytes; i += 2) {
+                u16 h;
+                std::memcpy(&h, data + i, 2);
+                const u32 exponent = (h >> 10) & 0x1f;
+                const u32 mantissa = h & 0x3ff;
+                if (exponent == 0x1f) {
+                    (mantissa ? nans : infs) += 1;
+                    continue;
+                }
+                const double value = exponent == 0
+                                         ? std::ldexp(double(mantissa), -24)
+                                         : std::ldexp(double(mantissa | 0x400), int(exponent) - 25);
+                sum += value;
+                max = std::max(max, value);
+                ++count;
+            }
+        } else if (single) {
+            for (u64 i = 0; i + 4 <= bytes; i += 4) {
+                float f;
+                std::memcpy(&f, data + i, 4);
+                if (std::isnan(f)) {
+                    ++nans;
+                } else if (std::isinf(f)) {
+                    ++infs;
+                } else {
+                    sum += std::abs(f);
+                    max = std::max(max, double(std::abs(f)));
+                    ++count;
+                }
+            }
+        } else {
+            for (u64 i = 0; i < bytes; ++i) {
+                sum += data[i] / 255.0;
+                max = std::max(max, data[i] / 255.0);
+                ++count;
+            }
+        }
+        // 32-bit texels as four bytes (a shader may read them as 8_8_8_8 unorm): the average of
+        // each byte (0-255) and how many are 0 and 255.
+        std::string bytes8;
+        if (texel_bytes == 4) {
+            std::array<u64, 4> byte_sum{}, zeros{}, fulls{};
+            for (u64 i = 0; i + 4 <= bytes; i += 4) {
+                for (u32 c = 0; c < 4; ++c) {
+                    const u8 value = data[i + c];
+                    byte_sum[c] += value;
+                    zeros[c] += value == 0;
+                    fulls[c] += value == 255;
+                }
+            }
+            const u64 texels = std::max<u64>(bytes / 4, 1);
+            bytes8 = " | as 8-bit channels:";
+            for (u32 c = 0; c < 4; ++c) {
+                bytes8 += fmt::format(" {} avg {:.1f} ({:.1f}% 0, {:.1f}% 255)", "rgba"[c],
+                                      double(byte_sum[c]) / texels, 100.0 * zeros[c] / texels,
+                                      100.0 * fulls[c] / texels);
+            }
+        }
+        if (!after_writer.empty()) {
+            LOG_INFO(Render_Vulkan,
+                     "[BB-BLUR] {:#x} after the writer {}: {} NaN (was {}){} | largest {:.4g}{}",
+                     info.guest_address, after_writer, nans, blur_last_nans,
+                     nans > blur_last_nans ? " <- this writer added NaN" : "", max, bytes8);
+            blur_last_nans = nans;
+            continue;
+        }
+        if ((nans + infs != 0 || read_as_bytes) && blur_watch.empty()) {
+            blur_watch_image = image_id;
+            blur_watch_uid = uid;
+            blur_last_nans = nans;
+            blur_writer_checks_left = 96;
+            blur_writer_input_dumps_left = 6;
+            blur_watch.push_back(info.guest_address);
+            blur_watch_left = 20000; // about two frames of draws
+            LOG_INFO(Render_Vulkan, "[BB-BLUR] following the writers of {:#x} for the next draws",
+                     info.guest_address);
+            // Every cached image over the same memory (formats differing from the one read).
+            texture_cache.ForEachImageInRegion(
+                info.guest_address, info.guest_size, [&](VideoCore::ImageId id, auto& other) {
+                    LOG_INFO(Render_Vulkan,
+                             "[BB-BLUR]   cached image over it: {:#x} {}x{} {} ({} KiB){}{}{}",
+                             other.info.guest_address, other.info.size.width,
+                             other.info.size.height, vk::to_string(other.info.pixel_format),
+                             other.info.guest_size / 1024, id == image_id ? " (this one)" : "",
+                             other.usage.render_target ? ", render target" : "",
+                             True(other.flags & VideoCore::ImageFlagBits::GpuModified)
+                                 ? ", GPU-written"
+                                 : "");
+                });
+        }
+        LOG_INFO(Render_Vulkan,
+                 "[BB-BLUR] texture {:#x} {}x{} {} read back: {} NaN and {} infinite of {} "
+                 "values | largest {:.4g}, average {:.4g}{}{}",
+                 info.guest_address, width, height, vk::to_string(format), nans, infs,
+                 nans + infs + count, max, count ? sum / double(count) : 0.0,
+                 half || single ? " (magnitudes)" : " (bytes as 0-1)", bytes8);
+    }
+}
+
+void Rasterizer::DumpBlurInputs(const Pipeline* pipeline) {
+    // The game's motion blur passes and the pass whose constants hold its blur matrix.
+    constexpr std::array<u64, 3> BlurShaders{0xe0305cef, 0x29e06868, 0xd3c8bb21};
+    if (Common::GuestStats::blur_dump_requested.exchange(false, std::memory_order_relaxed)) {
+        blur_dump_left = 12;
+        LOG_INFO(Render_Vulkan, "[BB-BLUR] Motion blur inputs requested: {}",
+                 temporal_dlss.DescribeBlur());
+    }
+    if (pipeline->IsCompute()) {
+        return;
+    }
+    bool match = false;
+    for (const auto* stage : pipeline->GetStages()) {
+        match |= stage && std::ranges::find(BlurShaders, stage->pgm_hash) != BlurShaders.end();
+    }
+    if (!match) {
+        return;
+    }
+    --blur_dump_left;
+    // What it draws into, and its textures read back from the GPU before the next draw.
+    {
+        std::string targets;
+        const auto& regs = Regs();
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            const auto& col_buf = regs.color_buffers[cb];
+            if (col_buf && regs.color_target_mask.GetMask(cb)) {
+                targets +=
+                    fmt::format("{}{}: {:#x}", targets.empty() ? "" : ", ", cb, col_buf.Address());
+            }
+        }
+        LOG_INFO(Render_Vulkan, "[BB-BLUR] draw: color targets {} | depth {:#x}",
+                 targets.empty() ? std::string{"none"} : targets,
+                 regs.depth_buffer.DepthValid() ? regs.depth_buffer.DepthAddress() : u64{0});
+        for (const auto image_id : bound_images) {
+            if (!image_id || std::ranges::find(blur_readbacks, image_id, &BlurReadback::id) !=
+                                 blur_readbacks.end()) {
+                continue;
+            }
+            const auto& image = texture_cache.GetImage(image_id);
+            bool read_as_bytes = false;
+            for (const auto* stage : pipeline->GetStages()) {
+                for (u32 i = 0; stage && i < stage->images.size(); ++i) {
+                    const auto tsharp = stage->images[i].GetSharp(*stage);
+                    read_as_bytes |= tsharp.Address() == image.info.guest_address &&
+                                     tsharp.GetDataFmt() == AmdGpu::DataFormat::Format8_8_8_8 &&
+                                     image.info.pixel_format != vk::Format::eR8G8B8A8Unorm &&
+                                     image.info.pixel_format != vk::Format::eB8G8R8A8Unorm &&
+                                     image.info.pixel_format != vk::Format::eR8G8B8A8Srgb &&
+                                     image.info.pixel_format != vk::Format::eB8G8R8A8Srgb;
+                }
+            }
+            if (read_as_bytes) {
+                LOG_INFO(Render_Vulkan,
+                         "[BB-BLUR] {:#x} is read as 8_8_8_8 but is kept as {}: its values are "
+                         "logged as both",
+                         image.info.guest_address, vk::to_string(image.info.pixel_format));
+            }
+            blur_readbacks.push_back({image_id, image.image_uid, {}, read_as_bytes});
+        }
+    }
+    const auto floats = [&](VAddr address, u64 size) -> std::string {
+        const u64 bytes = std::min<u64>(size, 128) & ~3ull;
+        if (address == 0 || bytes == 0 || !memory->IsReadableMapping(address, bytes)) {
+            return "(not readable)";
+        }
+        std::string out;
+        for (u64 i = 0; i < bytes; i += 4) {
+            float value;
+            std::memcpy(&value, std::bit_cast<const u8*>(address + i), sizeof(value));
+            u32 bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            out += std::isfinite(value) ? fmt::format("{}{:.5g}", i ? " " : "", value)
+                                        : fmt::format("{}0x{:08x}", i ? " " : "", bits);
+        }
+        return out;
+    };
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        std::string user_data;
+        for (size_t i = 0; i < std::min<size_t>(stage->user_data.size(), 16); ++i) {
+            user_data += fmt::format("{}{:08x}", i ? " " : "", stage->user_data[i]);
+        }
+        LOG_INFO(Render_Vulkan, "[BB-BLUR] input: stage {} shader {:#x} | user data {}",
+                 magic_enum::enum_name(stage->sw_stage), stage->pgm_hash, user_data);
+        for (u32 i = 0; i < stage->buffers.size(); ++i) {
+            const auto& desc = stage->buffers[i];
+            if (desc.IsSpecial()) {
+                if (desc.buffer_type == Shader::BufferType::Flatbuf) {
+                    const auto& flat = stage->flattened_ud_buf;
+                    std::string words;
+                    for (size_t w = 0; w < std::min<size_t>(flat.size(), 32); ++w) {
+                        float value;
+                        std::memcpy(&value, &flat[w], sizeof(value));
+                        words += fmt::format("{}{:.5g}", w ? " " : "", value);
+                    }
+                    LOG_INFO(Render_Vulkan, "[BB-BLUR]   buffer {} (flattened user data): {}", i,
+                             words);
+                }
+                continue;
+            }
+            const auto vsharp = desc.GetSharp(*stage);
+            const VAddr address = vsharp.base_address;
+            const u64 size = vsharp.GetSize();
+            const bool gpu_written =
+                address && size && buffer_cache.IsRegionGpuModified(address, size);
+            LOG_INFO(Render_Vulkan,
+                     "[BB-BLUR]   buffer {}: {:#x}, {} bytes, stride {}{}{} | first floats: {}", i,
+                     address, size, vsharp.GetStride(), desc.is_written ? ", written" : "",
+                     gpu_written ? ", GPU-written (guest memory may be older)" : "",
+                     floats(address, size));
+        }
+        for (u32 i = 0; i < stage->images.size(); ++i) {
+            const auto tsharp = stage->images[i].GetSharp(*stage);
+            LOG_INFO(Render_Vulkan,
+                     "[BB-BLUR]   texture {}: {:#x}, {}x{}, data format {}, number format {}{}", i,
+                     tsharp.Address(), tsharp.width + 1, tsharp.height + 1,
+                     static_cast<u32>(tsharp.GetDataFmt()), static_cast<u32>(tsharp.GetNumberFmt()),
+                     stage->images[i].is_written ? ", written" : "");
+        }
+    }
 }
 
 bool Rasterizer::PrepareVertexInputs(const GraphicsPipeline* pipeline) {
@@ -1997,6 +2956,17 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
         // Assume if a shader writes metadata without address calculation, it is a clear shader.
         for (const auto& desc : info.buffers) {
             const VAddr address = desc.GetSharp(info).base_address;
+            if (!desc.IsSpecial() && desc.is_written && blur_watch_left != 0) {
+                if (const auto meta = texture_cache.GetMetaInfo(address)) {
+                    const auto& owner = texture_cache.GetImage(meta->owner_id);
+                    if (BlurWatched(owner.info.guest_address)) {
+                        LOG_INFO(Render_Vulkan,
+                                 "[BB-BLUR] writer: metadata clear of {:#x} (meta {:#x}) by "
+                                 "compute {:#x}",
+                                 owner.info.guest_address, address, info.pgm_hash);
+                    }
+                }
+            }
             if (!desc.IsSpecial() && desc.is_written && texture_cache.ClearMeta(address)) {
                 // Assume all slices were updates
                 LOG_TRACE(Render_Vulkan, "Metadata update skipped");
@@ -2156,6 +3126,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Perform image copy
     VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
+    texture_cache.EnsureFullDetail(src_image);
     runtime.CopyColorAndDepth(&src_image, &dst_image);
     return true;
 }
@@ -2198,9 +3169,19 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
         return false;
     }
 
-    // Find image the buffer alias
-    const auto image1_id =
-        texture_cache.FindImageFromRange(buf1.base_address, buf1.GetSize(), false);
+    // Find image the buffer alias: the whole image, or (Clear shadow cube faces) one layer of an
+    // array or cube.
+    auto image1_id = texture_cache.FindImageFromRange(buf1.base_address, buf1.GetSize(), false);
+    u32 layer = 0;
+    bool one_layer = false;
+    if (EmulatorSettings.IsBbClearOneLayer() &&
+        (!image1_id || texture_cache.GetImage(image1_id).info.guest_size != buf1.GetSize())) {
+        if (const auto layer_id =
+                texture_cache.FindImageLayer(buf1.base_address, buf1.GetSize(), layer)) {
+            image1_id = layer_id;
+            one_layer = true;
+        }
+    }
     if (!image1_id) {
         if (diag) {
             NoteHleReject(
@@ -2212,8 +3193,8 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
     // Image clear must be valid
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
-    if (image1.info.guest_size != buf1.GetSize() || image1.info.num_bits != buf1_bpp ||
-        image1.info.props.is_depth) {
+    if ((!one_layer && image1.info.guest_size != buf1.GetSize()) ||
+        image1.info.num_bits != buf1_bpp || image1.info.props.is_depth) {
         if (diag) {
             NoteHleReject("clear", info.pgm_hash,
                           fmt::format("image differs (size {:#x} bpp {}): {}", buf1.GetSize(),
@@ -2227,16 +3208,82 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     const vk::ClearValue clear = {
         .color = {.float32 = std::array<float, 4>{values[0], values[1], values[2], values[3]}},
     };
-    const VideoCore::SubresourceRange range = {
-        .base =
-            {
-                .level = 0,
-                .layer = 0,
-            },
-        .extent = image1.info.resources,
-    };
-    runtime.ClearImage(&image1, range, clear);
+    const VideoCore::SubresourceRange range =
+        one_layer
+            ? VideoCore::SubresourceRange{.base = {.level = 0, .layer = static_cast<u16>(layer)},
+                                          .extent = {.levels = 1, .layers = 1}}
+            : VideoCore::SubresourceRange{.base = {.level = 0, .layer = 0},
+                                          .extent = image1.info.resources};
+    if (one_layer) {
+        static std::atomic<u32> layers_logged{};
+        if (layers_logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_INFO(Render_Vulkan,
+                     "Clear shadow cube faces: layer {} of {:#x} ({} layers) cleared", layer,
+                     image1.info.guest_address, image1.info.resources.layers);
+        }
+    }
+    ClearImageAs(image1, range,
+                 LiverpoolToVK::SurfaceFormat(buf1.GetDataFmt(), buf1.GetNumberFmt()), clear);
     return true;
+}
+
+void Rasterizer::ClearImageAs(VideoCore::Image& image, const VideoCore::SubresourceRange& range,
+                              vk::Format format, const vk::ClearValue& value) {
+    const auto image_format = image.info.pixel_format;
+    if (format == image_format || format == vk::Format::eUndefined || image.info.props.is_depth ||
+        !VideoCore::IsVulkanFormatCompatible(image_format, format)) {
+        runtime.ClearImage(&image, range, value);
+        return;
+    }
+    const bool as_game = bool(image.usage_flags & vk::ImageUsageFlagBits::eColorAttachment);
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+        LOG_INFO(Render_Vulkan, "Clear of {:#x} {}x{} in {} (kept as {}) to {} {} {} {}: {}",
+                 image.info.guest_address, image.info.size.width, image.info.size.height,
+                 vk::to_string(format), vk::to_string(image_format), value.color.float32[0],
+                 value.color.float32[1], value.color.float32[2], value.color.float32[3],
+                 as_game ? "cleared through a view in the game's format"
+                         : "cleared in the image's format (not a render target)");
+    }
+    if (!as_game) {
+        runtime.ClearImage(&image, range, value);
+        return;
+    }
+    scheduler.EndRendering();
+    for (u32 level = range.base.level; level < range.base.level + range.extent.levels; ++level) {
+        if (level < image.dropped_levels) {
+            continue;
+        }
+        VideoCore::ImageViewInfo view_info{};
+        view_info.type =
+            range.extent.layers > 1 ? AmdGpu::ImageType::Color2DArray : AmdGpu::ImageType::Color2D;
+        view_info.format = format;
+        view_info.range = {
+            .base = {.level = static_cast<u16>(level), .layer = range.base.layer},
+            .extent = {.levels = 1, .layers = range.extent.layers},
+        };
+        const auto& view = image.FindView(view_info, false);
+        if (runtime.Transit(&image, vk::ImageLayout::eColorAttachmentOptimal,
+                            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                            vk::AccessFlagBits2::eColorAttachmentWrite, view_info.range)) {
+            runtime.FlushBarriers();
+        }
+        RenderState state{};
+        auto& attachment = state.color_attachments[0];
+        attachment.image_view = *view.image_view;
+        attachment.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+        std::memcpy(attachment.clear_value.data(), value.color.float32.data(),
+                    sizeof(attachment.clear_value));
+        attachment.is_clear = 1;
+        state.width = static_cast<u16>(std::max(image.info.size.width >> level, 1u));
+        state.height = static_cast<u16>(std::max(image.info.size.height >> level, 1u));
+        state.num_layers = range.extent.layers;
+        state.num_color_attachments = 1;
+        scheduler.BeginRendering(state);
+        scheduler.EndRendering();
+    }
+    image.flags |= VideoCore::ImageFlagBits::GpuModified;
+    image.flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
@@ -2258,11 +3305,18 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 temporal_dlss.ObserveConstants(runtime, instance, ring, prefetched->offset, size,
                                                stage.pgm_hash, binding.unified);
                 temporal_dlss.ObserveSceneConstants(stage.FlatUserData().data(), size);
+                if (vbao) {
+                    vbao->ObserveSceneConstants(stage.FlatUserData().data(), size);
+                }
                 temporal_dlss.ObserveBlurInputs(stage.FlatUserData().data(), size, stage.pgm_hash,
                                                 binding.unified);
             } else {
                 // No barrier tracking: the GPU never writes the ring, and the host writes of a
                 // region are visible at submission (it is reused only after the GPU is done).
+                if (vbao) {
+                    vbao->ObserveSceneConstants(
+                        reinterpret_cast<const void*>(desc.GetSharp(stage).base_address), size);
+                }
                 if (temporal_dlss.Requested()) {
                     temporal_dlss.ObserveConstants(runtime, instance, ring, prefetched->offset,
                                                    size, stage.pgm_hash, binding.unified);
@@ -2299,6 +3353,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 temporal_dlss.ObserveConstants(runtime, instance, &vk_buffer, offset, ubo_size,
                                                stage.pgm_hash, binding.unified);
                 temporal_dlss.ObserveSceneConstants(flat_ud.data(), ubo_size);
+                if (vbao) {
+                    vbao->ObserveSceneConstants(flat_ud.data(), ubo_size);
+                }
                 temporal_dlss.ObserveBlurInputs(flat_ud.data(), ubo_size, stage.pgm_hash,
                                                 binding.unified);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
@@ -2347,8 +3404,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
+                VideoCore::BufferCache::SetWriterShader(desc.is_written ? stage.pgm_hash : 0);
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                VideoCore::BufferCache::SetWriterShader(0);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -2363,6 +3422,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                if (!desc.is_written && vbao) {
+                    vbao->ObserveSceneConstants(reinterpret_cast<const void*>(vsharp.base_address),
+                                                size);
+                }
                 if (!desc.is_written && temporal_dlss.Requested()) {
                     temporal_dlss.ObserveConstants(runtime, instance, buffer, offset, size,
                                                    stage.pgm_hash, binding.unified);
@@ -2387,6 +3450,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    // The pixel shader is bound first (SwStage::Fragment is stage 0), the vertex shader after.
+    const bool pixel_shader = stage.sw_stage == Shader::SwStage::Fragment;
+    if (pixel_shader) {
+        stage_texture1 = {};
+    }
     if (stage.images.empty()) {
         // Nothing to look up (most vertex shaders, shadow map pixel shaders without alpha test).
         ProfileLap(Section::Textures);
@@ -2480,8 +3548,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 // clean this GC tick, else refreshes it (as the full path would here).
                 texture_cache.UpdateTexture(entry.id);
                 const auto& image = texture_cache.GetImage(entry.id);
-                hit = image.backing == entry.backing && !image.binding.needs_rebind &&
-                      !image.binding.is_target && !image.binding.force_general &&
+                hit = image.backing == entry.backing && !image.detail_pending &&
+                      !image.binding.needs_rebind && !image.binding.is_target &&
+                      !image.binding.force_general &&
                       set.generation == texture_cache.RegistryGeneration();
             }
         }
@@ -2504,6 +3573,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     auto& image = texture_cache.GetImage(entry.id);
                     image.binding.is_bound = 1u;
                     bound_images.emplace_back(entry.id);
+                    if (i == 1 && pixel_shader) {
+                        stage_texture1 = entry.id;
+                    }
                     const auto new_layout = image.info.props.is_depth
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -2541,6 +3613,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     bool set_ok = set_slot != nullptr;
 
     u32 num_images{};
+    // The shader's image resource each binding comes from (new storage image statistics).
+    std::array<const Shader::ImageResource*, Shader::NUM_IMAGES> binding_res{};
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
@@ -2560,6 +3634,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             const auto* memo = memo_slot(sharp_words, base_flags);
             if (memo_hit(memo, sharp_words, base_flags)) {
                 image_memo_hits.fetch_add(1, std::memory_order_relaxed);
+                binding_res[num_images] = &image_desc;
                 auto& [image_id, desc] = image_bindings[num_images++];
                 image_id = memo->image_id;
                 desc = memo->desc;
@@ -2571,12 +3646,41 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
 
         if (texture_cache.IsMeta(tsharp.Address())) {
+            // Which texture and shader (each pair once, up to 32 lines), then the plain warning.
+            static std::mutex meta_mutex;
+            static std::vector<std::pair<VAddr, u64>> meta_seen;
+            bool detail = false;
+            {
+                std::scoped_lock lock{meta_mutex};
+                const std::pair key{tsharp.Address(), stage.pgm_hash};
+                if (meta_seen.size() < 32 && std::ranges::find(meta_seen, key) == meta_seen.end()) {
+                    meta_seen.push_back(key);
+                    detail = true;
+                }
+            }
+            if (detail) {
+                const auto meta = texture_cache.GetMetaInfo(tsharp.Address());
+                std::string owner = "unknown owner";
+                if (meta) {
+                    const auto& image = texture_cache.GetImage(meta->owner_id);
+                    owner = fmt::format(
+                        "{} of the {}x{} {} at {:#x}", magic_enum::enum_name(meta->type),
+                        image.info.size.width, image.info.size.height,
+                        vk::to_string(image.info.pixel_format), image.info.guest_address);
+                }
+                LOG_WARNING(Render_Vulkan,
+                            "Unexpected metadata read by a shader (texture): {:#x} ({}x{}, data "
+                            "format {}) read by shader {:#x} is {}",
+                            tsharp.Address(), tsharp.width + 1, tsharp.height + 1,
+                            static_cast<u32>(tsharp.GetDataFmt()), stage.pgm_hash, owner);
+            }
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
 
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+            binding_res[num_images] = &image_desc;
             image_bindings[num_images++].image_id = {};
             image_descriptor_array_sizes.push_back(1);
             continue;
@@ -2612,6 +3716,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
+            binding_res[num_images] = &image_desc;
             image_bindings[num_images++].image_id = {};
             image_descriptor_array_sizes.push_back(1);
             continue;
@@ -2623,6 +3728,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             const u32 memo_flags = base_flags | (u32(i) << 16);
             TextureMemoEntry* memo = memo_slot(sharp_words, memo_flags);
             const bool hit = memo_hit(memo, sharp_words, memo_flags);
+            binding_res[num_images] = &image_desc;
             auto& [image_id, desc] = image_bindings[num_images++];
             if (hit) {
                 image_id = memo->image_id;
@@ -2684,8 +3790,24 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             bound_images.emplace_back(image_id);
+            if (i == 1 && pixel_shader) {
+                stage_texture1 = image_id;
+            }
 
             auto& image = texture_cache.GetImage(image_id);
+            if (is_storage && binding_res[i] && image.backing &&
+                image.backing->state.layout == vk::ImageLayout::eUndefined &&
+                image.backing->subresource_states.empty() &&
+                True(image.flags & VideoCore::ImageFlagBits::CpuDirty)) {
+                // Uploaded from guest memory below, just before the shader writes it (or
+                // cleared instead, when the shader overwrites all of it).
+                if (NoteNewStorageImage(image, desc.view_info, *binding_res[i], stage) &&
+                    EmulatorSettings.IsBbClearShaderWritten() && image.info.num_samples == 1 &&
+                    !image.info.props.is_depth && !image.info.props.has_stencil &&
+                    !image.info.props.is_block) {
+                    texture_cache.ClearInsteadOfUpload(image);
+                }
+            }
             auto& image_view = texture_cache.FindTexture(image_id, desc);
             const auto binding = image.binding;
             ProfileLap(Section::TexView);
@@ -2733,7 +3855,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (set_ok && slot < TextureSet::MaxImages) {
                 (*resolved)[slot] = {image_id, *image_view.image_view, image.backing,
                                      desc.view_info};
-                set_ok = !is_storage && !binding.force_general && !binding.is_target;
+                // (Not while sampled at lower detail: its full view comes later.)
+                set_ok = !is_storage && !binding.force_general && !binding.is_target &&
+                         !image.detail_pending;
             }
             ProfileLap(Section::TexLayout);
         }
@@ -2922,11 +4046,30 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
         }
-        texture_cache.UpdateImage(image_id);
+        {
+            Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Target};
+            texture_cache.UpdateImage(image_id);
+        }
         runtime.SetBackingSamples(image, key.color_samples[cb]);
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
+        if (BlurWatched(image->info.guest_address)) [[unlikely]] {
+            LOG_INFO(Render_Vulkan,
+                     "[BB-BLUR] render pass into {:#x} (target {}): image {} (backing {}), "
+                     "wanted view {}, view {} created as {} | pipeline {} {} | {}x{} levels {}-{} "
+                     "layers {}-{}",
+                     image->info.guest_address, cb, vk::to_string(image->info.pixel_format),
+                     fmt::ptr(static_cast<VkImage>(image->GetImage())),
+                     vk::to_string(desc.view_info.format), vk::to_string(image_view.info.format),
+                     vk::to_string(instance.GetSupportedFormat(image_view.info.format,
+                                                               image->format_features)),
+                     magic_enum::enum_name(key.color_buffers[cb].data_format),
+                     magic_enum::enum_name(key.color_buffers[cb].num_format),
+                     image->info.size.width, image->info.size.height, mip,
+                     mip + image_view.info.range.extent.levels - 1, slice,
+                     slice + image_view.info.range.extent.layers - 1);
+        }
 
         const auto& col_buf = regs.color_buffers[cb];
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
@@ -3093,6 +4236,10 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     if (!is_gds) {
         texture_cache.ClearMeta(address);
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
+            // Occlusion results kept from the game: the game's clear of a block goes past it.
+            if (OcclusionTrapFill(address, num_bytes, value)) {
+                return;
+            }
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;
@@ -3749,8 +4896,12 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
                 }
                 const auto vsharp = desc.GetSharp(*info);
                 if (vsharp.base_address != 0 && vsharp.GetSize() != 0) {
-                    pending_writes.push_back(
-                        {packet_no, vsharp.base_address, vsharp.base_address + vsharp.GetSize()});
+                    pending_writes.push_back({packet_no, vsharp.base_address,
+                                              vsharp.base_address + vsharp.GetSize(),
+                                              info->sw_stage == Shader::SwStage::Compute
+                                                  ? "compute shader storage write"
+                                                  : "graphics shader storage write",
+                                              info->pgm_hash, true});
                 }
             }
         }
@@ -3874,11 +5025,16 @@ void Rasterizer::QueueDraw(PacketKind kind, const Pipeline* pipeline, bool is_in
 void Rasterizer::ABeginDraw() {
     if (!diagnostics.load(std::memory_order_relaxed)) {
         a_profile = false;
+        a_hitch = false;
         a_last = {};
         return;
     }
     const auto now = std::chrono::steady_clock::now();
     a_profile = (a_profile_counter++ & 7) == 0;
+    a_hitch = HitchProfile();
+    if (a_hitch) {
+        a_hitch_draws.fetch_add(1, std::memory_order_relaxed);
+    }
     if (a_profile && a_last != std::chrono::steady_clock::time_point{}) {
         const auto decode = (now - a_last) - (draw_pipe->drain_time - a_drain_mark);
         if (decode < std::chrono::milliseconds(1)) {
@@ -3895,19 +5051,21 @@ void Rasterizer::AEndDraw() {
         return;
     }
     a_profile = false;
+    a_hitch = false;
     a_last = std::chrono::steady_clock::now();
     a_drain_mark = draw_pipe->drain_time;
 }
 
 u64 Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, VAddr write_addr,
-                           u64 write_size) {
+                           u64 write_size, const char* writer) {
     if (!UseDrawPipe() || !DrawPipe::OnStageA()) {
         DrainDrawPipe();
         task(*this, static_cast<const u8*>(data));
         return 0;
     }
     if (write_size != 0) {
-        pending_writes.push_back({draw_pipe->packets + 1, write_addr, write_addr + write_size});
+        pending_writes.push_back(
+            {draw_pipe->packets + 1, write_addr, write_addr + write_size, writer, 0});
     }
     const u32 total = sizeof(TaskPacket) + AlignPacket(size);
     u8* out = draw_pipe->Begin(total);
@@ -4175,10 +5333,34 @@ Rasterizer::QueuedUse Rasterizer::CheckQueuedUse(VAddr address, u64 size) {
             return range.packet > consumed && address < range.end && range.begin < address + size;
         });
     };
-    return {
+    QueuedUse use{
         .read_later = queued_reads_overflow || overlaps(queued_later_reads),
-        .written = overlaps(pending_writes),
+        .written = false,
+        .overflow = queued_reads_overflow,
     };
+    // Constant dumps past huge writes: a storage write declared over all of memory says nothing
+    // about this range.
+    constexpr u64 HugeWriteBytes = 256_MB;
+    // Not with the copy shader on the CPU: its copies then land in game memory when the draw
+    // recorder reaches them, after a dump written at once, and would overwrite the dump's newer
+    // data (writing the GPU's copy, they lost to the dump's data at the next upload).
+    const bool skip_huge =
+        EmulatorSettings.IsBbCeSkipHugeWrites() && !EmulatorSettings.IsBbCpuCopyShader();
+    for (const auto& write : pending_writes) {
+        if (write.packet > consumed && address < write.end && write.begin < address + size) {
+            if (skip_huge && write.shader_write && write.end - write.begin > HugeWriteBytes) {
+                ++use.huge_writes_skipped;
+                continue;
+            }
+            use.written = true;
+            use.writer = write.writer ? write.writer : "queued task";
+            use.writer_shader = write.shader;
+            use.writer_bytes = write.end - write.begin;
+            use.writer_packets_back = draw_pipe->packets - write.packet;
+            break;
+        }
+    }
+    return use;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4191,6 +5373,8 @@ Rasterizer::QueuedUse Rasterizer::CheckQueuedUse(VAddr address, u64 size) {
 
 namespace {
 constexpr u64 OcclusionValidBit = 0x8000000000000000ULL;
+/// The occlusion answer thread (its writes never wait for answers).
+thread_local bool on_occlusion_answer_thread = false;
 constexpr u64 OcclusionVisibleCount = 0x2FFFFFFULL;
 } // Anonymous namespace
 
@@ -4200,12 +5384,30 @@ void Rasterizer::OcclusionDump(u64* results, u64 value, u32 pairs) {
     if (occlusion_a.open && address == occlusion_a.begin_address + sizeof(u64)) {
         task = {reinterpret_cast<u64*>(occlusion_a.begin_address), occlusion_a.begin_value, pairs,
                 occlusion_a.draws, false};
+        task.count_scale = occlusion_a.count_scale;
+        task.depth_address = occlusion_a.depth_address;
+        task.depth_extent = occlusion_a.depth_extent;
+        task.depth_control = occlusion_a.depth_control;
+        task.index = occlusion_a.index;
         occlusion_a.open = false;
     } else {
         // A new test (one left open is answered "visible" by the draw recorder).
         occlusion_a = {address, value, 0, true};
+        occlusion_a.pairs = pairs;
+        if (const u64 frame = occlusion_frame.load(std::memory_order_relaxed);
+            frame != occlusion_index_frame) {
+            occlusion_index_frame = frame;
+            occlusion_next_index = 0;
+        }
+        occlusion_a.index = occlusion_next_index++;
         task = {results, value, pairs, 0, true};
+        task.index = occlusion_a.index;
+        if (EmulatorSettings.IsBbOcclusionWaitForAnswers()) {
+            OcclusionTrapBegin(results, pairs);
+        }
     }
+    task.frame = occlusion_frame.load(std::memory_order_relaxed);
+    task.time = std::chrono::steady_clock::now();
     RunInOrder(
         [](Rasterizer& self, const u8* data) {
             self.OcclusionTaskRun(*reinterpret_cast<const OcclusionTask*>(data));
@@ -4223,7 +5425,12 @@ bool Rasterizer::OcclusionRedirectBegin() {
         if (occlusion_a.open) {
             // Turned off during a test: it ends here, answered "visible".
             const OcclusionTask task{reinterpret_cast<u64*>(occlusion_a.begin_address),
-                                     occlusion_a.begin_value, 0, ~0u, false};
+                                     occlusion_a.begin_value,
+                                     0,
+                                     ~0u,
+                                     false,
+                                     occlusion_frame.load(std::memory_order_relaxed),
+                                     std::chrono::steady_clock::now()};
             occlusion_a.open = false;
             RunInOrder(
                 [](Rasterizer& self, const u8* data) {
@@ -4247,8 +5454,18 @@ bool Rasterizer::OcclusionRedirectBegin() {
         // Remember the scene's depth buffer: the last one drawn with at the render size.
         if (depth && extent.width == resolution.render_width &&
             extent.height == resolution.render_height) {
+            const bool same = scene_depth.valid && scene_depth.depth_buffer.DepthAddress() ==
+                                                       regs.depth_buffer.DepthAddress();
+            const u64 frame = same ? scene_depth.frame : 0;
+            const bool written = same && scene_depth.written;
             scene_depth = {true, regs.depth_buffer, regs.depth_view, regs.depth_htile_data_base,
                            extent};
+            scene_depth.frame = frame;
+            scene_depth.written = written;
+            if (regs.depth_control.depth_write_enable) {
+                scene_depth.frame = occlusion_frame.load(std::memory_order_relaxed);
+                scene_depth.written = true;
+            }
         }
         return false;
     }
@@ -4298,7 +5515,13 @@ bool Rasterizer::OcclusionRedirectBegin() {
         scale_scissor(s);
     }
     OcclusionMarkRedirected();
+    occlusion_a.count_scale = float(double(resolution.output_width) * resolution.output_height /
+                                    (double(resolution.render_width) * resolution.render_height));
     occlusion_redirects.fetch_add(1, std::memory_order_relaxed);
+    (scene_depth.written && scene_depth.frame == occlusion_frame.load(std::memory_order_relaxed)
+         ? occlusion_depth_current
+         : occlusion_depth_older)
+        .fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -4342,8 +5565,30 @@ void Rasterizer::OcclusionTaskRun(const OcclusionTask& task) {
         b.results = task.results;
         b.begin_value = task.begin_value;
         b.pairs = task.pairs;
+        b.frame = task.frame;
+        b.time = task.time;
+        b.index = task.index;
         occlusion_tests.fetch_add(1, std::memory_order_relaxed);
+        if (EmulatorSettings.IsBbOcclusionVisibleUntilAnswered()) {
+            // In order after the game's clear of the block: "visible" until the answer.
+            WriteOcclusionAnswer({task.results, task.begin_value | OcclusionValidBit, task.pairs,
+                                  OcclusionVisibleCount, true});
+        }
+        OcclusionTrapRecorded(task.results, task.pairs);
+        {
+            // The game began this test again while the previous answer was still on its way.
+            std::scoped_lock lock{occlusion_mutex};
+            if (std::ranges::any_of(occlusion_pending, [&](const PendingOcclusion& pending) {
+                    return pending.results == task.results;
+                })) {
+                occlusion_retested.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     } else if (b.open && b.results == task.results) {
+        b.count_scale = task.count_scale;
+        b.depth_address = task.depth_address;
+        b.depth_extent = task.depth_extent;
+        b.depth_control = task.depth_control;
         OcclusionClose(task.stage_a_draws);
     }
     PollOcclusion();
@@ -4359,12 +5604,81 @@ void Rasterizer::OcclusionClose(u32 stage_a_draws) {
         .queries = b.queries,
         // Every draw of the test recorded with a query, or the answer is "visible".
         .known = !b.dropped && b.draws_seen == stage_a_draws && b.queries.size() == b.draws_seen,
+        .frame = b.frame,
+        .time = b.time,
+        .closed = std::chrono::steady_clock::now(),
+        .count_scale = b.count_scale,
+        .depth_address = b.depth_address,
+        .depth_extent = b.depth_extent,
+        .depth_control = b.depth_control,
+        .depth_view = b.depth_view,
+        .render_size = b.render_size,
+        .depth_clear = b.depth_clear,
+        .index = b.index,
     };
-    occlusion_pending.push_back(std::move(test));
+    {
+        std::scoped_lock lock{occlusion_mutex};
+        occlusion_pending.push_back(std::move(test));
+        occlusion_waiting.store(static_cast<u32>(occlusion_pending.size()),
+                                std::memory_order_relaxed);
+    }
     b.open = false;
+    if (EmulatorSettings.IsBbOcclusionEarlySubmit() && DrawPipe::OnStageB()) {
+        occlusion_submit_pending.store(true, std::memory_order_relaxed);
+    }
+    if (QuickOcclusionAnswers()) {
+        if (!occlusion_answer_thread.joinable()) {
+            occlusion_answer_thread =
+                std::jthread([this](std::stop_token stop) { OcclusionAnswerThread(stop); });
+        }
+        occlusion_cv.notify_one();
+    }
+}
+
+void Rasterizer::OcclusionAnswerThread(std::stop_token stop) {
+    Common::SetCurrentThreadName("shadPS4:OcclusionAnswers");
+    on_occlusion_answer_thread = true;
+    const auto device = instance.GetDevice();
+    const vk::Semaphore semaphore = scheduler.GetWorkSemaphore()->Handle();
+    while (!stop.stop_requested()) {
+        u64 tick;
+        {
+            std::unique_lock lock{occlusion_mutex};
+            occlusion_cv.wait(lock, stop, [&] { return !occlusion_pending.empty(); });
+            if (stop.stop_requested()) {
+                return;
+            }
+            tick = occlusion_pending.front().tick;
+        }
+        // The submission with the test, as soon as the GPU has run it (a timeout to notice
+        // one not submitted yet, and the setting turned off).
+        const vk::SemaphoreWaitInfo wait{
+            .semaphoreCount = 1,
+            .pSemaphores = &semaphore,
+            .pValues = &tick,
+        };
+        if (device.waitSemaphores(wait, 50'000'000) != vk::Result::eSuccess) {
+            continue;
+        }
+        const u64 done = device.getSemaphoreCounterValue(semaphore).value;
+        boost::container::small_vector<OcclusionAnswer, 16> answers;
+        {
+            std::scoped_lock lock{occlusion_mutex};
+            while (!occlusion_pending.empty() && occlusion_pending.front().tick <= done) {
+                answers.push_back(AnswerOcclusion(occlusion_pending.front()));
+                occlusion_pending.pop_front();
+            }
+            occlusion_waiting.store(static_cast<u32>(occlusion_pending.size()),
+                                    std::memory_order_relaxed);
+        }
+        for (const auto& answer : answers) {
+            WriteOcclusionAnswer(answer);
+        }
+    }
 }
 
 u32 Rasterizer::OcclusionQueryBegin() {
+    std::scoped_lock lock{occlusion_mutex};
     if (!occlusion_pool) {
         occlusion_pool = instance.GetDevice()
                              .createQueryPoolUnique(vk::QueryPoolCreateInfo{
@@ -4404,35 +5718,408 @@ void Rasterizer::OcclusionQueryEnd(u32 query) {
 }
 
 void Rasterizer::PollOcclusion() {
-    while (!occlusion_pending.empty() && scheduler.IsFree(occlusion_pending.front().tick)) {
-        const auto test = std::move(occlusion_pending.front());
-        occlusion_pending.pop_front();
-        u64 count = 0;
-        bool known = test.known;
-        for (const u32 query : test.queries) {
-            u64 samples = 0;
-            const auto result = instance.GetDevice().getQueryPoolResults(
-                *occlusion_pool, query, 1, sizeof(samples), &samples, sizeof(samples),
-                vk::QueryResultFlagBits::e64);
-            known &= result == vk::Result::eSuccess;
-            count += samples;
-            occlusion_busy[query] = false;
-        }
-        if (!known) {
-            occlusion_unknown.fetch_add(1, std::memory_order_relaxed);
-            count = OcclusionVisibleCount;
-        }
-        // Begin and end of every counter pair, the whole count in the first pair; the game
-        // reads "not ready" until then (the block was cleared before the test).
-        u64* results = test.results;
-        const u64 begin = test.begin_value | OcclusionValidBit;
-        for (u32 i = test.pairs; i-- > 0;) {
-            results[i * 2] = begin;
-            results[i * 2 + 1] = i == 0 ? begin + count : begin;
-        }
-        occlusion_answered.fetch_add(1, std::memory_order_relaxed);
-        occlusion_hidden.fetch_add(count == 0 ? 1 : 0, std::memory_order_relaxed);
+    if (occlusion_answer_thread.joinable() && QuickOcclusionAnswers()) {
+        return; // the answer thread writes them
     }
+    boost::container::small_vector<OcclusionAnswer, 16> answers;
+    {
+        std::scoped_lock lock{occlusion_mutex};
+        while (!occlusion_pending.empty() && scheduler.IsFree(occlusion_pending.front().tick)) {
+            answers.push_back(AnswerOcclusion(occlusion_pending.front()));
+            occlusion_pending.pop_front();
+        }
+        occlusion_waiting.store(static_cast<u32>(occlusion_pending.size()),
+                                std::memory_order_relaxed);
+    }
+    for (const auto& answer : answers) {
+        WriteOcclusionAnswer(answer);
+    }
+}
+
+bool Rasterizer::QuickOcclusionAnswers() {
+    return EmulatorSettings.IsBbQuickOcclusionAnswers() ||
+           EmulatorSettings.IsBbOcclusionWaitForAnswers();
+}
+
+void Rasterizer::UseTolerantOcclusionDepth(RenderState& state) {
+    if (!EmulatorSettings.IsBbOcclusionTolerantDepth() || !db_desc.image_id ||
+        !state.depth_stencil_attachment.has_depth) {
+        return;
+    }
+    const auto& control = Regs().depth_control;
+    using Func = AmdGpu::CompareFunc;
+    const Func func = control.depth_func;
+    if (!control.depth_enable || control.depth_write_enable || control.stencil_enable ||
+        (func != Func::Less && func != Func::LessEqual && func != Func::Greater &&
+         func != Func::GreaterEqual)) {
+        return;
+    }
+    auto& depth = texture_cache.GetImage(db_desc.image_id);
+    if (!occlusion_depth_built || occlusion_depth_source != depth.GetImage()) {
+        if (!occlusion_depth) {
+            occlusion_depth = std::make_unique<BbOcclusionDepth>(instance, runtime, scheduler);
+        }
+        const vk::ImageLayout layout = state.depth_stencil_attachment.image_layout;
+        occlusion_depth_view = occlusion_depth->Build(
+            depth, state.width, state.height, func == Func::Less || func == Func::LessEqual);
+        if (occlusion_depth_view) {
+            // Back as the pass memo expects it for the next draws with the scene's depth.
+            runtime.Transit(&depth, layout,
+                            vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                vk::PipelineStageFlagBits2::eLateFragmentTests,
+                            vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
+            runtime.FlushBarriers();
+            occlusion_depth_copies.fetch_add(1, std::memory_order_relaxed);
+        }
+        occlusion_depth_source = depth.GetImage();
+        occlusion_depth_built = true;
+    }
+    if (!occlusion_depth_view) {
+        return;
+    }
+    auto& attachment = state.depth_stencil_attachment;
+    attachment.image_view = occlusion_depth_view;
+    attachment.image_layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+    attachment.depth_clear = false;
+    attachment.stencil_clear = false;
+}
+
+void Rasterizer::OcclusionEarlySubmit() {
+    // Not while background texture copies run (the submission would wait for them).
+    if (Common::CopyPool::AsyncPending()) {
+        occlusion_early_skipped.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        occlusion_early_submits.fetch_add(1, std::memory_order_relaxed);
+        SubmitInfo info{};
+        scheduler.Flush(info);
+    }
+    occlusion_submit_pending.store(false, std::memory_order_relaxed);
+}
+
+void Rasterizer::OnDrawPipeIdle(void* context) {
+    // Nothing more queued after a group of tests (the game reads their answers before it
+    // hands over more): they go to the GPU now instead of with the next draw.
+    auto& self = *static_cast<Rasterizer*>(context);
+    if (!self.occlusion_b.open && self.occlusion_submit_pending.load(std::memory_order_relaxed)) {
+        self.OcclusionEarlySubmit();
+    }
+}
+
+namespace {
+constexpr VAddr OcclusionTrapPageSize = 4096;
+} // Anonymous namespace
+
+void Rasterizer::OcclusionTrapBegin(u64* results, u32 pairs) {
+    const VAddr begin = reinterpret_cast<VAddr>(results) & ~(OcclusionTrapPageSize - 1);
+    const VAddr end = reinterpret_cast<VAddr>(results) + u64(std::max(pairs, 1u)) * 16;
+    std::scoped_lock lock{occlusion_trap_mutex};
+    for (VAddr page = begin; page < end; page += OcclusionTrapPageSize) {
+        auto& trap = occlusion_traps[page];
+        ++trap.pending;
+        ++trap.unrecorded;
+        if (!trap.tracked) {
+            trap.tracked = page_manager.UpdatePageReadWatcher(page, VideoCore::PageOp::Track);
+        }
+    }
+    occlusion_trap_count.store(static_cast<u32>(occlusion_traps.size()), std::memory_order_relaxed);
+}
+
+void Rasterizer::OcclusionTrapRecorded(u64* results, u32 pairs) {
+    if (occlusion_trap_count.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    const VAddr begin = reinterpret_cast<VAddr>(results) & ~(OcclusionTrapPageSize - 1);
+    const VAddr end = reinterpret_cast<VAddr>(results) + u64(std::max(pairs, 1u)) * 16;
+    std::scoped_lock lock{occlusion_trap_mutex};
+    for (VAddr page = begin; page < end; page += OcclusionTrapPageSize) {
+        if (const auto it = occlusion_traps.find(page);
+            it != occlusion_traps.end() && it->second.unrecorded != 0) {
+            --it->second.unrecorded;
+        }
+    }
+}
+
+bool Rasterizer::OcclusionTrapFill(VAddr address, u64 size, u32 value) {
+    if (occlusion_trap_count.load(std::memory_order_relaxed) == 0 || size == 0) {
+        return false;
+    }
+    const VAddr begin = address & ~(OcclusionTrapPageSize - 1);
+    std::scoped_lock lock{occlusion_trap_mutex};
+    bool tracked = false;
+    for (VAddr page = begin; page < address + size; page += OcclusionTrapPageSize) {
+        if (const auto it = occlusion_traps.find(page);
+            it != occlusion_traps.end() && it->second.tracked) {
+            tracked = true;
+        }
+    }
+    if (!tracked) {
+        return false;
+    }
+    std::vector<u32> data((size + sizeof(u32) - 1) / sizeof(u32), value);
+    Core::Memory::Instance()->TryWriteBacking(reinterpret_cast<void*>(address), data.data(), size);
+    return true;
+}
+
+std::optional<u32> Rasterizer::OcclusionKnownWord(VAddr address, u32 function, u32 ref, u32 mask) {
+    if (occlusion_trap_count.load(std::memory_order_relaxed) != 0) {
+        // The game waits (before each test) for its clear of the next test's block to land, on
+        // a page kept from the game: read past the protection, which a read here would let go.
+        bool on_trap = false;
+        {
+            std::scoped_lock lock{occlusion_trap_mutex};
+            const auto it = occlusion_traps.find(address & ~(OcclusionTrapPageSize - 1));
+            on_trap = it != occlusion_traps.end() && it->second.tracked;
+        }
+        if (on_trap) {
+            u32 word = 0;
+            Core::Memory::Instance()->CopySparseMemory(address, reinterpret_cast<u8*>(&word),
+                                                       sizeof(word));
+            occlusion_known_waits.fetch_add(1, std::memory_order_relaxed);
+            return word;
+        }
+    }
+    if (!occlusion_a.open || !EmulatorSettings.IsBbOcclusionWaitForAnswers() ||
+        address < occlusion_a.begin_address ||
+        address >= occlusion_a.begin_address + u64(occlusion_a.pairs) * 16) {
+        return std::nullopt;
+    }
+    // Each counter pair: start (8 bytes), end (8 bytes); the start is known.
+    const u64 offset = (address - occlusion_a.begin_address) % 16;
+    if (offset >= 8 || offset % 4 != 0) {
+        return std::nullopt;
+    }
+    occlusion_known_waits.fetch_add(1, std::memory_order_relaxed);
+    const u64 value = occlusion_a.begin_value;
+    return offset == 0 ? u32(value) : u32(value >> 32);
+}
+
+bool Rasterizer::OcclusionTrapFault(VAddr addr, bool is_write) {
+    if (occlusion_trap_count.load(std::memory_order_relaxed) == 0) {
+        return false;
+    }
+    const VAddr page = addr & ~(OcclusionTrapPageSize - 1);
+    std::unique_lock lock{occlusion_trap_mutex};
+    auto it = occlusion_traps.find(page);
+    if (it == occlusion_traps.end() || !it->second.tracked) {
+        return false;
+    }
+    const auto release = [&](OcclusionTrap& trap) {
+        page_manager.UpdatePageReadWatcher(page, VideoCore::PageOp::Untrack);
+        trap.tracked = false;
+    };
+    if (IsGpuSideThread() || on_occlusion_answer_thread) {
+        // The emulator's own access (the game's clear of a block, a write of an answer): the
+        // page is let go (its answers are then written as they come).
+        release(it->second);
+        occlusion_trap_stats[4].fetch_add(1, std::memory_order_relaxed);
+        // Diagnostics: which thread, reading or writing (stage A 0/1, stage B 2/3, answer
+        // thread 4/5, another GPU-side thread 6/7).
+        const u32 thread = DrawPipe::OnStageA()         ? 0
+                           : DrawPipe::OnStageB()       ? 1
+                           : on_occlusion_answer_thread ? 2
+                                                        : 3;
+        occlusion_release_kinds[thread * 2 + (is_write ? 1 : 0)].fetch_add(
+            1, std::memory_order_relaxed);
+        if (occlusion_release_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
+            LOG_INFO(Render_Vulkan,
+                     "Occlusion: kept page {:#x} let go by {} ({}), at {:#x} (+{:#x}); {} tests "
+                     "pending on it, {} not reached by the draw recorder; packet {}",
+                     page, Common::GetCurrentThreadName(), is_write ? "write" : "read", addr,
+                     addr - page, it->second.pending, it->second.unrecorded,
+                     AmdGpu::current_packet_opcode == ~0u
+                         ? std::string{"(between packets)"}
+                         : fmt::format("{:#x} {}", AmdGpu::current_packet_opcode,
+                                       magic_enum::enum_name(static_cast<AmdGpu::PM4ItOpcode>(
+                                           AmdGpu::current_packet_opcode))));
+        }
+        return true;
+    }
+    // A game thread reading before the answer: it waits for the page's answers, as on the PS4.
+    const Common::GameWaits::Scope wait{"occlusion answer"};
+    if (it->second.unrecorded != 0) {
+        occlusion_trap_stats[5].fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    occlusion_trap_cv.wait_until(lock, start + std::chrono::milliseconds(6), [&] {
+        const auto found = occlusion_traps.find(page);
+        return found == occlusion_traps.end() || !found->second.tracked;
+    });
+    if (const auto found = occlusion_traps.find(page);
+        found != occlusion_traps.end() && found->second.tracked) {
+        release(found->second);
+        occlusion_trap_stats[2].fetch_add(1, std::memory_order_relaxed);
+    }
+    occlusion_trap_stats[0].fetch_add(1, std::memory_order_relaxed);
+    occlusion_trap_stats[1].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count(),
+                                      std::memory_order_relaxed);
+    return true;
+}
+
+void Rasterizer::WriteOcclusionAnswer(const OcclusionAnswer& answer) {
+    // Begin and end of every counter pair, the whole count in the first pair; the game reads
+    // "not ready" until then (the block was cleared before the test).
+    boost::container::small_vector<u64, 32> data(u64(answer.pairs) * 2);
+    for (u32 i = 0; i < answer.pairs; ++i) {
+        data[i * 2] = answer.begin;
+        data[i * 2 + 1] = i == 0 ? answer.begin + answer.count : answer.begin;
+    }
+    u64* results = answer.results;
+    const u64 bytes = data.size() * sizeof(u64);
+    if (occlusion_trap_count.load(std::memory_order_relaxed) != 0) {
+        // Wait for occlusion answers: written past the page's protection while it is kept from
+        // the game, then the page is let go once its last answer is in.
+        std::unique_lock lock{occlusion_trap_mutex};
+        const VAddr begin = reinterpret_cast<VAddr>(results) & ~(OcclusionTrapPageSize - 1);
+        const VAddr end = reinterpret_cast<VAddr>(results) + std::max<u64>(bytes, 16);
+        bool tracked = false;
+        bool found = false;
+        for (VAddr page = begin; page < end; page += OcclusionTrapPageSize) {
+            if (const auto it = occlusion_traps.find(page); it != occlusion_traps.end()) {
+                found = true;
+                tracked |= it->second.tracked;
+            }
+        }
+        if (found) {
+            if (tracked && bytes != 0) {
+                Core::Memory::Instance()->TryWriteBacking(results, data.data(), bytes);
+            }
+            if (!answer.provisional) {
+                for (VAddr page = begin; page < end; page += OcclusionTrapPageSize) {
+                    const auto it = occlusion_traps.find(page);
+                    if (it == occlusion_traps.end() || --it->second.pending != 0) {
+                        continue;
+                    }
+                    if (it->second.tracked) {
+                        page_manager.UpdatePageReadWatcher(page, VideoCore::PageOp::Untrack);
+                        occlusion_trap_stats[3].fetch_add(1, std::memory_order_relaxed);
+                    }
+                    occlusion_traps.erase(it);
+                }
+                occlusion_trap_count.store(static_cast<u32>(occlusion_traps.size()),
+                                           std::memory_order_relaxed);
+                lock.unlock();
+                occlusion_trap_cv.notify_all();
+            }
+            if (tracked) {
+                return;
+            }
+        }
+    }
+    std::memcpy(results, data.data(), bytes);
+}
+
+Rasterizer::OcclusionAnswer Rasterizer::AnswerOcclusion(const PendingOcclusion& test) {
+    u64 count = 0;
+    bool known = test.known;
+    for (const u32 query : test.queries) {
+        u64 samples = 0;
+        const auto result = instance.GetDevice().getQueryPoolResults(
+            *occlusion_pool, query, 1, sizeof(samples), &samples, sizeof(samples),
+            vk::QueryResultFlagBits::e64);
+        known &= result == vk::Result::eSuccess;
+        count += samples;
+        occlusion_busy[query] = false;
+    }
+    if (!known) {
+        occlusion_unknown.fetch_add(1, std::memory_order_relaxed);
+        count = OcclusionVisibleCount;
+    } else if (test.count_scale != 1.0f && EmulatorSettings.IsBbOcclusionGameResolutionCounts()) {
+        // Counted at the render size: as many pixels as at the game's resolution (the game
+        // weighs the count, not only whether it is zero).
+        count = u64(double(count) * test.count_scale + 0.5);
+    }
+    {
+        // One-frame hidden blips: visible, hidden, visible again in consecutive game frames.
+        auto& slot = occlusion_slots[test.results];
+        slot[0] = slot[1];
+        slot[1] = slot[2];
+        slot[2] = {test.frame,
+                   count,
+                   test.depth_address,
+                   test.depth_extent,
+                   test.depth_control,
+                   test.depth_view,
+                   test.render_size,
+                   test.depth_clear,
+                   known};
+        {
+            // By the test's place in its frame (n-th test), consecutive frames.
+            auto& place = occlusion_indices[test.index];
+            place[0] = place[1];
+            place[1] = place[2];
+            place[2] = {test.frame, count, test.results};
+            if (place[0].frame != 0 && place[0].frame + 1 == place[1].frame &&
+                place[1].frame + 1 == place[2].frame && place[0].count != 0 &&
+                place[1].count == 0 && place[2].count != 0) {
+                occlusion_index_blips.fetch_add(1, std::memory_order_relaxed);
+                if (occlusion_index_blips_logged < 40) {
+                    ++occlusion_index_blips_logged;
+                    LOG_INFO(Render_Vulkan,
+                             "Occlusion: hidden blip of the game's test #{} of its frame: frame "
+                             "{} count {} ({}), frame {} count 0 ({}), frame {} count {} ({})",
+                             test.index, place[0].frame, place[0].count, fmt::ptr(place[0].results),
+                             place[1].frame, fmt::ptr(place[1].results), place[2].frame,
+                             place[2].count, fmt::ptr(place[2].results));
+                }
+            }
+        }
+        if (slot[1].frame != 0) {
+            occlusion_slot_gaps[std::min<u64>(slot[2].frame - slot[1].frame, 3)].fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        // The slot's last three answers (a slot may be used every other frame).
+        const bool consecutive = slot[0].frame != 0 && slot[2].frame - slot[0].frame <= 6;
+        if (consecutive && slot[0].count != 0 && slot[1].count == 0 && slot[2].count != 0) {
+            occlusion_blips.fetch_add(1, std::memory_order_relaxed);
+            if (occlusion_blips_logged < 40) {
+                ++occlusion_blips_logged;
+                const auto describe = [](const OcclusionSlotAnswer& a) {
+                    return fmt::format("frame {} count {}{} | depth {:#x} hint {}x{} control "
+                                       "{:#x} | view {:#x} pass {}x{}{}",
+                                       a.frame, a.count, a.known ? "" : " (unknown)",
+                                       a.depth_address, a.depth_extent & 0xffff,
+                                       a.depth_extent >> 16, a.depth_control, a.depth_view,
+                                       a.render_size & 0xffff, a.render_size >> 16,
+                                       a.depth_clear ? " (clears depth)" : "");
+                };
+                LOG_INFO(Render_Vulkan,
+                         "Occlusion: hidden blip of the test at {}:\n  before: {}\n  "
+                         "hidden: {}\n  after:  {}",
+                         fmt::ptr(test.results), describe(slot[0]), describe(slot[1]),
+                         describe(slot[2]));
+            }
+        }
+        if (occlusion_slots.size() > 4096) {
+            occlusion_slots.clear();
+        }
+    }
+    occlusion_answered.fetch_add(1, std::memory_order_relaxed);
+    occlusion_hidden.fetch_add(count == 0 ? 1 : 0, std::memory_order_relaxed);
+    const u64 frames = occlusion_frame.load(std::memory_order_relaxed) - test.frame;
+    occlusion_late_frames[std::min<u64>(frames, 3)].fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now();
+    occlusion_late_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - test.time).count(),
+        std::memory_order_relaxed);
+    {
+        const auto& entry = submit_times[test.tick % submit_times.size()];
+        if (entry.tick.load(std::memory_order_acquire) == test.tick) {
+            const s64 closed = test.closed.time_since_epoch().count();
+            const s64 submitted = std::max(entry.ns.load(std::memory_order_relaxed), closed);
+            const s64 begun = test.time.time_since_epoch().count();
+            const s64 answered = now.time_since_epoch().count();
+            occlusion_span_ns[0].fetch_add(u64(std::max<s64>(closed - begun, 0)),
+                                           std::memory_order_relaxed);
+            occlusion_span_ns[1].fetch_add(u64(submitted - closed), std::memory_order_relaxed);
+            occlusion_span_ns[2].fetch_add(u64(std::max<s64>(answered - submitted, 0)),
+                                           std::memory_order_relaxed);
+            occlusion_span_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return {test.results, test.begin_value | OcclusionValidBit, test.pairs, count};
 }
 
 const Rasterizer::PrefetchedBuffer* Rasterizer::FindPrefetched(u32 buffer_index) {
@@ -4476,8 +6163,11 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
 }
 
 void Rasterizer::RunDrawPacketBody(Rasterizer& self, const u8* data, u32 size) {
+    // Upload statistics: which kind of packet the texture uploads below happen in.
+    Common::GuestStats::UploadPacketScope upload_packet{*data};
     // Occlusion answers go to the game as soon as the GPU has them, not at the next test.
-    if (!self.occlusion_pending.empty() && (++self.occlusion_poll_counter & 31) == 0) {
+    if (self.occlusion_waiting.load(std::memory_order_relaxed) != 0 &&
+        (++self.occlusion_poll_counter & 31) == 0) {
         self.PollOcclusion();
     }
     if (*data == static_cast<u8>(PacketKind::Task)) {
@@ -4716,6 +6406,116 @@ void Rasterizer::LogDrawPipeStats() {
                      (redirects - pipe_stats_occlusion[4]) / seconds);
         }
         pipe_stats_occlusion = {tests, answered, hidden, unknown, redirects};
+        const std::array<u64, 6> late{occlusion_late_frames[0].load(std::memory_order_relaxed),
+                                      occlusion_late_frames[1].load(std::memory_order_relaxed),
+                                      occlusion_late_frames[2].load(std::memory_order_relaxed),
+                                      occlusion_late_frames[3].load(std::memory_order_relaxed),
+                                      occlusion_late_ns.load(std::memory_order_relaxed),
+                                      occlusion_retested.load(std::memory_order_relaxed)};
+        const u64 late_answers =
+            (late[0] - pipe_stats_occlusion_late[0]) + (late[1] - pipe_stats_occlusion_late[1]) +
+            (late[2] - pipe_stats_occlusion_late[2]) + (late[3] - pipe_stats_occlusion_late[3]);
+        if (late_answers != 0) {
+            const auto pct = [&](u32 i) {
+                return 100.0 * (late[i] - pipe_stats_occlusion_late[i]) / late_answers;
+            };
+            LOG_INFO(Render_Vulkan,
+                     "  occlusion answers{}: reached the game {:.1f} ms after the test on "
+                     "average | in the same game frame {:.0f}%, 1 frame later {:.0f}%, 2 "
+                     "{:.0f}%, 3 or more {:.0f}% | tests begun again before the previous answer "
+                     "arrived {:.0f}/s",
+                     QuickOcclusionAnswers() ? " (quick answers)" : "",
+                     (late[4] - pipe_stats_occlusion_late[4]) / 1e6 / late_answers, pct(0), pct(1),
+                     pct(2), pct(3), (late[5] - pipe_stats_occlusion_late[5]) / seconds);
+        }
+        pipe_stats_occlusion_late = late;
+        const std::array<u64, 5> span{occlusion_span_ns[0].load(std::memory_order_relaxed),
+                                      occlusion_span_ns[1].load(std::memory_order_relaxed),
+                                      occlusion_span_ns[2].load(std::memory_order_relaxed),
+                                      occlusion_span_count.load(std::memory_order_relaxed),
+                                      occlusion_early_submits.load(std::memory_order_relaxed)};
+        const u64 spans = span[3] - pipe_stats_occlusion_span[3];
+        if (spans != 0) {
+            const auto ms = [&](u32 i) {
+                return (span[i] - pipe_stats_occlusion_span[i]) / 1e6 / spans;
+            };
+            const u64 skipped = occlusion_early_skipped.exchange(0, std::memory_order_relaxed);
+            LOG_INFO(Render_Vulkan,
+                     "  occlusion answer time: {:.1f} ms to the draw recorder, {:.1f} ms waiting "
+                     "for its submission, {:.1f} ms on the GPU | early submissions {:.0f}/s "
+                     "({:.0f}/s left out for background texture copies)",
+                     ms(0), ms(1), ms(2), (span[4] - pipe_stats_occlusion_span[4]) / seconds,
+                     skipped / seconds);
+        }
+        pipe_stats_occlusion_span = span;
+        std::array<u64, 6> trap{};
+        for (u32 i = 0; i < trap.size(); ++i) {
+            trap[i] = occlusion_trap_stats[i].load(std::memory_order_relaxed);
+        }
+        const u64 early_reads = trap[0] - pipe_stats_occlusion_trap[0];
+        const u64 in_time = trap[3] - pipe_stats_occlusion_trap[3];
+        if (early_reads + in_time != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "  waiting for occlusion answers: the game read {:.0f}/s before the answer "
+                     "(waited {:.2f} ms on average, {:.0f}/s gave up after 6 ms), {:.0f}/s "
+                     "answered before it read; {:.0f}/s let go for the emulator's own access; "
+                     "{:.0f}/s of the early reads came before the draw recorder got to the test",
+                     early_reads / seconds,
+                     early_reads ? (trap[1] - pipe_stats_occlusion_trap[1]) / 1e6 / early_reads
+                                 : 0.0,
+                     (trap[2] - pipe_stats_occlusion_trap[2]) / seconds, in_time / seconds,
+                     (trap[4] - pipe_stats_occlusion_trap[4]) / seconds,
+                     (trap[5] - pipe_stats_occlusion_trap[5]) / seconds);
+        }
+        pipe_stats_occlusion_trap = trap;
+        const u64 blips = occlusion_blips.load(std::memory_order_relaxed);
+        const u64 index_blips = occlusion_index_blips.load(std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan,
+                 "  occlusion hidden blips by the test's place in the frame: {:.1f}/s",
+                 (index_blips - pipe_stats_occlusion_index_blips) / seconds);
+        pipe_stats_occlusion_index_blips = index_blips;
+        LOG_INFO(Render_Vulkan,
+                 "  occlusion hidden blips (visible, hidden, visible): {:.1f}/s | a slot's next "
+                 "answer came 0 frames later {}, 1 {}, 2 {}, 3+ {} (in all)",
+                 (blips - pipe_stats_occlusion_blips) / seconds,
+                 occlusion_slot_gaps[0].load(std::memory_order_relaxed),
+                 occlusion_slot_gaps[1].load(std::memory_order_relaxed),
+                 occlusion_slot_gaps[2].load(std::memory_order_relaxed),
+                 occlusion_slot_gaps[3].load(std::memory_order_relaxed));
+        pipe_stats_occlusion_blips = blips;
+        {
+            std::array<u64, 8> kinds{};
+            for (u32 i = 0; i < kinds.size(); ++i) {
+                kinds[i] = occlusion_release_kinds[i].exchange(0, std::memory_order_relaxed);
+            }
+            LOG_INFO(Render_Vulkan, "  game waits for occlusion start counters met: {:.0f}/s",
+                     occlusion_known_waits.exchange(0, std::memory_order_relaxed) / seconds);
+            LOG_INFO(Render_Vulkan,
+                     "  kept occlusion pages let go: GPU command thread {:.0f}/s reads, {:.0f}/s "
+                     "writes | draw recorder {:.0f}/s, {:.0f}/s | answer thread {:.0f}/s, {:.0f}/s "
+                     "| other {:.0f}/s, {:.0f}/s",
+                     kinds[0] / seconds, kinds[1] / seconds, kinds[2] / seconds, kinds[3] / seconds,
+                     kinds[4] / seconds, kinds[5] / seconds, kinds[6] / seconds,
+                     kinds[7] / seconds);
+        }
+        const u64 copies = occlusion_depth_copies.load(std::memory_order_relaxed);
+        if (copies != pipe_stats_occlusion_depth_copies) {
+            LOG_INFO(Render_Vulkan, "  occlusion tests tolerant of a pixel: {:.0f} depth copies/s",
+                     (copies - pipe_stats_occlusion_depth_copies) / seconds);
+        }
+        pipe_stats_occlusion_depth_copies = copies;
+        const std::array<u64, 2> depth{occlusion_depth_current.load(std::memory_order_relaxed),
+                                       occlusion_depth_older.load(std::memory_order_relaxed)};
+        const u64 depth_current = depth[0] - pipe_stats_occlusion_depth[0];
+        const u64 depth_older = depth[1] - pipe_stats_occlusion_depth[1];
+        if (depth_current + depth_older != 0) {
+            LOG_INFO(Render_Vulkan,
+                     "  occlusion tests on the scene's depth: {:.0f}% against depth drawn in the "
+                     "same game frame, {:.0f}% against depth from an earlier frame",
+                     100.0 * depth_current / (depth_current + depth_older),
+                     100.0 * depth_older / (depth_current + depth_older));
+        }
+        pipe_stats_occlusion_depth = depth;
     }
     {
         const u64 prepared = vertex_prepared.load(std::memory_order_relaxed);
@@ -4895,6 +6695,94 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
                            state.depth_stencil_attachment.has_depth ? " + depth" : "", vs.pgm_hash,
                            ps ? ps->pgm_hash : 0);
     });
+}
+
+bool Rasterizer::NoteNewStorageImage(const VideoCore::Image& image,
+                                     const VideoCore::ImageViewInfo& view,
+                                     const Shader::ImageResource& res, const Shader::Info& stage) {
+    namespace GS = Common::GuestStats;
+    const auto& info = image.info;
+    const bool reads = res.is_atomic || (res.exact_texel_reads & Shader::ExactTexelFetch) != 0;
+    const u32 levels = info.resources.levels;
+    const u32 layers = info.resources.layers;
+    const bool whole_view = view.range.base.level == 0 && view.range.extent.levels >= levels &&
+                            view.range.base.layer == 0 && view.range.extent.layers >= layers;
+    const bool compute = stage.sw_stage == Shader::SwStage::Compute;
+    const bool indirect = GS::upload_packet == 3;
+    u64 threads_x = 0, threads_y = 0, threads_z = 0;
+    if (compute) {
+        const auto& cs = CsRegs();
+        threads_x = u64(cs.dim_x) * cs.num_thread_x.full;
+        threads_y = u64(cs.dim_y) * cs.num_thread_y.full;
+        threads_z = u64(cs.dim_z) * cs.num_thread_z.full;
+    }
+    const u32 mip = std::min<u32>(view.range.base.level, levels - 1);
+    const u64 width = std::max(info.size.width >> mip, 1u);
+    const u64 height = std::max(info.size.height >> mip, 1u);
+    const u64 depth = info.props.is_volume ? std::max(info.size.depth >> mip, 1u)
+                                           : std::max<u32>(view.range.extent.layers, 1u);
+    const bool enough_threads =
+        compute && !indirect && threads_x * threads_y * threads_z >= width * height * depth;
+    const auto use = reads             ? GS::NewStorageUse::AlsoRead
+                     : !whole_view     ? GS::NewStorageUse::Part
+                     : !enough_threads ? GS::NewStorageUse::Unclear
+                                       : GS::NewStorageUse::Whole;
+    GS::new_storage_bytes[static_cast<size_t>(use)].fetch_add(info.guest_size,
+                                                              std::memory_order_relaxed);
+    // Guest memory all zero? 64 places of 64 bytes (a hint, not a proof).
+    bool sampled = false, zero = true;
+    if (info.guest_size >= 64) {
+        for (u32 i = 0; i < 64 && zero; ++i) {
+            const u64 offset = (u64(info.guest_size - 64) * i / 63) & ~63ull;
+            const VAddr address = info.guest_address + offset;
+            if (!memory->IsReadableMapping(address, 64)) {
+                continue;
+            }
+            sampled = true;
+            const auto* bytes = std::bit_cast<const u8*>(address);
+            zero = std::all_of(bytes, bytes + 64, [](u8 b) { return b == 0; });
+        }
+    }
+    if (sampled && zero) {
+        GS::new_storage_zero_bytes.fetch_add(info.guest_size, std::memory_order_relaxed);
+    }
+    const bool whole = use == GS::NewStorageUse::Whole;
+    // Each kind once (shader, format, size), 1 MiB or larger: up to 64 lines.
+    if (info.guest_size < 1_MB) {
+        return whole;
+    }
+    static std::mutex seen_mutex;
+    static std::vector<u64> seen;
+    const u64 key = HashCombine(HashCombine(stage.pgm_hash, u64(info.pixel_format)),
+                                (u64(info.size.width) << 40) ^ (u64(info.size.height) << 20) ^
+                                    (u64(levels) << 8) ^ layers);
+    {
+        std::scoped_lock lock{seen_mutex};
+        if (seen.size() >= 64 || std::ranges::find(seen, key) != seen.end()) {
+            return whole;
+        }
+        seen.push_back(key);
+    }
+    static constexpr std::array UseNames{"only written, whole image, enough threads", "also read",
+                                         "only part bound", "coverage unclear"};
+    LOG_INFO(Render_Vulkan,
+             "New image written by {} shader {:#x} (uploaded first): {}x{}x{} {} ({} levels, {} "
+             "layers, {:.2f} MiB, {}) at {:#x} | bound: levels {}-{}, layers {}-{} | shader also "
+             "reads it: {} (image loads {}, atomics {}) | threads {}x{}x{}{} for {}x{}x{} texels | "
+             "guest memory {} | {}",
+             compute ? "compute" : "graphics", stage.pgm_hash, info.size.width, info.size.height,
+             info.size.depth, vk::to_string(info.pixel_format), levels, layers,
+             info.guest_size / 1048576.0, info.props.is_tiled ? "tiled" : "linear",
+             info.guest_address, view.range.base.level,
+             view.range.base.level + view.range.extent.levels - 1, view.range.base.layer,
+             view.range.base.layer + view.range.extent.layers - 1, reads,
+             (res.exact_texel_reads & Shader::ExactTexelFetch) != 0, res.is_atomic, threads_x,
+             threads_y, threads_z, indirect ? " (indirect: not known)" : "", width, height, depth,
+             !sampled ? "not sampled"
+             : zero   ? "looks all zero"
+                      : "has data",
+             UseNames[static_cast<size_t>(use)]);
+    return whole;
 }
 
 void Rasterizer::MarkDispatch(const ComputePipeline* pipeline) {

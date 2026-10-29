@@ -3,10 +3,14 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <source_location>
+#include <stop_token>
+#include <thread>
 #include <unordered_map>
 
 #include "common/guest_stats.h"
@@ -17,6 +21,8 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
+#include "video_core/renderer_vulkan/vk_bb_occlusion_depth.h"
+#include "video_core/renderer_vulkan/vk_bb_vbao.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
@@ -107,6 +113,13 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool OnWriteFault(VAddr addr, u64 size, bool assume_locks = false);
+    /// Wait for occlusion answers: a fault on a page of occlusion results kept from the game
+    /// until their answers are in (waits for them on a game thread). False when not one.
+    bool OcclusionTrapFault(VAddr addr, bool is_write);
+    /// GPU command thread: a 32-bit word of the open occlusion test's results known without the
+    /// GPU (its start counters), for the game's wait for them; nullopt otherwise.
+    std::optional<u32> OcclusionKnownWord(VAddr address, u32 function, u32 ref, u32 mask);
+    std::atomic<u32> occlusion_wait_logged{};
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
@@ -137,13 +150,23 @@ public:
     /// ring until it has run.
     using OrderedTask = void (*)(Rasterizer& rasterizer, const u8* data);
     /// Returns the number of the queued packet, or 0 when the task ran here.
+    /// `writer`: what writes [write_addr, +write_size) (statistics; a static string).
     u64 RunInOrder(OrderedTask task, const void* data, u32 size, VAddr write_addr = 0,
-                   u64 write_size = 0);
+                   u64 write_size = 0, const char* writer = "queued task");
     /// Constant RAM dumps: what queued, not yet recorded work does with a guest range. Stage A
     /// only.
     struct QueuedUse {
         bool read_later; ///< a queued draw or dispatch reads a buffer there when recorded
-        bool written;    ///< a queued task (DMA, fence) writes there
+        bool written;    ///< a queued task (DMA, fence) or shader writes there
+        bool overflow;   ///< too many queued reads to tell
+        /// The first queued write there: what it is, its shader, its size, and how many packets
+        /// back it was queued.
+        const char* writer;
+        u64 writer_shader;
+        u64 writer_bytes;
+        u64 writer_packets_back;
+        /// Constant dumps past huge writes: overlapping huge shader writes left out.
+        u32 huge_writes_skipped;
     };
     QueuedUse CheckQueuedUse(VAddr address, u64 size);
     /// Whether the draw recording thread has run the packet with this number.
@@ -238,8 +261,27 @@ private:
         u64 present_acquire_ns{}, present_queue_ns{}, present_frame_wait_ns{}, presents{},
             queue_ops_behind_present{}, skipped_bytes{}, direct_bytes{}, gpu_busy_ns{},
             gpu_idle_ns{}, gpu_submits{}, queue_submit_ns{}, allocs{}, alloc_ns{}, slow_allocs{},
-            slow_alloc_ns{};
+            slow_alloc_ns{}, detail_deferred{}, detail_deferred_bytes{}, detail_restored{},
+            detail_restored_bytes{}, detail_forced{}, cmd_protect_calls{}, cmd_protect_ns{},
+            cmd_resident_ns{}, cmd_buffer_upload_bytes{}, cmd_buffer_upload_ns{}, a_hitch_draws{};
+        std::array<u64, 256> cmd_opcode_ns{}, cmd_opcode_count{};
+        std::array<u64, static_cast<size_t>(Common::GuestStats::Detail::Count) + 1> protect_ns_by{},
+            protect_calls_by{};
+        u64 stream_copies{}, stream_copy_bytes{}, buffer_syncs{}, buffer_sync_ranges{},
+            buffer_sync_inline_bytes{}, buffer_mem_allocs{}, buffer_mem_alloc_ns{}, cmd_drain_ns{},
+            cmd_compute_ns{}, cmd_compute_packets{}, ce_dumps{}, ce_dump_drains{},
+            ce_dump_drain_ns{}, ce_dump_write_ns{}, ce_outside_ns{}, ce_wait_reads{},
+            ce_wait_writes{}, ce_wait_overflow{}, ce_huge_write_skips{}, evicted_refills{},
+            evicted_refill_bytes{}, helper_protect_calls{}, helper_protect_ns{},
+            evicted_bytes_total{}, flips{}, flip_drain_ns{}, flip_signal_ns{};
+        std::array<u64, 4> evicted_returned{};
+        std::array<s64, 6> a_hitch_ns{}; ///< by ASection (declared below)
         std::array<u64, Common::GuestStats::upload_age_bytes.size()> upload_ages{};
+        std::array<u64, Common::GuestStats::upload_path_bytes.size()> upload_paths{};
+        std::array<u64, Common::GuestStats::UploadPackets> upload_packets{};
+        std::array<u64, Common::GuestStats::new_storage_bytes.size()> new_storage{};
+        u64 new_storage_zero{};
+        u64 new_storage_cleared{};
         u64 mutex_waits{}, sleeps{}, sleep_ns{}, uploads{}, upload_bytes{}, upload_ns{},
             image_copy_ns{}, buffer_bytes{}, buffer_ns{}, resident_ns{}, staging_count{},
             staging_bytes{}, staging_ns{}, async_copies{}, async_wait_ns{}, file_opens{},
@@ -274,6 +316,47 @@ private:
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    /// F1's "Log motion blur inputs": logs every input of the next motion blur passes.
+    void DumpBlurInputs(const Pipeline* pipeline);
+    /// Reads the textures DumpBlurInputs queued back from the GPU and logs what they hold (NaN
+    /// and infinite values, the largest and average magnitude). Before a draw binds anything.
+    void ReadBackBlurTextures();
+    u32 blur_dump_left{};
+    struct BlurReadback {
+        VideoCore::ImageId id;
+        u64 uid;
+        std::string after_writer; ///< set when read back right after a watched writer
+        bool read_as_bytes{};     ///< sampled as 8_8_8_8 though the image has another format
+    };
+    std::vector<BlurReadback> blur_readbacks;
+    /// Textures the readback found NaN in: every draw, dispatch and clear that writes them is
+    /// logged for the next draws (blur_watch_left).
+    std::vector<VAddr> blur_watch;
+    u32 blur_watch_left{};
+    /// The watched texture read back after each of its writers, for this many writers.
+    u32 blur_writer_checks_left{};
+    u32 blur_writer_input_dumps_left{}; ///< writers whose textures are also read back
+    VideoCore::ImageId blur_watch_image{};
+    u64 blur_watch_uid{};
+    u64 blur_last_nans{};
+    void LogBlurWatchWriters(const Pipeline* pipeline);
+    /// NaN and infinite floats in the guest memory of the stage's buffers.
+    std::string DescribeBufferNans(const Shader::Info& stage);
+    /// The same for the draw's float vertex attributes (the GPU's copy when GPU-written).
+    std::string DescribeVertexNans(const GraphicsPipeline& pipeline);
+    /// Whether `address` is a texture the blur watch is following.
+    bool BlurWatched(VAddr address) const {
+        return blur_watch_left != 0 && std::ranges::find(blur_watch, address) != blur_watch.end();
+    }
+    std::unique_ptr<VideoCore::Buffer> blur_readback_buffer;
+    std::unique_ptr<VideoCore::Buffer> blur_buffer_readback;
+    /// The GPU's copy of a buffer range (what a draw recorded now reads), into
+    /// blur_buffer_readback. Returns the mapped bytes, empty when it can't be read.
+    std::span<const u8> ReadBackBuffer(VAddr address, u64 size);
+    /// Statistics: a new image a shader writes, uploaded from guest memory first.
+    /// Returns true when the shader only writes it, bound whole with a thread for every texel.
+    bool NoteNewStorageImage(const VideoCore::Image& image, const VideoCore::ImageViewInfo& view,
+                             const Shader::ImageResource& res, const Shader::Info& stage);
     void BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
 
@@ -285,6 +368,12 @@ private:
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
     bool IsComputeImageClear(const Pipeline* pipeline);
+    /// Clears `range` to `value` as `format`, the format the game clears it in. An image kept
+    /// in another format of the same size (memory used by targets of several formats) is
+    /// cleared through a view in that format, so it holds the game's bytes; a clear in the
+    /// image's own format converts the value to it instead.
+    void ClearImageAs(VideoCore::Image& image, const VideoCore::SubresourceRange& range,
+                      vk::Format format, const vk::ClearValue& value);
 
 private:
     friend class VideoCore::BufferCache;
@@ -529,13 +618,32 @@ private:
         u32 pairs;
         u32 stage_a_draws;
         bool begin;
+        u64 frame; ///< game frame the GPU command thread saw the dump in
+        std::chrono::steady_clock::time_point time;
+        /// Drawn at the render size: the pixels it counts there stand for this many each at the
+        /// game's resolution (1: not moved).
+        float count_scale{1.0f};
+        /// What the test's last box was drawn against (stage A's registers).
+        u64 depth_address{};
+        u32 depth_extent{};  ///< the size hint (0: none)
+        u32 depth_control{}; ///< DB_DEPTH_CONTROL
+        u32 index{};         ///< the game's n-th test of its frame
     };
     struct {
         VAddr begin_address{};
         u64 begin_value{};
         u32 draws{};
         bool open{};
+        float count_scale{1.0f};
+        u64 depth_address{};
+        u32 depth_extent{};
+        u32 depth_control{};
+        u32 pairs{};
+        u32 index{};
     } occlusion_a; ///< GPU command thread
+    u64 occlusion_index_frame{};
+    u32 occlusion_next_index{};
+    std::atomic<u64> occlusion_known_waits{};
     struct {
         bool open{};
         bool dropped{};
@@ -543,6 +651,16 @@ private:
         u32 draws_seen{};
         u64* results{};
         u64 begin_value{};
+        u64 frame{};
+        std::chrono::steady_clock::time_point time{};
+        float count_scale{1.0f};
+        u64 depth_address{};
+        u32 depth_extent{};
+        u32 depth_control{};
+        u64 depth_view{};   ///< the depth attachment its boxes were recorded with
+        u32 render_size{};  ///< the render pass's width | height << 16
+        bool depth_clear{}; ///< that pass clears its depth
+        u32 index{};
         boost::container::small_vector<u32, 4> queries;
     } occlusion_b; ///< draw recorder
     struct PendingOcclusion {
@@ -552,8 +670,138 @@ private:
         u64 tick;
         boost::container::small_vector<u32, 4> queries;
         bool known;
+        u64 frame;
+        std::chrono::steady_clock::time_point time;
+        std::chrono::steady_clock::time_point closed; ///< the draw recorder ended it
+        float count_scale{1.0f};
+        u64 depth_address{};
+        u32 depth_extent{};
+        u32 depth_control{};
+        u64 depth_view{};
+        u32 render_size{};
+        bool depth_clear{};
+        u32 index{};
     };
+    /// One-frame hidden blips: a test's last three answers (visible, hidden, visible in
+    /// consecutive frames) with what each was drawn against. Under occlusion_mutex.
+    struct OcclusionSlotAnswer {
+        u64 frame{};
+        u64 count{};
+        u64 depth_address{};
+        u32 depth_extent{};
+        u32 depth_control{};
+        u64 depth_view{};
+        u32 render_size{};
+        bool depth_clear{};
+        bool known{};
+    };
+    std::unordered_map<u64*, std::array<OcclusionSlotAnswer, 3>> occlusion_slots;
+    /// The same by the test's place in the game's frame (n-th test), frame after frame, whatever
+    /// result slot it uses.
+    struct OcclusionIndexAnswer {
+        u64 frame{};
+        u64 count{};
+        u64* results{};
+    };
+    std::unordered_map<u32, std::array<OcclusionIndexAnswer, 3>> occlusion_indices;
+    std::atomic<u64> occlusion_index_blips{};
+    u64 pipe_stats_occlusion_index_blips{};
+    u32 occlusion_index_blips_logged{};
+    std::array<std::atomic<u64>, 4> occlusion_slot_gaps{}; ///< frames between a slot's answers
+    std::atomic<u64> occlusion_blips{};
+    /// Who lets kept pages go (logged): the first ones, and counts by thread and access.
+    std::atomic<u32> occlusion_release_logged{};
+    std::array<std::atomic<u64>, 8> occlusion_release_kinds{};
+    /// Occlusion tests tolerant of a pixel: the copy of the scene's depth (made for the first
+    /// test draw of a group of tests).
+    std::unique_ptr<BbOcclusionDepth> occlusion_depth;
+    /// Better ambient occlusion (GT-VBAO, after bbport 0.7): made when the setting is first on.
+    std::unique_ptr<BbVbao> vbao;
+    /// Texture 1 of the draw's pixel shader (after BindResources). image_bindings holds the last
+    /// bound stage's (the vertex shader's), and is not filled when a remembered texture set is
+    /// reused.
+    VideoCore::ImageId stage_texture1{};
+    /// After the draw that ends the game's AO: overwrites it with VBAO (when on).
+    void BetterAoAfterDraw(const GraphicsPipeline* pipeline);
+    bool occlusion_depth_built{};
+    vk::Image occlusion_depth_source{};
+    vk::ImageView occlusion_depth_view{};
+    std::atomic<u64> occlusion_depth_copies{};
+    u64 pipe_stats_occlusion_depth_copies{};
+    /// Draw recorder: a test draw's pass uses the copy instead of the scene's depth.
+    void UseTolerantOcclusionDepth(RenderState& state);
+    u64 pipe_stats_occlusion_blips{};
+    u32 occlusion_blips_logged{};
+    /// Pending answers, the query pool's busy flags and its host resets: under occlusion_mutex
+    /// (the answer thread reads them too).
+    std::mutex occlusion_mutex;
+    std::condition_variable_any occlusion_cv;
     std::deque<PendingOcclusion> occlusion_pending;
+    std::atomic<u32> occlusion_waiting{};
+    /// Game frames (OnSubmit) and answer statistics: frames from the test to its answer (0, 1,
+    /// 2, 3+), the time, and tests the game began again before the previous answer reached it.
+    std::atomic<u64> occlusion_frame{};
+    std::array<std::atomic<u64>, 4> occlusion_late_frames{};
+    std::atomic<u64> occlusion_late_ns{};
+    std::atomic<u64> occlusion_retested{};
+    /// Where an answer's time went: GPU command thread to draw recorder (test begun to ended
+    /// there), waiting for its submission, and the GPU (submission to answer).
+    std::array<std::atomic<u64>, 3> occlusion_span_ns{};
+    std::atomic<u64> occlusion_span_count{};
+    std::atomic<u64> occlusion_early_submits{};
+    std::atomic<u64> occlusion_early_skipped{};
+    std::array<u64, 5> pipe_stats_occlusion_span{};
+    /// Submission times by tick (the answer thread looks its test's up).
+    struct SubmitTime {
+        std::atomic<u64> tick{~0ULL};
+        std::atomic<s64> ns{};
+    };
+    std::array<SubmitTime, 256> submit_times{};
+    /// Draw recorder: a test ended since the last submission (cleared by any submission).
+    std::atomic<bool> occlusion_submit_pending{};
+    /// Draw recorder: the tests recorded so far to the GPU (early submission).
+    void OcclusionEarlySubmit();
+    static void OnDrawPipeIdle(void* context);
+    /// The answer thread runs (quick answers, or waiting for answers).
+    [[nodiscard]] static bool QuickOcclusionAnswers();
+    /// Wait for occlusion answers: pages of results not yet answered, kept from the game (their
+    /// reads watched) until the last answer in them is written.
+    struct OcclusionTrap {
+        u32 pending{};
+        u32 unrecorded{}; ///< begun by the GPU command thread, not by the draw recorder yet
+        bool tracked{};
+    };
+    std::mutex occlusion_trap_mutex;
+    std::condition_variable occlusion_trap_cv;
+    std::unordered_map<VAddr, OcclusionTrap> occlusion_traps;
+    std::atomic<u32> occlusion_trap_count{};
+    /// Game reads before the answer, the time they waited, those given up on, answers in before
+    /// the game read, and pages let go for the GPU side's own access.
+    std::array<std::atomic<u64>, 6> occlusion_trap_stats{};
+    std::array<u64, 6> pipe_stats_occlusion_trap{};
+    /// GPU command thread: the results are kept from the game from the moment the game's test
+    /// is decoded (the game can read them before the draw recorder gets to the test).
+    void OcclusionTrapBegin(u64* results, u32 pairs);
+    /// Draw recorder: it got to the test.
+    void OcclusionTrapRecorded(u64* results, u32 pairs);
+    /// Writes `size` bytes of `value` (the game's clear of a block) past the protection of a
+    /// page kept from the game; false when the range is not on one (written as usual).
+    bool OcclusionTrapFill(VAddr address, u64 size, u32 value);
+    std::array<u64, 6> pipe_stats_occlusion_late{};
+    /// Quick occlusion answers: a thread waits for the GPU and writes each answer at once.
+    void OcclusionAnswerThread(std::stop_token stop);
+    /// The GPU's count for a finished test (under occlusion_mutex), written to game memory by
+    /// WriteOcclusionAnswer after the lock is released (a write fault there may wait for the
+    /// GPU command thread).
+    struct OcclusionAnswer {
+        u64* results;
+        u64 begin;
+        u32 pairs;
+        u64 count;
+        bool provisional{}; ///< "visible until answered": no answer yet
+    };
+    OcclusionAnswer AnswerOcclusion(const PendingOcclusion& test);
+    void WriteOcclusionAnswer(const OcclusionAnswer& answer);
     static constexpr u32 OcclusionPoolSize = 4096;
     static constexpr u32 NoOcclusionQuery = ~0u;
     vk::UniqueQueryPool occlusion_pool;
@@ -565,6 +813,7 @@ private:
     std::atomic<u64> occlusion_unknown{};
     u32 occlusion_poll_counter{};
     std::array<u64, 5> pipe_stats_occlusion{};
+    std::jthread occlusion_answer_thread; ///< started on first use
     void OcclusionTaskRun(const OcclusionTask& task);
     bool OcclusionRedirectBegin();
     void OcclusionRedirectEnd();
@@ -575,7 +824,14 @@ private:
         AmdGpu::DepthView depth_view{};
         AmdGpu::Address htile{};
         AmdGpu::CbDbExtent extent{};
+        u64 frame{};    ///< game frame it was last drawn with depth writes in
+        bool written{}; ///< drawn with depth writes at all
     } scene_depth; ///< GPU command thread
+    /// Tests moved to the scene's depth: drawn in this game frame with depth writes, or only in
+    /// an earlier one (the test then sees where things were a frame ago).
+    std::atomic<u64> occlusion_depth_current{};
+    std::atomic<u64> occlusion_depth_older{};
+    std::array<u64, 2> pipe_stats_occlusion_depth{};
     struct {
         AmdGpu::DepthBuffer depth_buffer{};
         AmdGpu::DepthView depth_view{};
@@ -632,6 +888,10 @@ private:
         u64 packet;
         VAddr begin;
         VAddr end;
+        /// Queued writes: what writes there (a static name) and the shader for storage writes.
+        const char* writer{};
+        u64 shader{};
+        bool shader_write{}; ///< a shader's storage write (else a task)
     };
     std::deque<PendingWrite> pending_writes;
     /// Guest ranges queued packets read buffers from when recorded (not copied ahead).
@@ -757,13 +1017,23 @@ private:
     std::atomic<u64> a_profile_draws{};
     std::array<s64, static_cast<size_t>(ASection::Count)> pipe_stats_a_ns{};
     u64 pipe_stats_a_draws{};
+    // Stutter detail: every queued draw timed by section (stutter reports).
+    bool a_hitch{};
+    std::array<std::atomic<s64>, static_cast<size_t>(ASection::Count)> a_hitch_ns{};
+    std::atomic<u64> a_hitch_draws{};
     void ALap(ASection finished) {
-        if (!a_profile) [[likely]] {
+        if (!a_profile && !a_hitch) [[likely]] {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
-        a_profile_ns[static_cast<size_t>(finished)].fetch_add((now - a_lap).count(),
-                                                              std::memory_order_relaxed);
+        if (a_profile) {
+            a_profile_ns[static_cast<size_t>(finished)].fetch_add((now - a_lap).count(),
+                                                                  std::memory_order_relaxed);
+        }
+        if (a_hitch) {
+            a_hitch_ns[static_cast<size_t>(finished)].fetch_add((now - a_lap).count(),
+                                                                std::memory_order_relaxed);
+        }
         a_lap = now;
     }
     void ABeginDraw();

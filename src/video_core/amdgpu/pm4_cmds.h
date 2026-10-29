@@ -696,6 +696,28 @@ struct PM4CmdWaitRegMem {
         return reg.Value();
     }
 
+    /// The wait's condition for a value known without reading it.
+    bool TestValue(u32 value) const {
+        switch (function.Value()) {
+        case Function::Always:
+            return true;
+        case Function::LessThan:
+            return (value & mask) < ref;
+        case Function::LessThanEqual:
+            return (value & mask) <= ref;
+        case Function::Equal:
+            return (value & mask) == ref;
+        case Function::NotEqual:
+            return (value & mask) != ref;
+        case Function::GreaterThanEqual:
+            return (value & mask) >= ref;
+        case Function::GreaterThan:
+            return (value & mask) > ref;
+        default:
+            return false;
+        }
+    }
+
     bool Test(std::span<const u32> regs) const {
         u32 value = mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()];
         switch (function.Value()) {

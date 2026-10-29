@@ -207,9 +207,10 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
             u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
             memcpy(backing, data, copy_size);
+            // (The source moved on once per piece: it went twice as far before, so a write over
+            // more than one physical area copied the wrong data into the areas after the first.)
             data = static_cast<const u8*>(data) + copy_size;
             size -= copy_size;
-            data = static_cast<const u8*>(data) + copy_size;
         }
     }
 

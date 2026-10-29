@@ -63,6 +63,8 @@ public:
     // F1's Object motion vectors (dlss.ini object_motion) with an upscaler requested.
     bool ObjectMotionRequested() const;
     void SetObjectMotion(BbObjectMotion* object_motion);
+    // The motion blur watch's view of this frame (blur matrix, camera change, passes).
+    std::string DescribeBlur() const;
 
     struct DrawInfo {
         u64 vs_hash;

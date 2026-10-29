@@ -77,6 +77,11 @@ private:
     std::string runningGameSerial = "";
     bool isGameRunning = false;
     bool closeOnSave = false;
+    /// Controller: a setting row has the focus this frame (d-pad right then jumps to Save).
+    bool rowFocused = false;
+    void NoteRowFocus() {
+        rowFocused |= ImGui::IsItemFocused();
+    }
     int openedFrame = 0; ///< ImGui frame the window was opened on (Prepare)
     int deleteProfileIndex = -1;
 
@@ -189,7 +194,24 @@ private:
     bool bbSkipLeftOutLevelsSetting;
     bool bbDirectTextureCopiesSetting;
     int bbCopyThreadsSetting; ///< index into copyThreadOptions
+    bool renderdocSetting;
+    int bbRdocCaptureFramesSetting;
     bool bbCachedTextureStagingSetting;
+    bool bbLowerDetailFirstSetting;
+    bool bbClearShaderWrittenSetting;
+    bool bbCeSkipHugeWritesSetting;
+    bool bbEvictKeepProtectionSetting;
+    bool bbEvictKeepReturningSetting;
+    bool bbProtectHelperThreadSetting;
+    bool bbQuickOcclusionAnswersSetting;
+    bool bbOcclusionVisibleUntilAnsweredSetting;
+    bool bbOcclusionEarlySubmitSetting;
+    bool bbOcclusionWaitForAnswersSetting;
+    bool bbOcclusionGameResolutionCountsSetting;
+    bool bbOcclusionTolerantDepthSetting;
+    bool bbCpuCopyShaderSetting;
+    bool bbCopySkipSameSetting;
+    bool bbClearOneLayerSetting;
     bool bbSpreadLoadsSetting;
     bool bbStutterDetailSetting;
     int bbVramBudgetTestSetting;

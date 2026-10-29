@@ -691,9 +691,94 @@ struct VulkanSettings {
     // otherwise this many, leaving two cores); applies after a restart. Traversal bursts of new
     // textures copy 200-440 MiB in one frame: ~7 GB/s on 4 threads, ~10 GB/s on 8.
     Setting<int> bb_copy_threads{0};
+    // RenderDoc (diagnostics): frames one F12 capture takes, one after another in one file.
+    Setting<int> bb_rdoc_capture_frames{1};
     // Texture uploads staged in cached system memory instead of write-combined (uncached)
     // memory: faster for the CPU's copy, possibly slower for the GPU's read. Off: uncached.
     Setting<bool> bb_cached_texture_staging{false};
+    // Lower detail first: in a burst of new textures (a traversal load) their largest level
+    // waits and arrives over the next frames within a per-frame budget; meanwhile shaders
+    // sample the next level down (softer for a few frames). Needs VK_EXT_image_view_min_lod.
+    Setting<bool> bb_lower_detail_first{false};
+    // Clear new shader-written images: a new image a compute shader only writes, bound whole
+    // with a thread for every texel, is cleared on the GPU instead of uploaded from guest memory
+    // first (the shader overwrites it). Traversal bursts uploaded 180-410 MiB of them.
+    Setting<bool> bb_clear_shader_written{false};
+    // Constant dumps past huge shader writes: a queued shader's storage write declared over
+    // 256 MiB (a descriptor over all of memory, ~3.7 GiB in Bloodborne) does not hold up a
+    // constant dump to memory inside it; the dump is written at once, as with nothing queued
+    // (the command thread waited 20-40 ms for the draw recorder in traversal bursts).
+    Setting<bool> bb_ce_skip_huge_writes{false};
+    // Cheaper buffer refill (buffer eviction): evicted buffers keep their page protection and
+    // are uploaded straight from guest memory when made resident again, instead of being marked
+    // changed (unprotected) at eviction and protected again, page run by page run, at their next
+    // use (~12-15 ms per traversal burst).
+    Setting<bool> bb_evict_keep_protection{false};
+    // Keep returning buffers (buffer eviction): a loading screen evicts only what VRAM needs
+    // (down to 1 GiB below the pressure limit) instead of every buffer idle for 2 s (~700 MiB
+    // per respawn, ~170 MiB of it uploaded again in the next area's first frames), and buffers
+    // that came back after an eviction are evicted last.
+    Setting<bool> bb_evict_keep_returning{false};
+    // Protection on a helper thread: a new texture's memory protection (noticing the game's
+    // writes) is done by one helper thread instead of the draw recorder (~6-9 ms of a traversal
+    // burst); the texture's background copies wait for it. Needs background texture copies.
+    Setting<bool> bb_protect_helper_thread{false};
+    // Quick occlusion answers (with real occlusion tests): a thread waits for the GPU and
+    // writes each test's answer into game memory as soon as the GPU has run it, instead of the
+    // draw recorder checking every 32 packets (none between frames). Areas coming round a
+    // corner were drawn a frame or two late (white for a moment).
+    Setting<bool> bb_quick_occlusion_answers{false};
+    // Visible until answered (with real occlusion tests): a test reads "visible" from when the
+    // game starts it until the GPU's answer replaces it, instead of "not ready". On the PS4 the
+    // answer is there within a few ms; here 20-25 ms, and a game that reads "not ready" keeps
+    // its last answer, so an area hidden last time stayed undrawn (white) round a corner.
+    Setting<bool> bb_occlusion_visible_until_answered{false};
+    // Submit occlusion tests at once (with real occlusion tests): after a group of the game's
+    // tests the work recorded so far goes to the GPU straight away, instead of with the rest of
+    // the frame, so the answers are back sooner (the game reads them 2-10 ms after the test;
+    // they took 20-25 ms). Skipped while background texture copies are still running.
+    Setting<bool> bb_occlusion_early_submit{false};
+    // Wait for occlusion answers (with real occlusion tests): a test's results are kept from the
+    // game (no access) until the GPU's answer is there; a game thread reading them sooner waits
+    // for it, up to 6 ms (then reads "visible" with "Visible until answered", or "not ready"),
+    // as on the PS4, where the answer is there before the game reads it.
+    Setting<bool> bb_occlusion_wait_for_answers{false};
+    // Occlusion counts at the game's resolution (with real occlusion tests and a render size
+    // below the output): a test drawn at the render size counts fewer pixels (a quarter at
+    // half size); its count is scaled to the game's resolution, as the game expects (it uses the
+    // count itself, e.g. for how much of an area or light shows).
+    Setting<bool> bb_occlusion_game_resolution_counts{false};
+    // Occlusion tests tolerant of a pixel (with real occlusion tests): the game's test boxes are
+    // tested against a copy of the scene's depth where each pixel holds the farthest depth
+    // around it. An area showing through a gap of about a pixel read 0 pixels in some frames
+    // (the upscaler's sub-pixel camera jitter and sub-pixel movement) and was not drawn for that
+    // frame (white or sky for a frame).
+    Setting<bool> bb_occlusion_tolerant_depth{false};
+    // Copy shader on the CPU: the game's GPU copy shader (thousands of small copies a second)
+    // is done in game memory when neither side holds data only the GPU has. Its destination
+    // was marked GPU-written, and the game's next write near it waited for the GPU to finish
+    // (3-16 ms each, the slow in-play frames when running into new parts of an area).
+    Setting<bool> bb_cpu_copy_shader{false};
+    // With "Copy shader on the CPU": a copy whose destination already holds the source's bytes is
+    // left out. Writing them again still marked the memory changed, so the buffers over it were
+    // uploaded again.
+    Setting<bool> bb_copy_skip_same{false};
+    // Clear one face of a cube or one layer of an array: the game clears its point lights'
+    // shadow cube a face at a time with a compute shader. Only whole images were cleared as
+    // images; a face was left to the shader, which wrote memory only, and the face kept its
+    // older shadows (wedges of light in lamp shadows).
+    Setting<bool> bb_clear_one_layer{false};
+    // Better ambient occlusion: the game's screen-space AO replaced with GT-VBAO (ground-truth
+    // AO with a visibility bitmask) from the scene's depth and normals: contact shadows in
+    // corners, under objects and in carvings, without the game's halos.
+    Setting<bool> bb_vbao{false};
+    // Its strength (exponent on the visibility, x100) and reach (metres, x100). Set in the F1
+    // window, global only: a game's own settings file kept an old value that the F1 window's
+    // change did not replace.
+    Setting<int> bb_vbao_strength{150};
+    Setting<int> bb_vbao_radius{150};
+    // Settings window: the threaded renderer's individual settings are listed (remembered).
+    Setting<bool> bb_show_threaded_settings{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -716,17 +801,53 @@ struct VulkanSettings {
             make_override<VulkanSettings>("pipeline_cache_archived",
                                           &VulkanSettings::pipeline_cache_archived),
             make_override<VulkanSettings>("bb_copy_threads", &VulkanSettings::bb_copy_threads),
+            make_override<VulkanSettings>("bb_rdoc_capture_frames",
+                                          &VulkanSettings::bb_rdoc_capture_frames),
             make_override<VulkanSettings>("bb_cached_texture_staging",
                                           &VulkanSettings::bb_cached_texture_staging),
+            make_override<VulkanSettings>("bb_lower_detail_first",
+                                          &VulkanSettings::bb_lower_detail_first),
+            make_override<VulkanSettings>("bb_clear_shader_written",
+                                          &VulkanSettings::bb_clear_shader_written),
+            make_override<VulkanSettings>("bb_ce_skip_huge_writes",
+                                          &VulkanSettings::bb_ce_skip_huge_writes),
+            make_override<VulkanSettings>("bb_evict_keep_protection",
+                                          &VulkanSettings::bb_evict_keep_protection),
+            make_override<VulkanSettings>("bb_evict_keep_returning",
+                                          &VulkanSettings::bb_evict_keep_returning),
+            make_override<VulkanSettings>("bb_protect_helper_thread",
+                                          &VulkanSettings::bb_protect_helper_thread),
+            make_override<VulkanSettings>("bb_quick_occlusion_answers",
+                                          &VulkanSettings::bb_quick_occlusion_answers),
+            make_override<VulkanSettings>("bb_cpu_copy_shader",
+                                          &VulkanSettings::bb_cpu_copy_shader),
+            make_override<VulkanSettings>("bb_copy_skip_same", &VulkanSettings::bb_copy_skip_same),
+            make_override<VulkanSettings>("bb_clear_one_layer",
+                                          &VulkanSettings::bb_clear_one_layer),
+            make_override<VulkanSettings>("bb_occlusion_visible_until_answered",
+                                          &VulkanSettings::bb_occlusion_visible_until_answered),
+            make_override<VulkanSettings>("bb_occlusion_early_submit",
+                                          &VulkanSettings::bb_occlusion_early_submit),
+            make_override<VulkanSettings>("bb_occlusion_wait_for_answers",
+                                          &VulkanSettings::bb_occlusion_wait_for_answers),
+            make_override<VulkanSettings>("bb_occlusion_game_resolution_counts",
+                                          &VulkanSettings::bb_occlusion_game_resolution_counts),
+            make_override<VulkanSettings>("bb_occlusion_tolerant_depth",
+                                          &VulkanSettings::bb_occlusion_tolerant_depth),
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(VulkanSettings, gpu_id, renderdoc_enabled, vkvalidation_enabled,
-                                   vkvalidation_core_enabled, vkvalidation_sync_enabled,
-                                   vkvalidation_gpu_enabled, vkcrash_diagnostic_enabled,
-                                   vkhost_markers, vkguest_markers, pipeline_cache_enabled,
-                                   pipeline_cache_archived, bb_copy_threads,
-                                   bb_cached_texture_staging)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
+    VulkanSettings, gpu_id, renderdoc_enabled, vkvalidation_enabled, vkvalidation_core_enabled,
+    vkvalidation_sync_enabled, vkvalidation_gpu_enabled, vkcrash_diagnostic_enabled, vkhost_markers,
+    vkguest_markers, pipeline_cache_enabled, pipeline_cache_archived, bb_copy_threads,
+    bb_cached_texture_staging, bb_lower_detail_first, bb_clear_shader_written,
+    bb_ce_skip_huge_writes, bb_evict_keep_protection, bb_evict_keep_returning,
+    bb_protect_helper_thread, bb_cpu_copy_shader, bb_copy_skip_same,
+    bb_clear_one_layer, bb_quick_occlusion_answers, bb_occlusion_visible_until_answered,
+    bb_occlusion_early_submit, bb_occlusion_wait_for_answers, bb_occlusion_game_resolution_counts,
+    bb_occlusion_tolerant_depth, bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius,
+    bb_show_threaded_settings)
 
 // -------------------------------
 // Main manager
@@ -1014,7 +1135,29 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbSkipLeftOutLevels, bb_skip_left_out_levels)
     SETTING_FORWARD_BOOL(m_gpu, BbDirectTextureCopies, bb_direct_texture_copies)
     SETTING_FORWARD(m_vulkan, BbCopyThreads, bb_copy_threads)
+    SETTING_FORWARD(m_vulkan, BbRdocCaptureFrames, bb_rdoc_capture_frames)
     SETTING_FORWARD_BOOL(m_vulkan, BbCachedTextureStaging, bb_cached_texture_staging)
+    SETTING_FORWARD_BOOL(m_vulkan, BbLowerDetailFirst, bb_lower_detail_first)
+    SETTING_FORWARD_BOOL(m_vulkan, BbClearShaderWritten, bb_clear_shader_written)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCeSkipHugeWrites, bb_ce_skip_huge_writes)
+    SETTING_FORWARD_BOOL(m_vulkan, BbEvictKeepProtection, bb_evict_keep_protection)
+    SETTING_FORWARD_BOOL(m_vulkan, BbEvictKeepReturning, bb_evict_keep_returning)
+    SETTING_FORWARD_BOOL(m_vulkan, BbProtectHelperThread, bb_protect_helper_thread)
+    SETTING_FORWARD_BOOL(m_vulkan, BbQuickOcclusionAnswers, bb_quick_occlusion_answers)
+    SETTING_FORWARD_BOOL(m_vulkan, BbOcclusionVisibleUntilAnswered,
+                         bb_occlusion_visible_until_answered)
+    SETTING_FORWARD_BOOL(m_vulkan, BbOcclusionEarlySubmit, bb_occlusion_early_submit)
+    SETTING_FORWARD_BOOL(m_vulkan, BbOcclusionWaitForAnswers, bb_occlusion_wait_for_answers)
+    SETTING_FORWARD_BOOL(m_vulkan, BbOcclusionGameResolutionCounts,
+                         bb_occlusion_game_resolution_counts)
+    SETTING_FORWARD_BOOL(m_vulkan, BbOcclusionTolerantDepth, bb_occlusion_tolerant_depth)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCpuCopyShader, bb_cpu_copy_shader)
+    SETTING_FORWARD_BOOL(m_vulkan, BbCopySkipSame, bb_copy_skip_same)
+    SETTING_FORWARD_BOOL(m_vulkan, BbClearOneLayer, bb_clear_one_layer)
+    SETTING_FORWARD_BOOL(m_vulkan, BbVbao, bb_vbao)
+    SETTING_FORWARD(m_vulkan, BbVbaoStrength, bb_vbao_strength)
+    SETTING_FORWARD(m_vulkan, BbVbaoRadius, bb_vbao_radius)
+    SETTING_FORWARD_BOOL(m_vulkan, BbShowThreadedSettings, bb_show_threaded_settings)
     SETTING_FORWARD_BOOL(m_gpu, BbSpreadLoads, bb_spread_loads)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)

@@ -182,6 +182,7 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_volume_up", "kpplus"},
             {"hotkey_volume_down", "kpminus"},
             {"hotkey_emulator_settings", "f3"},
+            {"hotkey_emulator_settings_controller", "l3, r3"},
             {"hotkey_toggle_friends", "f2"},
             {"hotkey_toggle_dlss", "f1"},
         };

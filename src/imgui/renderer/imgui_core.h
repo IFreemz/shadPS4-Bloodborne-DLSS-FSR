@@ -43,4 +43,7 @@ void RenderGameFrame(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image
 
 bool MustKeepDrawing(); // Force the emulator redraw
 
+/// Windows' display scaling of the game window (1.0 at 100%).
+float DisplayScale();
+
 } // namespace ImGui::Core

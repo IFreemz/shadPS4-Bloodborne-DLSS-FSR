@@ -38,6 +38,9 @@ void Async(std::function<void()> task);
 /// Returns whether there was anything to wait for.
 bool WaitAsync();
 
+/// Whether any task passed to Async() is still queued or running.
+bool AsyncPending();
+
 /// The number of pool threads (0: a quarter of the logical cores, at most 4). Only before the
 /// pool's first use; returns the number it runs with.
 u32 Configure(u32 workers);

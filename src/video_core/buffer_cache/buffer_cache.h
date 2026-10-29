@@ -19,6 +19,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
 namespace AmdGpu {
@@ -118,6 +119,8 @@ public:
     void SetEarlyWriteback(bool enabled) noexcept {
         early_writeback.store(enabled, std::memory_order_relaxed);
     }
+    /// Diagnostics: the shader whose written buffers are bound next (0 for anything else).
+    static void SetWriterShader(u64 hash) noexcept;
     [[nodiscard]] bool EarlyWriteback() const noexcept {
         return early_writeback.load(std::memory_order_relaxed);
     }
@@ -148,9 +151,14 @@ public:
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainGeometryBuffer(VAddr device_addr, u32 size);
 
     /// Attempts to obtain a buffer without modifying the cache contents.
-    /// The first `skip` bytes are not needed (levels the image leaves out): not copied.
+    /// The first `skip` bytes are not needed (levels the image leaves out): not copied. Of them
+    /// the first `trim` (<= skip) get no staging memory either. The offset returned is where
+    /// guest byte 0 would be: only bytes from `trim` on may be read there.
+    /// `protect`: page ranges to protect before reading them (protection on a helper thread):
+    /// the copies wait for the helper thread to protect them (or they are protected here).
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size,
-                                                                     u32 skip = 0);
+                                                                     u32 skip = 0, u32 trim = 0,
+                                                                     ProtectRanges protect = {});
 
     /// Writes a GPU-produced buffer range back to emulated memory.
     bool DownloadMemoryFromBuffer(const Buffer* arena, VAddr device_addr, u64 size);
@@ -202,6 +210,13 @@ private:
     }
 
     const Buffer* GetArena(u64 first_block, u64 last_block);
+    /// Uploads guest ranges (BufferCopy: srcOffset = offset in the upload, dstOffset = guest
+    /// address, size) into the arena; copies on the copy threads when large.
+    void UploadRanges(const Buffer* arena,
+                      boost::container::small_vector<vk::BufferCopy, 4>& copies,
+                      size_t total_size_bytes);
+    /// GetArena, timed for stutter reports.
+    const Buffer* TimedArena(u64 first_block, u64 last_block);
 
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
@@ -223,12 +238,16 @@ private:
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
+    PageManager& page_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     std::unique_ptr<Buffer> null_index_buffer;
     RangeSet gpu_modified_ranges;
+    /// Cheaper buffer refill: evicted ranges still protected (unchanged since, as far as the
+    /// memory tracker knows), uploaded from guest memory when made resident again.
+    RangeSet evicted_ranges;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
@@ -272,6 +291,11 @@ private:
     };
     ResidentRangeList resident_ranges;
     std::unordered_map<u64, u64> resident_chunk_use; ///< 2 MiB chunk -> second of last use
+    /// Buffer eviction: 2 MiB chunks evicted (-> second of the eviction), and chunks that were
+    /// made resident again after one (-> second they came back; keep returning buffers).
+    std::unordered_map<u64, u64> evicted_chunks;
+    std::unordered_map<u64, u64> returned_chunks;
+    void NoteResidentAgain(VAddr address, u64 size);
     /// Chunks already marked used this second (MarkResidentUse skips the map write).
     struct ChunkUseMemo {
         u64 chunk{~0ull};
@@ -334,6 +358,15 @@ private:
     u64 readback_max_wait_ns{};
     std::mutex gpu_write_mutex;
     std::unordered_map<u64, u64> gpu_write_ticks;    ///< 64 KiB block -> tick of the last GPU write
+    /// Diagnostics: the last GPU write of each 64 KiB block (shader, the range it was bound
+    /// over), for the log of game writes that waited for unfinished GPU work.
+    struct GpuWriter {
+        u64 shader{};
+        VAddr base{};
+        u64 size{};
+    };
+    std::unordered_map<u64, GpuWriter> gpu_writers; ///< under gpu_write_mutex
+    u32 slow_write_logs{};
     u64 readback_queue_count{}, readback_queue_ns{}; ///< readbacks on the second queue (report)
 
     /// Early write-back state (see SetEarlyWriteback), under writeback_mutex.

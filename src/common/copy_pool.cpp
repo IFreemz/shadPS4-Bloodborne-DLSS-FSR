@@ -109,6 +109,10 @@ public:
         return true;
     }
 
+    bool AsyncPending() const {
+        return async_pending.load(std::memory_order_acquire) != 0;
+    }
+
 private:
     void Work(const std::function<void(std::size_t)>& task, std::size_t count) {
         while (true) {
@@ -213,6 +217,10 @@ void Async(std::function<void()> task) {
 
 bool WaitAsync() {
     return GetPool().WaitAsync();
+}
+
+bool AsyncPending() {
+    return GetPool().AsyncPending();
 }
 
 u32 AutoWorkers() {

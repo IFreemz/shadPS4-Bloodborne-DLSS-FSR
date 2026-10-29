@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include "common/alignment.h"
 #include "common/bb_tuning.h"
 #include "core/emulator_settings.h"
@@ -17,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/texture_cache/texture_cache.h"
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
@@ -30,6 +32,7 @@ struct CopyStats {
     std::atomic<u64> dispatches, batches, commands, multi, copies, bytes, flushes, cpu_ns;
     std::atomic<u64> small, unaligned, overlapping, too_large;
     std::atomic<u64> after_write, overwrite_write, overwrite_read;
+    std::atomic<u64> cpu_batches, cpu_bytes, same_copies, same_bytes;
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 };
 CopyStats copy_stats;
@@ -52,6 +55,20 @@ void LogCopyStats() {
     const u64 overlapping = take(c.overlapping), too_large = take(c.too_large);
     const u64 after_write = take(c.after_write), overwrite_write = take(c.overwrite_write);
     const u64 overwrite_read = take(c.overwrite_read);
+    const u64 cpu_batches = take(c.cpu_batches), cpu_bytes = take(c.cpu_bytes);
+    const u64 same_copies = take(c.same_copies), same_bytes = take(c.same_bytes);
+    if (same_copies != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Copy shader: {:.0f} copies/s ({:.1f} MiB/s) left out, their destinations "
+                 "already held the bytes",
+                 same_copies / seconds, same_bytes / seconds / (1 << 20));
+    }
+    if (cpu_batches != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Copy shader on the CPU: {:.0f}% of batches ({:.1f} MiB/s) copied in game "
+                 "memory, the rest on the GPU (data the GPU wrote)",
+                 100.0 * cpu_batches / (cpu_batches + batches), cpu_bytes / seconds / (1 << 20));
+    }
     if (dispatches == 0 || commands == 0) {
         return;
     }
@@ -271,7 +288,9 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
                                  Rasterizer& rasterizer) {
     auto& runtime = rasterizer.GetRuntime();
     auto& buffer_cache = rasterizer.GetBufferCache();
+    auto& texture_cache = rasterizer.GetTextureCache();
     const bool diagnostics = EmulatorSettings.IsThreadedRendererDiagnostics();
+    const bool cpu_copies = EmulatorSettings.IsBbCpuCopyShader();
     const auto start =
         diagnostics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
@@ -350,6 +369,52 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             dst_offset_max = new_dst_offset_max;
         }
 
+        // Copy shader on the CPU: neither side holds data only the GPU has (buffers or images
+        // it wrote), so the copy is done in game memory now, in order with the work around it
+        // (later prefetches wait for the dispatch's write). The destination is then never marked
+        // GPU-written, and the game's next write near it doesn't wait for the GPU (3-16 ms
+        // each, mostly in newly streamed areas).
+        if (cpu_copies) {
+            const VAddr src_lo = src_buf_sharp.base_address + src_offset_min;
+            const VAddr dst_lo = dst_buf_sharp.base_address + dst_offset_min;
+            const u64 src_len = src_offset_max - src_offset_min;
+            const u64 dst_len = dst_offset_max - dst_offset_min;
+            const auto gpu_image = [&](VAddr address, u64 size) {
+                bool written = false;
+                texture_cache.ForEachImageInRegion(
+                    address, size, [&](VideoCore::ImageId, auto& image) {
+                        written |= True(image.flags & VideoCore::ImageFlagBits::GpuModified);
+                    });
+                return written;
+            };
+            if (!buffer_cache.IsRegionGpuModified(src_lo, src_len) &&
+                !buffer_cache.IsRegionGpuModified(dst_lo, dst_len) && !gpu_image(src_lo, src_len) &&
+                !gpu_image(dst_lo, dst_len)) {
+                u64 bytes = 0;
+                const bool skip_same = EmulatorSettings.IsBbCopySkipSame();
+                for (const auto& c :
+                     std::span{copies}.subspan(batch_start, batch_end - batch_start)) {
+                    auto* dst = std::bit_cast<void*>(dst_buf_sharp.base_address + c.dstOffset);
+                    const auto* src =
+                        std::bit_cast<const void*>(src_buf_sharp.base_address + c.srcOffset);
+                    // Skip copies that change nothing: writing the same bytes again still marks
+                    // the memory changed (a write fault) and the buffers over it are uploaded
+                    // again.
+                    if (skip_same && std::memcmp(dst, src, c.size) == 0) {
+                        Count(copy_stats.same_copies);
+                        Count(copy_stats.same_bytes, c.size);
+                        continue;
+                    }
+                    std::memmove(dst, src, c.size);
+                    bytes += c.size;
+                }
+                Count(copy_stats.cpu_batches);
+                Count(copy_stats.cpu_bytes, bytes);
+                batch_start = batch_end;
+                continue;
+            }
+        }
+
         // Obtain buffers for the total source and destination ranges.
         const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBuffer(
             src_buf_sharp.base_address + src_offset_min, src_offset_max - src_offset_min, false);
@@ -424,7 +489,9 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             u32 last = first + 1;
             for (; last < batches.size(); ++last) {
                 const auto& next = batches[last];
-                if (next.src != batches[first].src || next.dst != batches[first].dst) {
+                // Copy shader on the CPU: batches done in game memory leave gaps in the list.
+                if (next.src != batches[first].src || next.dst != batches[first].dst ||
+                    next.start != batches[last - 1].end) {
                     break;
                 }
                 const u64 s_lo = std::min(src_lo, next.range.src_offset);

@@ -53,6 +53,13 @@ public:
     DrawPipe(const DrawPipe&) = delete;
     DrawPipe& operator=(const DrawPipe&) = delete;
 
+    /// Stage B, after a packet when no other one has been handed over yet (before stage A can
+    /// see the pipe idle).
+    using IdleHandler = void (*)(void* context);
+    void SetIdleHandler(IdleHandler idle) noexcept {
+        idle_handler.store(idle, std::memory_order_release);
+    }
+
     /// The GPU command thread marks itself as stage A.
     static void SetStageA() noexcept {
         role = Role::StageA;
@@ -209,6 +216,10 @@ private:
             Common::GuestStats::recorder_busy.store(false, std::memory_order_relaxed);
             busy_ns.fetch_add((std::chrono::steady_clock::now() - start).count(),
                               std::memory_order_relaxed);
+            if (const auto idle = idle_handler.load(std::memory_order_acquire);
+                idle && published.load(std::memory_order_acquire) == at + header->size) {
+                idle(context);
+            }
             at += header->size;
             consumed_packets.fetch_add(1, std::memory_order_release);
             consumed.store(at, std::memory_order_release);
@@ -228,6 +239,7 @@ private:
     alignas(64) std::atomic<u32> wake{0};
     std::atomic<bool> sleeping{false};
     std::atomic<s64> busy_ns{0};
+    std::atomic<IdleHandler> idle_handler{nullptr};
     std::jthread thread;
 };
 

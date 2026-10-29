@@ -40,6 +40,9 @@ constexpr auto FRAME_PERIOD = std::chrono::milliseconds(16);
 // So with 16 GB of RAM or more, 1 GiB is kept ready (384 MiB below that).
 constexpr size_t MIN_UPLOAD_BLOCKS_SMALL = 24;
 constexpr size_t MIN_UPLOAD_BLOCKS_LARGE = 64;
+// Buffer uploads always stage in uncached memory: with texture staging in cached memory, that
+// ring kept nothing and a burst allocated a block again (16 MiB, 20-24 ms of pinned memory).
+constexpr size_t MIN_BUFFER_UPLOAD_BLOCKS = 8;
 constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
 constexpr u64 BLOCK_SIZE = 16_MB;
 // Graphics card memory released under VRAM pressure once unused this long (~3 s): taking it back
@@ -75,20 +78,39 @@ StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& sched
     // Allocated and touched now, so the pages are committed before the game streams.
     min_upload_blocks =
         SDL_GetSystemRAM() >= 15 * 1024 ? MIN_UPLOAD_BLOCKS_LARGE : MIN_UPLOAD_BLOCKS_SMALL;
-    auto& ring = rings[u32(MemoryType::HostUncached)];
-    for (size_t i = 0; i < min_upload_blocks; ++i) {
-        auto& block = ring.blocks.emplace_back(Block{
-            .buffer = std::make_unique<VideoCore::StreamBuffer>(
-                instance, scheduler, MemoryType::HostUncached, BLOCK_SIZE),
-            .last_used_frame = 0,
-        });
-        if (!block.buffer->mapped_data.empty()) {
-            std::memset(block.buffer->mapped_data.data(), 0, block.buffer->mapped_data.size());
+    // In the memory texture uploads use: with cached texture staging the kept blocks were in
+    // the other kind, and every burst after an idle spell allocated 150-220 MiB again (5-8 ms).
+    for (size_t type = 0; type < rings.size(); ++type) {
+        const size_t blocks = KeptBlocks(MemoryType(type));
+        auto& ring = rings[type];
+        for (size_t i = 0; i < blocks; ++i) {
+            auto& block = ring.blocks.emplace_back(Block{
+                .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler,
+                                                                    MemoryType(type), BLOCK_SIZE),
+                .last_used_frame = 0,
+            });
+            if (!block.buffer->mapped_data.empty()) {
+                std::memset(block.buffer->mapped_data.data(), 0, block.buffer->mapped_data.size());
+            }
         }
     }
 }
 
+size_t StagingBufferPool::KeptBlocks(MemoryType type) const {
+    if (type == TextureStagingType()) {
+        return min_upload_blocks;
+    }
+    return type == MemoryType::HostUncached && min_upload_blocks != 0 ? MIN_BUFFER_UPLOAD_BLOCKS
+                                                                      : 0;
+}
+
 StagingBufferPool::~StagingBufferPool() = default;
+
+MemoryType StagingBufferPool::TextureStagingType() const {
+    return EmulatorSettings.IsThreadedRenderer() && EmulatorSettings.IsBbCachedTextureStaging()
+               ? MemoryType::HostCached
+               : MemoryType::HostUncached;
+}
 
 StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 alignment, bool deferred,
                                             bool unsynchronized) {
@@ -227,8 +249,7 @@ void StagingBufferPool::TickFrame() {
     }
     ++frame;
     for (size_t type = 0; type < rings.size(); ++type) {
-        TrimRing(rings[type], streaming && type == u32(MemoryType::HostUncached) ? min_upload_blocks
-                                                                                 : size_t{0});
+        TrimRing(rings[type], streaming ? KeptBlocks(MemoryType(type)) : size_t{0});
     }
     for (auto& cache : large_caches) {
         TrimLarge(cache);

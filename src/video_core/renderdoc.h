@@ -18,8 +18,11 @@ void StartCapture();
 /// Ends current renderdoc capture.
 void EndCapture();
 
-/// Triggers capturing process.
+/// Triggers capturing process (the next frames, as many as the setting says, in one file).
 void TriggerCapture();
+
+/// A capture is being recorded.
+bool IsCapturing();
 
 /// Sets output directory for captures
 void SetOutputDir(const std::filesystem::path& path, const std::string& prefix);

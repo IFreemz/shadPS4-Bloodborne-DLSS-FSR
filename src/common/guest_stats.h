@@ -64,6 +64,72 @@ inline std::atomic<u64> image_allocs{0};
 inline std::atomic<u64> image_alloc_ns{0};
 inline std::atomic<u64> image_slow_allocs{0};
 inline std::atomic<u64> image_slow_alloc_ns{0};
+/// Lower detail first: new textures whose largest level waited (and its bytes), those whose
+/// largest level arrived later (within the per-frame budget, or at once for another use), and
+/// how long they were shown softer (total and longest).
+inline std::atomic<u64> detail_deferred{0};
+inline std::atomic<u64> detail_deferred_bytes{0};
+inline std::atomic<u64> detail_restored{0};
+inline std::atomic<u64> detail_restored_bytes{0};
+inline std::atomic<u64> detail_forced{0};
+inline std::atomic<u64> detail_soft_ns{0};
+inline std::atomic<u64> detail_soft_max_ns{0};
+/// Texture uploads by what asked for them (a texture a draw or dispatch samples, a storage
+/// image, a render or depth target, merging overlapping images, the displayed frame, anything
+/// else) and by the draw recorder packet running then (draws, indirect draws, dispatches,
+/// indirect dispatches, queued jobs such as DMA copies, or not on the draw recorder).
+enum class UploadPath : u8 { Texture, Storage, Target, Overlap, Display, Other, Count };
+inline constexpr size_t UploadPackets = 6;
+inline std::array<std::atomic<u64>, static_cast<size_t>(UploadPath::Count)> upload_path_bytes{};
+inline std::array<std::atomic<u64>, UploadPackets> upload_packet_bytes{};
+inline thread_local UploadPath upload_path = UploadPath::Other;
+inline thread_local u8 upload_packet = UploadPackets - 1;
+inline void NoteUploadPath(u64 bytes) {
+    upload_path_bytes[static_cast<size_t>(upload_path)].fetch_add(bytes, std::memory_order_relaxed);
+    upload_packet_bytes[upload_packet].fetch_add(bytes, std::memory_order_relaxed);
+}
+struct UploadPathScope {
+    explicit UploadPathScope(UploadPath path) : previous{upload_path} {
+        upload_path = path;
+    }
+    ~UploadPathScope() {
+        upload_path = previous;
+    }
+    UploadPathScope(const UploadPathScope&) = delete;
+    UploadPathScope& operator=(const UploadPathScope&) = delete;
+    UploadPath previous;
+};
+struct UploadPacketScope {
+    explicit UploadPacketScope(u8 packet) : previous{upload_packet} {
+        upload_packet = packet < UploadPackets - 1 ? packet : UploadPackets - 1;
+    }
+    ~UploadPacketScope() {
+        upload_packet = previous;
+    }
+    UploadPacketScope(const UploadPacketScope&) = delete;
+    UploadPacketScope& operator=(const UploadPacketScope&) = delete;
+    u8 previous;
+};
+/// New images a shader writes (storage) uploaded from guest memory before the write, by how
+/// the shader uses them: only written, the whole image bound and enough compute threads for
+/// every texel; also read (image loads or atomics); only part of the image bound; coverage
+/// unclear (fewer threads than texels, an indirect dispatch or not compute). And of all of them,
+/// those whose guest memory looked all zero (64 places sampled).
+enum class NewStorageUse : u8 { Whole, AlsoRead, Part, Unclear, Count };
+inline std::array<std::atomic<u64>, static_cast<size_t>(NewStorageUse::Count)> new_storage_bytes{};
+inline std::atomic<u64> new_storage_zero_bytes{0};
+/// GPU command thread (stutter detail): time and count by PM4 packet type (graphics queue,
+/// after any wait for the draw recorder; packets that wait for the game include that wait), and
+/// work done on that thread: page protection, buffers made resident, buffer uploads.
+inline std::array<std::atomic<u64>, 256> cmd_opcode_ns{};
+inline std::array<std::atomic<u64>, 256> cmd_opcode_count{};
+inline std::atomic<u64> cmd_protect_calls{0};
+inline std::atomic<u64> cmd_protect_ns{0};
+inline std::atomic<u64> cmd_resident_ns{0};
+inline std::atomic<u64> cmd_buffer_upload_bytes{0};
+inline std::atomic<u64> cmd_buffer_upload_ns{0};
+/// Clear new shader-written images: of them, cleared on the GPU instead of uploaded.
+inline std::atomic<u64> new_storage_cleared_bytes{0};
 /// Direct texture copies: guest bytes copied from the game's own addresses.
 inline std::atomic<u64> image_direct_bytes{0};
 /// Buffer data uploaded from guest memory, and the time the copies took.
@@ -174,23 +240,89 @@ enum class Detail : u32 {
     BufTrack,        ///< buffer ranges to upload found, marked and protected
     BufCopy,         ///< buffer staging and copy queued or recorded
     RecorderProtect, ///< page protection calls made on the draw recorder
+    BufStream,       ///< small read-only buffers copied into the stream buffer
+    BufResident,     ///< buffer memory made resident (arena blocks bound)
+    BufArena,        ///< buffer arena looked up
     Count,
 };
 inline std::atomic<bool> detail_timing{false};
 inline std::array<std::atomic<u64>, static_cast<size_t>(Detail::Count)> detail_ns{};
 inline std::atomic<u64> recorder_protect_calls{0};
 inline thread_local bool on_recorder = false;
+/// The detail step running on this thread (Count: none), and the draw recorder's page
+/// protection by the step it happened in (Count: outside any).
+inline thread_local Detail current_detail = Detail::Count;
+inline std::array<std::atomic<u64>, static_cast<size_t>(Detail::Count) + 1>
+    recorder_protect_ns_by{};
+inline std::array<std::atomic<u64>, static_cast<size_t>(Detail::Count) + 1>
+    recorder_protect_calls_by{};
+/// Buffers: small read-only copies into the stream buffer, and uploads from guest memory (buffers
+/// with data to upload, their ranges, and the bytes copied right away rather than on the copy
+/// threads).
+inline std::atomic<u64> stream_copies{0};
+inline std::atomic<u64> stream_copy_bytes{0};
+inline std::atomic<u64> buffer_syncs{0};
+inline std::atomic<u64> buffer_sync_ranges{0};
+inline std::atomic<u64> buffer_sync_inline_bytes{0};
+/// F1's "Log motion blur inputs": the next motion blur passes (and the depth producer) log
+/// every input they read.
+inline std::atomic<bool> blur_dump_requested{false};
+inline std::atomic<bool> texture_reload_requested{false};
+/// Cheaper buffer refill: evicted buffer data uploaded straight from guest memory when made
+/// resident again (no page protection change).
+inline std::atomic<u64> evicted_refill_bytes{0};
+inline std::atomic<u64> evicted_refills{0};
+/// Buffer eviction: bytes evicted, and evicted data made resident again, by how long after its
+/// eviction: under 10 s, 10-60 s, 1-5 min, later.
+inline std::atomic<u64> evicted_bytes_total{0};
+/// Protection on a helper thread: its protection calls and their time.
+inline thread_local bool on_protect_helper = false;
+inline std::atomic<u64> helper_protect_calls{0};
+inline std::atomic<u64> helper_protect_ns{0};
+inline std::array<std::atomic<u64>, 4> evicted_returned_bytes{};
+/// Buffer memory blocks asked from the driver while making buffers resident (and the time).
+inline std::atomic<u64> buffer_mem_allocs{0};
+inline std::atomic<u64> buffer_mem_alloc_ns{0};
+/// Constant engine (stutter detail): constant dumps to game memory, those that first waited
+/// for the draw recorder and that wait, the dumps' own time (writes that fault included), and
+/// the constant engine's time when run at the start or end of a submission (outside
+/// WaitOnCeCounter).
+inline std::atomic<u64> ce_dumps{0};
+inline std::atomic<u64> ce_dump_drains{0};
+inline std::atomic<u64> ce_dump_drain_ns{0};
+inline std::atomic<u64> ce_dump_write_ns{0};
+inline std::atomic<u64> ce_outside_ns{0};
+/// Why constant dumps waited: queued draws read the memory later, queued work (tasks, shader
+/// storage writes) writes it, too many queued reads to tell.
+inline std::atomic<u64> ce_wait_reads{0};
+inline std::atomic<u64> ce_wait_writes{0};
+inline std::atomic<u64> ce_wait_overflow{0};
+/// Constant dumps past huge writes: dumps written at once that only huge shader writes held up.
+inline std::atomic<u64> ce_huge_write_skips{0};
+/// Flips (the patched flip NOP on the command thread): count, waiting for the draw recorder
+/// first, and the flip signal itself (the game's flip handling, the presenter's frame wait).
+inline std::atomic<u64> flips{0};
+inline std::atomic<u64> flip_drain_ns{0};
+inline std::atomic<u64> flip_signal_ns{0};
+/// GPU command thread (stutter detail): waits for the draw recorder before packets, and the
+/// compute queues' packets.
+inline std::atomic<u64> cmd_drain_ns{0};
+inline std::atomic<u64> cmd_compute_ns{0}; ///< compute queue packets (waits included)
+inline std::atomic<u64> cmd_compute_packets{0};
 
 /// Adds the scope's time to `detail` while detail timing is on.
 class DetailTimer {
 public:
     explicit DetailTimer(Detail detail_)
-        : detail{detail_}, on{detail_timing.load(std::memory_order_relaxed)} {
+        : detail{detail_}, on{detail_timing.load(std::memory_order_relaxed)},
+          previous{current_detail} {
+        current_detail = detail;
         if (on) {
             start = std::chrono::steady_clock::now();
         }
     }
     ~DetailTimer() {
+        current_detail = previous;
         if (on) {
             detail_ns[static_cast<size_t>(detail)].fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -205,6 +337,7 @@ public:
 private:
     Detail detail;
     bool on;
+    Detail previous;
     std::chrono::steady_clock::time_point start{};
 };
 

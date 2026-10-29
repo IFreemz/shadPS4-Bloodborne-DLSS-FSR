@@ -965,7 +965,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                                VAddr cpu_address) {
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
-    texture_cache.UpdateImage(image_id);
+    {
+        Common::GuestStats::UploadPathScope path{Common::GuestStats::UploadPath::Display};
+        texture_cache.UpdateImage(image_id);
+    }
 
     // Keep rendering while presenting: with a frame limiter (RTSS) sleeping in the present, the
     // GPU threads no longer wait for it mid-frame, so nothing held the game back: frames queued

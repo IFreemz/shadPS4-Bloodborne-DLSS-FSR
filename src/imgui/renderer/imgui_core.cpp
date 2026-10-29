@@ -201,8 +201,11 @@ bool ProcessEvent(SDL_Event* event) {
         return io.WantCaptureKeyboard && io.Ctx->NavWindow != nullptr &&
                io.Ctx->NavWindow->ID != dock_id;
     }
-    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        // Never blocked, as with keys: a button held when a window opened (L3+R3 for the
+        // settings) and let go in it stayed pressed for the bindings afterwards.
+        return false;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
     case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
     case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
@@ -315,6 +318,10 @@ void RenderGameFrame(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image
     if (draw_data && draw_data->CmdListsCount > 0)
         Vulkan::RenderGameFrame(*draw_data, cmdbuf, game_frame);
     cmdbuf.endRendering();
+}
+
+float DisplayScale() {
+    return display_scale;
 }
 
 bool MustKeepDrawing() {

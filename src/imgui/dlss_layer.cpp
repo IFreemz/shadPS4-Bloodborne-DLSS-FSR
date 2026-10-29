@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <regex>
@@ -15,6 +16,7 @@
 #include <fmt/ranges.h>
 #include <imgui.h>
 
+#include "common/guest_stats.h"
 #include "common/path_util.h"
 #include "core/bb_mouse_camera.h"
 #include "core/bb_resolution.h"
@@ -252,6 +254,9 @@ public:
                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoNav |
                       ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoSavedSettings |
                       ImGuiWindowFlags_NoDocking)) {
+            // The same size whether "Menus sized by screen pixels" is on or not.
+            if (EmulatorSettings.IsBbIgnoreDisplayScale())
+                SetWindowFontScale(ImGui::Core::DisplayScale());
             Text("%.0f fps", stats.base_fps);
             if (stats.generating) {
                 SameLine();
@@ -817,6 +822,45 @@ void DlssLayer::Draw() {
             TextWrapped("%s", patch_message.c_str());
     }
 
+    // Applies at once: toggled while watching the game.
+    SeparatorText("Ambient occlusion");
+    {
+        bool vbao = EmulatorSettings.IsBbVbao();
+        if (Checkbox("Better ambient occlusion (GT-VBAO)", &vbao)) {
+            EmulatorSettings.SetBbVbao(vbao);
+            EmulatorSettings.Save();
+        }
+        if (IsItemHovered())
+            SetTooltip("The game's ambient occlusion replaced with GT-VBAO: deeper, cleaner "
+                       "contact shadows in corners,\nunder objects and in carvings, without "
+                       "the game's dark halos around thin things.");
+        BeginDisabled(!vbao);
+        // Stored as hundredths; saved when the slider is let go.
+        const auto slider = [](const char* name, int value, auto set) {
+            float shown = float(value) * 0.01f;
+            SetNextItemWidth(200.0f);
+            if (SliderFloat(name, &shown, 0.25f, 4.0f, "%.2f"))
+                set(int(std::lround(shown * 100.0f)));
+            if (IsItemDeactivatedAfterEdit())
+                EmulatorSettings.Save();
+        };
+        slider("Strength", EmulatorSettings.GetBbVbaoStrength(),
+               [](int v) { EmulatorSettings.SetBbVbaoStrength(v); });
+        if (IsItemHovered())
+            SetTooltip("How dark occluded places get (1.50 by default).");
+        slider("Reach (metres)", EmulatorSettings.GetBbVbaoRadius(),
+               [](int v) { EmulatorSettings.SetBbVbaoRadius(v); });
+        if (IsItemHovered())
+            SetTooltip("How far away something can be and still shade a surface (1.50 by "
+                       "default).");
+        if (Button("Defaults")) {
+            EmulatorSettings.SetBbVbaoStrength(150);
+            EmulatorSettings.SetBbVbaoRadius(150);
+            EmulatorSettings.Save();
+        }
+        EndDisabled();
+    }
+
     // Down here on purpose: hardly anyone wants it back.
     SeparatorText("Game effects");
     bool motion_blur = settings.Get("motion_blur", "0") != "0";
@@ -824,6 +868,19 @@ void DlssLayer::Draw() {
         settings.Set("motion_blur", motion_blur ? "1" : "0");
     SameLine();
     TextDisabled("(off = sharper in motion)");
+    // The whole picture but the character blurred (after a respawn): every input of the game's
+    // motion blur passes goes to the log, to compare with a frame that looks right.
+    if (Button("Log motion blur inputs"))
+        Common::GuestStats::blur_dump_requested.store(true, std::memory_order_relaxed);
+    SameLine();
+    TextDisabled("(press while the picture is blurred, and once when it looks right)");
+    // A texture that looks wrong: uploaded again from game memory. If it then looks right, the
+    // emulator's copy was out of date (the log lists textures still waiting for their largest
+    // level).
+    if (Button("Reload textures from game memory"))
+        Common::GuestStats::texture_reload_requested.store(true, std::memory_order_relaxed);
+    SameLine();
+    TextDisabled("(press while a texture looks wrong)");
     End();
 }
 

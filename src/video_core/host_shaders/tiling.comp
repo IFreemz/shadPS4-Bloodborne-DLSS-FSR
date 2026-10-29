@@ -105,6 +105,8 @@ layout (set = 0, binding = 2, scalar) uniform TilingInfo {
     uint micro_tiled_mips;
     uint num_mips;
     MipInfo mips[16];
+    uint texel_base; // detiling from a level on: its first texel
+    uint tiled_base; // and where the tiled data bound starts
 } info;
 
 uint32_t ComputePixelIndexWithinMicroTile(uint32_t x, uint32_t y, uint32_t z, uint32_t thickness) {
@@ -426,7 +428,7 @@ uint GetMipLevel(inout uint texel) {
 }
 
 void main() {
-    uint texel = gl_GlobalInvocationID.x;
+    uint texel = gl_GlobalInvocationID.x + info.texel_base;
     uint mip = GetMipLevel(texel);
     uint pitch = info.mips[mip].pitch_height & 0xffffu;
     uint height = info.mips[mip].pitch_height >> 16;
@@ -445,6 +447,7 @@ void main() {
     tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, MICRO_TILE_THICKNESS, 0);
 #endif
 
+    tiled_offset -= info.tiled_base;
     if (IS_TILER != 0) {
         tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
     } else {

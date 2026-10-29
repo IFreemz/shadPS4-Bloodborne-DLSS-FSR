@@ -181,6 +181,8 @@ const std::map<std::string, u32> string_to_hotkey_map = {
     {"hotkey_volume_up", HOTKEY_VOLUME_UP},
     {"hotkey_volume_down", HOTKEY_VOLUME_DOWN},
     {"hotkey_emulator_settings", HOTKEY_OPEN_EMULATOR_SETTINGS},
+    // A second binding for the same window (a controller combination by default).
+    {"hotkey_emulator_settings_controller", HOTKEY_OPEN_EMULATOR_SETTINGS},
     {"hotkey_toggle_friends", HOTKEY_TOGGLE_FRIENDS},
     {"hotkey_toggle_dlss", HOTKEY_TOGGLE_DLSS},
 };
