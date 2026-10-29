@@ -971,7 +971,11 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 ImGui::TextWrapped("Threaded Renderer");
                 ImGui::TableNextColumn();
                 ImGui::Checkbox("##Threaded Renderer", &threadedRendererSetting);
-                NoteRowFocus();
+                // With the Show/Hide button beside it, d-pad right goes to the button first
+                // (ImGui's own navigation); from the button it jumps to Save as usual.
+                if (!threadedRendererSetting) {
+                    NoteRowFocus();
+                }
                 const bool shown = EmulatorSettings.IsBbShowThreadedSettings();
                 if (threadedRendererSetting) {
                     ImGui::SameLine();

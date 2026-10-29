@@ -598,9 +598,24 @@ void Rasterizer::BetterAoAfterDraw(const GraphicsPipeline* pipeline) {
         std::popcount(pipeline->GetGraphicsKey().mrt_mask) < 1) {
         return;
     }
-    vbao->OnAoPass(cb_descs[0].image_id,
-                   ps->pgm_hash == BbVbao::AoHalfShader ? texture1 : VideoCore::ImageId{},
-                   temporal_dlss.Requested());
+    vbao->OnAoPass(cb_descs[0].image_id, cb_descs[0].desc.view_info.format,
+                   ps->pgm_hash == BbVbao::AoHalfShader ? texture1 : VideoCore::ImageId{});
+}
+
+bool Rasterizer::BetterAoLeavesOutDraw(const GraphicsPipeline* pipeline) {
+    const auto* ps = pipeline->GetStages()[static_cast<u32>(Shader::SwStage::Fragment)];
+    if (!ps || !EmulatorSettings.IsBbVbao()) {
+        return false;
+    }
+    if (ps->pgm_hash == BbVbao::SsaoShader) {
+        return vbao->ReplacesSsaoPass();
+    }
+    // The upsample writes only the AO; the half-size path's target also holds other channels.
+    if (ps->pgm_hash == BbVbao::AoUpsampleShader &&
+        std::popcount(pipeline->GetGraphicsKey().mrt_mask) == 1) {
+        return vbao->ReplacesAoDraw(cb_descs[0].image_id, cb_descs[0].desc.view_info.format);
+    }
+    return false;
 }
 
 // Fills color target 0 with a copy of another image of the same size and format, with the same
@@ -965,7 +980,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
         occlusion_b.depth_clear = state.depth_stencil_attachment.depth_clear;
     }
     const u32 query = occlusion_b.open ? OcclusionQueryBegin() : NoOcclusionQuery;
-    scheduler.Record(record_draw);
+    // Better AO: the game's own AO draws whose result VBAO replaces are left out (their GPU time
+    // back); the bookkeeping above still ran, as for any draw.
+    if (!(vbao && BetterAoLeavesOutDraw(pipeline))) {
+        scheduler.Record(record_draw);
+    }
     OcclusionQueryEnd(query);
     ReplayDisplayCopy(pipeline, state, draw);
     if (vbao) {

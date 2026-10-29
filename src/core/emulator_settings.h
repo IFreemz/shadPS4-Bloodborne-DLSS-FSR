@@ -777,6 +777,9 @@ struct VulkanSettings {
     // change did not replace.
     Setting<int> bb_vbao_strength{150};
     Setting<int> bb_vbao_radius{150};
+    // The AO computed at half the scene's size and upscaled guided by the depth (about a
+    // quarter of the cost; slightly softer fine detail). Off: at the full scene size.
+    Setting<bool> bb_vbao_half_res{true};
     // Settings window: the threaded renderer's individual settings are listed (remembered).
     Setting<bool> bb_show_threaded_settings{false};
 
@@ -847,7 +850,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_clear_one_layer, bb_quick_occlusion_answers, bb_occlusion_visible_until_answered,
     bb_occlusion_early_submit, bb_occlusion_wait_for_answers, bb_occlusion_game_resolution_counts,
     bb_occlusion_tolerant_depth, bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius,
-    bb_show_threaded_settings)
+    bb_vbao_half_res, bb_show_threaded_settings)
 
 // -------------------------------
 // Main manager
@@ -1157,6 +1160,7 @@ public:
     SETTING_FORWARD_BOOL(m_vulkan, BbVbao, bb_vbao)
     SETTING_FORWARD(m_vulkan, BbVbaoStrength, bb_vbao_strength)
     SETTING_FORWARD(m_vulkan, BbVbaoRadius, bb_vbao_radius)
+    SETTING_FORWARD_BOOL(m_vulkan, BbVbaoHalfRes, bb_vbao_half_res)
     SETTING_FORWARD_BOOL(m_vulkan, BbShowThreadedSettings, bb_show_threaded_settings)
     SETTING_FORWARD_BOOL(m_gpu, BbSpreadLoads, bb_spread_loads)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)

@@ -63,6 +63,7 @@ add_host_shader(bb_occlusion_dilate.frag bb_occlusion_dilate_frag)
 add_host_shader(bb_vbao.comp bb_vbao_comp)
 add_host_shader(bb_vbao_blur.comp bb_vbao_blur_comp)
 add_host_shader(bb_vbao_blur.comp bb_vbao_blur_rgba_comp OUTPUT_RGBA=1)
+add_host_shader(bb_vbao_temporal.comp bb_vbao_temporal_comp)
 
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)

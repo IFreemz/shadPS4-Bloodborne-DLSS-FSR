@@ -853,7 +853,16 @@ void DlssLayer::Draw() {
         if (IsItemHovered())
             SetTooltip("How far away something can be and still shade a surface (1.50 by "
                        "default).");
+        bool half_res = EmulatorSettings.IsBbVbaoHalfRes();
+        if (Checkbox("Half resolution (faster)", &half_res)) {
+            EmulatorSettings.SetBbVbaoHalfRes(half_res);
+            EmulatorSettings.Save();
+        }
+        if (IsItemHovered())
+            SetTooltip("Computed at half the scene's size and upscaled along the edges: about a "
+                       "quarter of the cost,\nslightly softer fine detail.");
         if (Button("Defaults")) {
+            EmulatorSettings.SetBbVbaoHalfRes(true);
             EmulatorSettings.SetBbVbaoStrength(150);
             EmulatorSettings.SetBbVbaoRadius(150);
             EmulatorSettings.Save();

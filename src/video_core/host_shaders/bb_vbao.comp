@@ -47,13 +47,34 @@ float ViewZ(float depth) {
     return proj.w / min(depth - proj.z, -1e-8);
 }
 
-float DepthAt(ivec2 pixel) {
+// The depth texel a pixel reads: one of the 2x2 below it when depth_scale is 2.
+ivec2 DepthTexel(ivec2 pixel) {
     pixel = clamp(pixel, ivec2(0), ivec2(size) - 1);
-    return texelFetch(depth_tex, ivec2((vec2(pixel) + 0.5) * depth_scale), 0).r;
+    const ivec2 texel = ivec2((vec2(pixel) + 0.5) * depth_scale);
+    return min(texel, textureSize(depth_tex, 0) - 1);
+}
+
+float DepthAt(ivec2 pixel) {
+    return texelFetch(depth_tex, DepthTexel(pixel), 0).r;
+}
+
+// Where on the screen (in pixels of this pass) that depth was drawn: the texel's centre. At
+// half size it is a quarter of a pixel off the pixel's own centre; placing the depth at the
+// pixel's centre tilted the surfaces rebuilt from it (most on floors seen at a low angle), so
+// the G-buffer normals no longer lay along them and flat ground got darker than at full size.
+vec2 DepthPos(ivec2 pixel) {
+    return (vec2(DepthTexel(pixel)) + 0.5) / depth_scale;
 }
 
 vec3 ViewPos(ivec2 pixel) {
-    return ViewAt(vec2(pixel) + 0.5, ViewZ(DepthAt(pixel)));
+    return ViewAt(DepthPos(pixel), ViewZ(DepthAt(pixel)));
+}
+
+// The view position of a depth texel (for the surface normal: neighbouring depth texels, the
+// same footprint at full and half size).
+vec3 TexelViewPos(ivec2 texel) {
+    texel = clamp(texel, ivec2(0), textureSize(depth_tex, 0) - 1);
+    return ViewAt((vec2(texel) + 0.5) / depth_scale, ViewZ(texelFetch(depth_tex, texel, 0).r));
 }
 
 // The blur's guides: view depth and the normal (xy; z faces the camera).
@@ -73,14 +94,22 @@ float Noise(vec2 pixel) {
     return fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
 }
 
+// A small margin taken off both ends of an occluded span: samples on the surface itself sit
+// right at the horizon, and the pixel grid and the fast acos put them a little inside it.
+const float HORIZON_BIAS = 0.02;
+
 uint Sectors(float min_t, float max_t) {
-    min_t = clamp(min_t, 0.0, 1.0);
-    max_t = clamp(max_t, 0.0, 1.0);
-    const uint start = uint(min_t * float(SECTORS));
-    const uint count = uint(ceil((max_t - min_t) * float(SECTORS)));
-    if (count == 0u || start >= SECTORS) {
+    min_t = clamp(min_t + HORIZON_BIAS, 0.0, 1.0);
+    max_t = clamp(max_t - HORIZON_BIAS, 0.0, 1.0);
+    // Sectors the span mostly covers: rounding up made every sliver at the horizon a whole
+    // sector, and flat open ground came out about 14% darker than it should.
+    const int first = int(min_t * float(SECTORS) + 0.5);
+    const int last = int(max_t * float(SECTORS) + 0.5);
+    if (last <= first || first >= int(SECTORS)) {
         return 0u;
     }
+    const uint start = uint(first);
+    const uint count = uint(last - first);
     const uint bits = count >= SECTORS ? 0xffffffffu : ((1u << count) - 1u);
     return bits << start;
 }
@@ -95,12 +124,17 @@ void main() {
         Store(pixel, 1.0, 65000.0, vec3(0.0));
         return;
     }
-    const vec3 pos = ViewAt(vec2(pixel) + 0.5, ViewZ(depth));
+    const vec3 pos = ViewAt(DepthPos(pixel), ViewZ(depth));
     const vec3 view_dir = normalize(-pos);
 
-    // Normal from depth: of the two neighbours on each axis, the one on the same surface.
-    const vec3 px0 = ViewPos(pixel - ivec2(1, 0)), px1 = ViewPos(pixel + ivec2(1, 0));
-    const vec3 py0 = ViewPos(pixel - ivec2(0, 1)), py1 = ViewPos(pixel + ivec2(0, 1));
+    // Normal from depth: of the two neighbouring depth texels on each axis, the one on the same
+    // surface. Neighbouring texels, not neighbouring pixels of this pass: at half size those
+    // were two texels apart, the normal came out smoother over bumpy ground (cobbles), agreed
+    // with the G-buffer normal more often, and the normal-map detail darkened it more than at
+    // full size.
+    const ivec2 center = DepthTexel(pixel);
+    const vec3 px0 = TexelViewPos(center - ivec2(1, 0)), px1 = TexelViewPos(center + ivec2(1, 0));
+    const vec3 py0 = TexelViewPos(center - ivec2(0, 1)), py1 = TexelViewPos(center + ivec2(0, 1));
     const vec3 dx = abs(px1.z - pos.z) < abs(pos.z - px0.z) ? px1 - pos : pos - px0;
     const vec3 dy = abs(py1.z - pos.z) < abs(pos.z - py0.z) ? py1 - pos : pos - py0;
     // At the screen's edge a neighbour is the pixel itself: no cross product (a NaN normal made
@@ -143,7 +177,7 @@ void main() {
         const float phi = (float(slice) + noise) * PI / float(SLICES);
         const vec2 omega = vec2(cos(phi), sin(phi));
         // The slice plane: the view direction and the screen direction omega.
-        const vec3 direction = normalize(ViewAt(vec2(pixel) + 0.5 + omega, pos.z) - pos);
+        const vec3 direction = normalize(ViewAt(DepthPos(pixel) + omega, pos.z) - pos);
         const vec3 ortho = normalize(direction - dot(direction, view_dir) * view_dir);
         const vec3 axis = cross(ortho, view_dir);
         const vec3 proj_normal = normal - axis * dot(normal, axis);
@@ -161,7 +195,14 @@ void main() {
                 // Quadratic spacing: more samples close to the pixel.
                 float t = (float(i) + step_noise) / float(STEPS);
                 t = t * t;
-                const vec2 offset = s * omega * max(t * radius_px, float(i + 1));
+                // At least a texel per step, but never past the radius: distant surfaces (a
+                // radius of a few texels) were sampled up to 8 texels out, wider than the radius
+                // and twice as wide at half resolution (too dark there).
+                const float dist = max(t * radius_px, float(i + 1));
+                if (dist > radius_px + 1.0) {
+                    break;
+                }
+                const vec2 offset = s * omega * dist;
                 const ivec2 sample_pixel = ivec2(vec2(pixel) + 0.5 + offset);
                 if (any(lessThan(sample_pixel, ivec2(0))) ||
                     any(greaterThanEqual(sample_pixel, ivec2(size)))) {

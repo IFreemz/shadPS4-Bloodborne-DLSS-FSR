@@ -1,0 +1,74 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Temporal accumulation of the raw VBAO (bb_vbao.comp): this frame's AO blended with the last
+// frames', which is moved to where the camera sees it now (reprojected with both frames' cameras,
+// as for the upscaler's camera motion). History is dropped where its depth doesn't match the
+// reprojected point: places just come into view, and what moved in front of them. The blur
+// (bb_vbao_blur.comp) then reads the result. Layout as the raw image: AO, view z, normal xy.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D raw_tex;                    // this frame's AO
+layout(binding = 1, rgba16f) uniform writeonly image2D out_img;   // accumulated, this frame
+layout(binding = 2) uniform texture2D history_tex;                // accumulated, last frame
+
+layout(push_constant) uniform Constants {
+    vec4 reproject[3]; // previous view * inverse current view, rows (3x4)
+    vec4 proj;         // current: x scale, y scale, z scale, z offset (ndc +y down)
+    vec4 prev_proj;    // previous
+    vec2 size;         // texels
+    float blend;       // history weight; 0: no history
+    float tolerance;   // relative view depth difference that drops a history texel
+    float texel_pos;   // where in a texel its depth was read (0.5: centre; 0.75 at half size)
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const vec4 current = texelFetch(raw_tex, pixel, 0);
+    if (blend <= 0.0 || current.y >= 65000.0) {
+        imageStore(out_img, pixel, current); // no history, or the sky
+        return;
+    }
+    const vec2 ndc = (vec2(pixel) + texel_pos) / size * 2.0 - 1.0;
+    const float z = current.y;
+    const vec4 view = vec4(ndc.x * z / proj.x, ndc.y * z / proj.y, z, 1.0);
+    const vec3 prev =
+        vec3(dot(reproject[0], view), dot(reproject[1], view), dot(reproject[2], view));
+    if (prev.z <= 1e-3) {
+        imageStore(out_img, pixel, current);
+        return;
+    }
+    const vec2 prev_ndc = prev.xy * prev_proj.xy / prev.z;
+    const vec2 at = (prev_ndc * 0.5 + 0.5) * size - texel_pos;
+    const ivec2 base = ivec2(floor(at));
+    const vec2 f = at - vec2(base);
+    // Bilinear, each of the four texels only where its depth is the reprojected point's.
+    float sum = 0.0;
+    float weight = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        const ivec2 offset = ivec2(i & 1, i >> 1);
+        const ivec2 p = base + offset;
+        if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, ivec2(size)))) {
+            continue;
+        }
+        const vec4 h = texelFetch(history_tex, p, 0);
+        if (abs(h.y - prev.z) > tolerance * prev.z) {
+            continue;
+        }
+        const float w = (offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y);
+        sum += h.x * w;
+        weight += w;
+    }
+    if (weight < 0.25) {
+        imageStore(out_img, pixel, current); // mostly newly seen
+        return;
+    }
+    const float history = sum / weight;
+    const float ao = mix(current.x, history, blend * min(weight, 1.0));
+    imageStore(out_img, pixel, vec4(ao, current.yzw));
+}

@@ -12,6 +12,8 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform texture2D raw_tex; // AO, view z, normal xy
+// With upscale 2: the scene depth at the output size, the guide for the upscale.
+layout(binding = 2) uniform texture2D depth_tex;
 #ifdef OUTPUT_RGBA
 layout(binding = 1, rgba8) uniform image2D ao_img;
 #else
@@ -19,10 +21,15 @@ layout(binding = 1, r8) uniform writeonly image2D ao_img;
 #endif
 
 layout(push_constant) uniform Constants {
-    vec2 size;
-    int radius;      // taps per side; 0 copies the raw AO
+    vec2 size;       // output pixels
+    int radius;      // taps per side (raw texels); 0 copies the raw AO
     float tolerance; // relative depth difference at which a tap's weight falls to 1/e
     float normal_power; // tap weight times (cos of the normals' angle)^normal_power
+    float upscale;      // output pixels per raw texel: 1, or 2 for AO computed at half size
+    vec2 raw_size;      // raw texels
+    float depth_scale;  // depth texels per output pixel
+    float z_scale;      // the projection's z scale and offset (view depth from depth)
+    float z_offset;
 };
 
 // The normal stored by bb_vbao.comp; its z faces the camera (-z). Zero for the sky.
@@ -30,9 +37,58 @@ vec3 Normal(vec2 xy) {
     return vec3(xy, -sqrt(max(1.0 - dot(xy, xy), 0.0)));
 }
 
+void Store(ivec2 pixel, float value) {
+#ifdef OUTPUT_RGBA
+    imageStore(ao_img, pixel, vec4(value, imageLoad(ao_img, pixel).gba));
+#else
+    imageStore(ao_img, pixel, vec4(value));
+#endif
+}
+
+// Half-size AO brought up to the output: the raw texels around the pixel, weighted by how close
+// they are and by how well their depth and normal match the pixel's own (from the full-size
+// depth), so the AO stays sharp at edges.
+void Upscale(ivec2 pixel) {
+    const float depth = texelFetch(depth_tex, ivec2((vec2(pixel) + 0.5) * depth_scale), 0).r;
+    if (depth >= 1.0) {
+        Store(pixel, 1.0); // the sky
+        return;
+    }
+    const float z = z_offset / min(depth - z_scale, -1e-8);
+    const vec2 at = (vec2(pixel) + 0.5) / upscale - 0.5;
+    const ivec2 base = ivec2(floor(at + 0.5));
+    const ivec2 last = ivec2(raw_size) - 1;
+    const vec4 nearest = texelFetch(raw_tex, clamp(base, ivec2(0), last), 0);
+    const vec3 center_normal = Normal(nearest.zw);
+    const bool use_normal = normal_power > 0.0 && dot(nearest.zw, nearest.zw) > 0.0;
+    float sum = 0.0;
+    float weight = 0.0;
+    const float inv_sigma2 = 1.0 / max(float(radius * radius), 1.0);
+    for (int y = -radius; y <= radius; ++y) {
+        for (int x = -radius; x <= radius; ++x) {
+            const ivec2 p = clamp(base + ivec2(x, y), ivec2(0), last);
+            const vec4 tap = texelFetch(raw_tex, p, 0);
+            // A raw texel's AO is for where its depth was read: a quarter texel past its centre.
+            const vec2 d = vec2(p) + 0.25 - at;
+            const float dz = abs(tap.y - z) / (z * tolerance);
+            float w = exp(-dot(d, d) * inv_sigma2 - dz);
+            if (use_normal) {
+                w *= pow(max(dot(Normal(tap.zw), center_normal), 0.0), normal_power);
+            }
+            sum += tap.r * w;
+            weight += w;
+        }
+    }
+    Store(pixel, weight > 1e-6 ? sum / weight : nearest.r);
+}
+
 void main() {
     const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    if (upscale > 1.0) {
+        Upscale(pixel);
         return;
     }
     const vec4 center = texelFetch(raw_tex, pixel, 0);
@@ -54,10 +110,5 @@ void main() {
             weight += w;
         }
     }
-    const float value = weight > 1e-6 ? sum / weight : center.r;
-#ifdef OUTPUT_RGBA
-    imageStore(ao_img, pixel, vec4(value, imageLoad(ao_img, pixel).gba));
-#else
-    imageStore(ao_img, pixel, vec4(value));
-#endif
+    Store(pixel, weight > 1e-6 ? sum / weight : center.r);
 }

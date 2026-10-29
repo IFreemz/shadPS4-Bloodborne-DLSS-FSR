@@ -4,6 +4,7 @@
 
 #include <memory>
 #include "common/types.h"
+#include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/types.h"
 
 namespace VideoCore {
@@ -52,10 +53,19 @@ public:
     /// The temporal path's SSAO pass read `normals` (its texture 1): the G-buffer's normals.
     void OnSsaoPass(VideoCore::ImageId normals);
 
-    /// The draw that ends the game's AO wrote `target`; `normals` is the G-buffer normal texture
-    /// it read (the half-size path), or null (then those the SSAO pass read). Overwrites the AO;
-    /// `temporal`: a temporal upscaler accumulates frames, so the sample pattern rotates.
-    void OnAoPass(VideoCore::ImageId target, VideoCore::ImageId normals, bool temporal);
+    /// Before the temporal path's SSAO draw: whether to leave it out (its result only feeds the
+    /// upsample, which VBAO overwrites).
+    [[nodiscard]] bool ReplacesSsaoPass();
+
+    /// Before the upsample draw into `target` (drawn as `view_format`): whether VBAO will write
+    /// all of it this frame, so the game's draw can be left out. The half-size path's draw is
+    /// kept: VBAO writes only its red channel.
+    [[nodiscard]] bool ReplacesAoDraw(VideoCore::ImageId target, vk::Format view_format);
+
+    /// The draw that ends the game's AO wrote (or would have written) `target` as
+    /// `view_format`; `normals` is the G-buffer normal texture it read (the half-size path), or
+    /// null (then those the SSAO pass read). Overwrites the AO.
+    void OnAoPass(VideoCore::ImageId target, vk::Format view_format, VideoCore::ImageId normals);
 
 private:
     struct Impl;

@@ -723,6 +723,8 @@ private:
     VideoCore::ImageId stage_texture1{};
     /// After the draw that ends the game's AO: overwrites it with VBAO (when on).
     void BetterAoAfterDraw(const GraphicsPipeline* pipeline);
+    /// Before recording the draw: whether it is one of the game's AO draws VBAO replaces.
+    bool BetterAoLeavesOutDraw(const GraphicsPipeline* pipeline);
     bool occlusion_depth_built{};
     vk::Image occlusion_depth_source{};
     vk::ImageView occlusion_depth_view{};
