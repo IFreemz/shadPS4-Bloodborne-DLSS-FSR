@@ -21,7 +21,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
-#include "video_core/renderer_vulkan/vk_bb_occlusion_depth.h"
+#include "video_core/renderer_vulkan/vk_bb_ssr.h"
 #include "video_core/renderer_vulkan/vk_bb_vbao.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
@@ -113,13 +113,6 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool OnWriteFault(VAddr addr, u64 size, bool assume_locks = false);
-    /// Wait for occlusion answers: a fault on a page of occlusion results kept from the game
-    /// until their answers are in (waits for them on a game thread). False when not one.
-    bool OcclusionTrapFault(VAddr addr, bool is_write);
-    /// GPU command thread: a 32-bit word of the open occlusion test's results known without the
-    /// GPU (its start counters), for the game's wait for them; nullopt otherwise.
-    std::optional<u32> OcclusionKnownWord(VAddr address, u32 function, u32 ref, u32 mask);
-    std::atomic<u32> occlusion_wait_logged{};
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
@@ -620,9 +613,6 @@ private:
         bool begin;
         u64 frame; ///< game frame the GPU command thread saw the dump in
         std::chrono::steady_clock::time_point time;
-        /// Drawn at the render size: the pixels it counts there stand for this many each at the
-        /// game's resolution (1: not moved).
-        float count_scale{1.0f};
         /// What the test's last box was drawn against (stage A's registers).
         u64 depth_address{};
         u32 depth_extent{};  ///< the size hint (0: none)
@@ -634,7 +624,6 @@ private:
         u64 begin_value{};
         u32 draws{};
         bool open{};
-        float count_scale{1.0f};
         u64 depth_address{};
         u32 depth_extent{};
         u32 depth_control{};
@@ -643,7 +632,6 @@ private:
     } occlusion_a; ///< GPU command thread
     u64 occlusion_index_frame{};
     u32 occlusion_next_index{};
-    std::atomic<u64> occlusion_known_waits{};
     struct {
         bool open{};
         bool dropped{};
@@ -653,7 +641,6 @@ private:
         u64 begin_value{};
         u64 frame{};
         std::chrono::steady_clock::time_point time{};
-        float count_scale{1.0f};
         u64 depth_address{};
         u32 depth_extent{};
         u32 depth_control{};
@@ -673,7 +660,6 @@ private:
         u64 frame;
         std::chrono::steady_clock::time_point time;
         std::chrono::steady_clock::time_point closed; ///< the draw recorder ended it
-        float count_scale{1.0f};
         u64 depth_address{};
         u32 depth_extent{};
         u32 depth_control{};
@@ -709,35 +695,30 @@ private:
     u32 occlusion_index_blips_logged{};
     std::array<std::atomic<u64>, 4> occlusion_slot_gaps{}; ///< frames between a slot's answers
     std::atomic<u64> occlusion_blips{};
-    /// Who lets kept pages go (logged): the first ones, and counts by thread and access.
-    std::atomic<u32> occlusion_release_logged{};
-    std::array<std::atomic<u64>, 8> occlusion_release_kinds{};
-    /// Occlusion tests tolerant of a pixel: the copy of the scene's depth (made for the first
-    /// test draw of a group of tests).
-    std::unique_ptr<BbOcclusionDepth> occlusion_depth;
     /// Better ambient occlusion (GT-VBAO, after bbport 0.7): made when the setting is first on.
     std::unique_ptr<BbVbao> vbao;
-    /// Texture 1 of the draw's pixel shader (after BindResources). image_bindings holds the last
-    /// bound stage's (the vertex shader's), and is not filled when a remembered texture set is
-    /// reused.
-    VideoCore::ImageId stage_texture1{};
+    /// The first textures of the draw's pixel shader (after BindResources). image_bindings holds
+    /// the last bound stage's (the vertex shader's), and is not filled when a remembered texture
+    /// set is reused.
+    std::array<VideoCore::ImageId, 3> stage_textures{};
+    /// Better reflections: made when the setting is first on.
+    std::unique_ptr<BbSsr> ssr;
+    /// The game's reflection constants (its trace pixel shader's buffer 0), from BindBuffers.
+    BbSsr::Constants ssr_constants{};
+    const void* ssr_guest_constants{};
+    /// Before recording the draw: whether it is the game's reflection trace, written instead by
+    /// the better reflections (when on).
+    bool BetterSsrReplacesDraw(const GraphicsPipeline* pipeline);
+    /// After a draw: the game's passes the full-resolution reflections take inputs from.
+    void BetterSsrAfterDraw(const GraphicsPipeline* pipeline);
     /// After the draw that ends the game's AO: overwrites it with VBAO (when on).
     void BetterAoAfterDraw(const GraphicsPipeline* pipeline);
     /// Before recording the draw: whether it is one of the game's AO draws VBAO replaces.
     bool BetterAoLeavesOutDraw(const GraphicsPipeline* pipeline);
-    bool occlusion_depth_built{};
-    vk::Image occlusion_depth_source{};
-    vk::ImageView occlusion_depth_view{};
-    std::atomic<u64> occlusion_depth_copies{};
-    u64 pipe_stats_occlusion_depth_copies{};
-    /// Draw recorder: a test draw's pass uses the copy instead of the scene's depth.
-    void UseTolerantOcclusionDepth(RenderState& state);
     u64 pipe_stats_occlusion_blips{};
     u32 occlusion_blips_logged{};
-    /// Pending answers, the query pool's busy flags and its host resets: under occlusion_mutex
-    /// (the answer thread reads them too).
+    /// Pending answers, the query pool's busy flags and its host resets: under occlusion_mutex.
     std::mutex occlusion_mutex;
-    std::condition_variable_any occlusion_cv;
     std::deque<PendingOcclusion> occlusion_pending;
     std::atomic<u32> occlusion_waiting{};
     /// Game frames (OnSubmit) and answer statistics: frames from the test to its answer (0, 1,
@@ -750,48 +731,14 @@ private:
     /// there), waiting for its submission, and the GPU (submission to answer).
     std::array<std::atomic<u64>, 3> occlusion_span_ns{};
     std::atomic<u64> occlusion_span_count{};
-    std::atomic<u64> occlusion_early_submits{};
-    std::atomic<u64> occlusion_early_skipped{};
-    std::array<u64, 5> pipe_stats_occlusion_span{};
-    /// Submission times by tick (the answer thread looks its test's up).
+    std::array<u64, 4> pipe_stats_occlusion_span{};
+    /// Submission times by tick (an answer looks its test's up).
     struct SubmitTime {
         std::atomic<u64> tick{~0ULL};
         std::atomic<s64> ns{};
     };
     std::array<SubmitTime, 256> submit_times{};
-    /// Draw recorder: a test ended since the last submission (cleared by any submission).
-    std::atomic<bool> occlusion_submit_pending{};
-    /// Draw recorder: the tests recorded so far to the GPU (early submission).
-    void OcclusionEarlySubmit();
-    static void OnDrawPipeIdle(void* context);
-    /// The answer thread runs (quick answers, or waiting for answers).
-    [[nodiscard]] static bool QuickOcclusionAnswers();
-    /// Wait for occlusion answers: pages of results not yet answered, kept from the game (their
-    /// reads watched) until the last answer in them is written.
-    struct OcclusionTrap {
-        u32 pending{};
-        u32 unrecorded{}; ///< begun by the GPU command thread, not by the draw recorder yet
-        bool tracked{};
-    };
-    std::mutex occlusion_trap_mutex;
-    std::condition_variable occlusion_trap_cv;
-    std::unordered_map<VAddr, OcclusionTrap> occlusion_traps;
-    std::atomic<u32> occlusion_trap_count{};
-    /// Game reads before the answer, the time they waited, those given up on, answers in before
-    /// the game read, and pages let go for the GPU side's own access.
-    std::array<std::atomic<u64>, 6> occlusion_trap_stats{};
-    std::array<u64, 6> pipe_stats_occlusion_trap{};
-    /// GPU command thread: the results are kept from the game from the moment the game's test
-    /// is decoded (the game can read them before the draw recorder gets to the test).
-    void OcclusionTrapBegin(u64* results, u32 pairs);
-    /// Draw recorder: it got to the test.
-    void OcclusionTrapRecorded(u64* results, u32 pairs);
-    /// Writes `size` bytes of `value` (the game's clear of a block) past the protection of a
-    /// page kept from the game; false when the range is not on one (written as usual).
-    bool OcclusionTrapFill(VAddr address, u64 size, u32 value);
     std::array<u64, 6> pipe_stats_occlusion_late{};
-    /// Quick occlusion answers: a thread waits for the GPU and writes each answer at once.
-    void OcclusionAnswerThread(std::stop_token stop);
     /// The GPU's count for a finished test (under occlusion_mutex), written to game memory by
     /// WriteOcclusionAnswer after the lock is released (a write fault there may wait for the
     /// GPU command thread).
@@ -800,7 +747,6 @@ private:
         u64 begin;
         u32 pairs;
         u64 count;
-        bool provisional{}; ///< "visible until answered": no answer yet
     };
     OcclusionAnswer AnswerOcclusion(const PendingOcclusion& test);
     void WriteOcclusionAnswer(const OcclusionAnswer& answer);
@@ -815,7 +761,6 @@ private:
     std::atomic<u64> occlusion_unknown{};
     u32 occlusion_poll_counter{};
     std::array<u64, 5> pipe_stats_occlusion{};
-    std::jthread occlusion_answer_thread; ///< started on first use
     void OcclusionTaskRun(const OcclusionTask& task);
     bool OcclusionRedirectBegin();
     void OcclusionRedirectEnd();

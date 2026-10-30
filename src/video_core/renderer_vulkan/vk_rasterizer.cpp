@@ -108,7 +108,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                            std::memory_order_relaxed);
             entry.tick.store(tick, std::memory_order_release);
         }
-        occlusion_submit_pending.store(false, std::memory_order_relaxed);
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
@@ -137,7 +136,6 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             copy_thread = std::jthread([this](std::stop_token stop) { RunCopyThread(stop); });
         }
         draw_pipe = std::make_unique<DrawPipe>(&Rasterizer::RunDrawPacket, this);
-        draw_pipe->SetIdleHandler(&Rasterizer::OnDrawPipeIdle);
         state_sampler = std::jthread([this](std::stop_token stop) {
             Common::SetCurrentThreadName("shadPS4:StateSampler");
             while (!stop.stop_requested()) {
@@ -589,7 +587,7 @@ void Rasterizer::BetterAoAfterDraw(const GraphicsPipeline* pipeline) {
     // The G-buffer normals the game's SSAO reads: its pixel shader's texture 1. The temporal
     // path's last pass (the upsample) reads others.
     const VideoCore::ImageId texture1 =
-        ps->images.size() > 1 ? stage_texture1 : VideoCore::ImageId{};
+        ps->images.size() > 1 ? stage_textures[1] : VideoCore::ImageId{};
     if (ps->pgm_hash == BbVbao::SsaoShader) {
         vbao->OnSsaoPass(texture1);
         return;
@@ -616,6 +614,41 @@ bool Rasterizer::BetterAoLeavesOutDraw(const GraphicsPipeline* pipeline) {
         return vbao->ReplacesAoDraw(cb_descs[0].image_id, cb_descs[0].desc.view_info.format);
     }
     return false;
+}
+
+bool Rasterizer::BetterSsrReplacesDraw(const GraphicsPipeline* pipeline) {
+    const auto* ps = pipeline->GetStages()[static_cast<u32>(Shader::SwStage::Fragment)];
+    const int mode = EmulatorSettings.GetBbSsrMode();
+    if (!ps || ps->pgm_hash != BbSsr::TraceShader || (mode != 1 && mode != 2)) {
+        return false;
+    }
+    const auto constants = std::exchange(ssr_constants, {});
+    const auto* guest_constants = std::exchange(ssr_guest_constants, nullptr);
+    if (ps->images.size() < 3 || std::popcount(pipeline->GetGraphicsKey().mrt_mask) != 1) {
+        return false;
+    }
+    if (!ssr) {
+        ssr = std::make_unique<BbSsr>(instance, scheduler, runtime, texture_cache);
+    }
+    if (mode == 2) {
+        return ssr->Clear(cb_descs[0].image_id, cb_descs[0].desc.view_info.format);
+    }
+    return ssr->Run(cb_descs[0].image_id, cb_descs[0].desc.view_info.format, stage_textures[0],
+                    stage_textures[1], stage_textures[2], constants, guest_constants);
+}
+
+void Rasterizer::BetterSsrAfterDraw(const GraphicsPipeline* pipeline) {
+    const auto* ps = pipeline->GetStages()[static_cast<u32>(Shader::SwStage::Fragment)];
+    if (!ps || EmulatorSettings.GetBbSsrMode() != 1 ||
+        std::popcount(pipeline->GetGraphicsKey().mrt_mask) < 1) {
+        return;
+    }
+    if (ps->pgm_hash == BbSsr::ColorCopyShader && !ps->images.empty()) {
+        ssr->OnColorCopy(stage_textures[0], cb_descs[0].image_id);
+    } else if (ps->pgm_hash == BbSsr::LightingShader &&
+               ps->images.size() > BbSsr::LightingReflectionSlot) {
+        ssr->OnLighting(stage_textures[BbSsr::LightingGlossSlot]);
+    }
 }
 
 // Fills color target 0 with a copy of another image of the same size and format, with the same
@@ -881,10 +914,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     const u64 mirror_flushes = velocity_mirror.Flushes();
     mirror_rebind = false;
     occlusion_b.draws_seen += occlusion_b.open ? 1 : 0;
-    if (!occlusion_b.open && occlusion_submit_pending.load(std::memory_order_relaxed)) {
-        // The first draw after a group of tests: they go to the GPU now.
-        OcclusionEarlySubmit();
-    }
     if (DrawPipe::OnStageB()) {
         scheduler.PopPendingOperations();
         if (target_memo_enabled.load(std::memory_order_relaxed)) {
@@ -915,12 +944,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     ProfileLap(Section::Dlss);
     Common::Crumbs::Add("draw: begin rendering");
     auto state = BeginRendering(pipeline);
-    if (occlusion_b.open) {
-        UseTolerantOcclusionDepth(state);
-    } else if (occlusion_depth_built) {
-        // The group of tests is over: the next one gets a new copy.
-        occlusion_depth_built = false;
-    }
     ProfileLap(Section::BeginRendering);
 
     Common::Crumbs::Add("draw: vertex and index buffers");
@@ -982,13 +1005,17 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, bool is_indexed, u
     const u32 query = occlusion_b.open ? OcclusionQueryBegin() : NoOcclusionQuery;
     // Better AO: the game's own AO draws whose result VBAO replaces are left out (their GPU time
     // back); the bookkeeping above still ran, as for any draw.
-    if (!(vbao && BetterAoLeavesOutDraw(pipeline))) {
+    // Better reflections: the game's trace is written by its own pass instead.
+    if (!BetterSsrReplacesDraw(pipeline) && !(vbao && BetterAoLeavesOutDraw(pipeline))) {
         scheduler.Record(record_draw);
     }
     OcclusionQueryEnd(query);
     ReplayDisplayCopy(pipeline, state, draw);
     if (vbao) {
         BetterAoAfterDraw(pipeline);
+    }
+    if (ssr) {
+        BetterSsrAfterDraw(pipeline);
     }
     DebugState.IncDrawCall();
     draw_jitter = {};
@@ -2070,6 +2097,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // (shadow passes bind the same constants with the light's camera).
     if (EmulatorSettings.IsBbVbao() && !vbao) {
         vbao = std::make_unique<BbVbao>(instance, scheduler, runtime, texture_cache);
+    }
+    if (ssr && gbuffer_draw) {
+        ssr->OnGBufferDraw(db_desc.image_id);
     }
     if (vbao) {
         if (gbuffer_draw && EmulatorSettings.IsBbVbao()) {
@@ -3320,6 +3350,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             const auto* ring = const_ring.get();
             const u32 size = prefetched->size;
             buffer_infos.emplace_back(ring->Handle(), prefetched->offset, size);
+            if (buffer_index == 0 && stage.pgm_hash == BbSsr::TraceShader) {
+                ssr_constants = {ring->Handle(), prefetched->offset, size, 0};
+                ssr_guest_constants =
+                    reinterpret_cast<const void*>(desc.GetSharp(stage).base_address);
+            }
             if (desc.IsSpecial()) {
                 temporal_dlss.ObserveConstants(runtime, instance, ring, prefetched->offset, size,
                                                stage.pgm_hash, binding.unified);
@@ -3435,6 +3470,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 }
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
+                if (buffer_index == 0 && stage.pgm_hash == BbSsr::TraceShader) {
+                    ssr_constants = {buffer->Handle(), offset_aligned, size + adjust,
+                                     u32(adjust / 4)};
+                    ssr_guest_constants = reinterpret_cast<const void*>(vsharp.base_address);
+                }
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
@@ -3472,7 +3512,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // The pixel shader is bound first (SwStage::Fragment is stage 0), the vertex shader after.
     const bool pixel_shader = stage.sw_stage == Shader::SwStage::Fragment;
     if (pixel_shader) {
-        stage_texture1 = {};
+        stage_textures = {};
     }
     if (stage.images.empty()) {
         // Nothing to look up (most vertex shaders, shadow map pixel shaders without alpha test).
@@ -3482,6 +3522,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         return;
     }
     const u32 first_image_idx = image_infos.size();
+    // Better reflections at full resolution: the lighting reads the full-size reflections
+    // instead of the game's half-size target.
+    const auto replace_reflections = [&] {
+        if (!pixel_shader || !ssr || EmulatorSettings.GetBbSsrMode() != 1 ||
+            stage.pgm_hash != BbSsr::LightingShader ||
+            stage.images.size() <= BbSsr::LightingReflectionSlot ||
+            image_infos.size() <= first_image_idx + BbSsr::LightingReflectionSlot) {
+            return;
+        }
+        if (const auto view = ssr->LightingReflections()) {
+            image_infos[first_image_idx + BbSsr::LightingReflectionSlot] =
+                vk::DescriptorImageInfo{VK_NULL_HANDLE, view, vk::ImageLayout::eGeneral};
+        }
+    };
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
@@ -3592,8 +3646,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     auto& image = texture_cache.GetImage(entry.id);
                     image.binding.is_bound = 1u;
                     bound_images.emplace_back(entry.id);
-                    if (i == 1 && pixel_shader) {
-                        stage_texture1 = entry.id;
+                    if (i < stage_textures.size() && pixel_shader) {
+                        stage_textures[i] = entry.id;
                     }
                     const auto new_layout = image.info.props.is_depth
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
@@ -3618,6 +3672,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 set_write.descriptorType = vk::DescriptorType::eSampledImage;
                 set_write.pImageInfo = &image_infos[first_image_idx + i];
             }
+            replace_reflections();
             ProfileLap(Section::TexSetHit);
             BindSamplers(stage, binding);
             ProfileLap(Section::Samplers);
@@ -3809,8 +3864,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             bound_images.emplace_back(image_id);
-            if (i == 1 && pixel_shader) {
-                stage_texture1 = image_id;
+            if (i < stage_textures.size() && pixel_shader) {
+                stage_textures[i] = image_id;
             }
 
             auto& image = texture_cache.GetImage(image_id);
@@ -3910,6 +3965,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         image_binding_idx += array_size;
         binding.unified += array_size;
     }
+    replace_reflections();
     ProfileLap(Section::Textures);
     BindSamplers(stage, binding);
     ProfileLap(Section::Samplers);
@@ -4255,10 +4311,6 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     if (!is_gds) {
         texture_cache.ClearMeta(address);
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
-            // Occlusion results kept from the game: the game's clear of a block goes past it.
-            if (OcclusionTrapFill(address, num_bytes, value)) {
-                return;
-            }
             u32* buffer = std::bit_cast<u32*>(address);
             std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
             return;
@@ -5392,8 +5444,6 @@ Rasterizer::QueuedUse Rasterizer::CheckQueuedUse(VAddr address, u64 size) {
 
 namespace {
 constexpr u64 OcclusionValidBit = 0x8000000000000000ULL;
-/// The occlusion answer thread (its writes never wait for answers).
-thread_local bool on_occlusion_answer_thread = false;
 constexpr u64 OcclusionVisibleCount = 0x2FFFFFFULL;
 } // Anonymous namespace
 
@@ -5403,7 +5453,6 @@ void Rasterizer::OcclusionDump(u64* results, u64 value, u32 pairs) {
     if (occlusion_a.open && address == occlusion_a.begin_address + sizeof(u64)) {
         task = {reinterpret_cast<u64*>(occlusion_a.begin_address), occlusion_a.begin_value, pairs,
                 occlusion_a.draws, false};
-        task.count_scale = occlusion_a.count_scale;
         task.depth_address = occlusion_a.depth_address;
         task.depth_extent = occlusion_a.depth_extent;
         task.depth_control = occlusion_a.depth_control;
@@ -5421,9 +5470,6 @@ void Rasterizer::OcclusionDump(u64* results, u64 value, u32 pairs) {
         occlusion_a.index = occlusion_next_index++;
         task = {results, value, pairs, 0, true};
         task.index = occlusion_a.index;
-        if (EmulatorSettings.IsBbOcclusionWaitForAnswers()) {
-            OcclusionTrapBegin(results, pairs);
-        }
     }
     task.frame = occlusion_frame.load(std::memory_order_relaxed);
     task.time = std::chrono::steady_clock::now();
@@ -5534,8 +5580,6 @@ bool Rasterizer::OcclusionRedirectBegin() {
         scale_scissor(s);
     }
     OcclusionMarkRedirected();
-    occlusion_a.count_scale = float(double(resolution.output_width) * resolution.output_height /
-                                    (double(resolution.render_width) * resolution.render_height));
     occlusion_redirects.fetch_add(1, std::memory_order_relaxed);
     (scene_depth.written && scene_depth.frame == occlusion_frame.load(std::memory_order_relaxed)
          ? occlusion_depth_current
@@ -5588,12 +5632,6 @@ void Rasterizer::OcclusionTaskRun(const OcclusionTask& task) {
         b.time = task.time;
         b.index = task.index;
         occlusion_tests.fetch_add(1, std::memory_order_relaxed);
-        if (EmulatorSettings.IsBbOcclusionVisibleUntilAnswered()) {
-            // In order after the game's clear of the block: "visible" until the answer.
-            WriteOcclusionAnswer({task.results, task.begin_value | OcclusionValidBit, task.pairs,
-                                  OcclusionVisibleCount, true});
-        }
-        OcclusionTrapRecorded(task.results, task.pairs);
         {
             // The game began this test again while the previous answer was still on its way.
             std::scoped_lock lock{occlusion_mutex};
@@ -5604,7 +5642,6 @@ void Rasterizer::OcclusionTaskRun(const OcclusionTask& task) {
             }
         }
     } else if (b.open && b.results == task.results) {
-        b.count_scale = task.count_scale;
         b.depth_address = task.depth_address;
         b.depth_extent = task.depth_extent;
         b.depth_control = task.depth_control;
@@ -5626,7 +5663,6 @@ void Rasterizer::OcclusionClose(u32 stage_a_draws) {
         .frame = b.frame,
         .time = b.time,
         .closed = std::chrono::steady_clock::now(),
-        .count_scale = b.count_scale,
         .depth_address = b.depth_address,
         .depth_extent = b.depth_extent,
         .depth_control = b.depth_control,
@@ -5642,58 +5678,6 @@ void Rasterizer::OcclusionClose(u32 stage_a_draws) {
                                 std::memory_order_relaxed);
     }
     b.open = false;
-    if (EmulatorSettings.IsBbOcclusionEarlySubmit() && DrawPipe::OnStageB()) {
-        occlusion_submit_pending.store(true, std::memory_order_relaxed);
-    }
-    if (QuickOcclusionAnswers()) {
-        if (!occlusion_answer_thread.joinable()) {
-            occlusion_answer_thread =
-                std::jthread([this](std::stop_token stop) { OcclusionAnswerThread(stop); });
-        }
-        occlusion_cv.notify_one();
-    }
-}
-
-void Rasterizer::OcclusionAnswerThread(std::stop_token stop) {
-    Common::SetCurrentThreadName("shadPS4:OcclusionAnswers");
-    on_occlusion_answer_thread = true;
-    const auto device = instance.GetDevice();
-    const vk::Semaphore semaphore = scheduler.GetWorkSemaphore()->Handle();
-    while (!stop.stop_requested()) {
-        u64 tick;
-        {
-            std::unique_lock lock{occlusion_mutex};
-            occlusion_cv.wait(lock, stop, [&] { return !occlusion_pending.empty(); });
-            if (stop.stop_requested()) {
-                return;
-            }
-            tick = occlusion_pending.front().tick;
-        }
-        // The submission with the test, as soon as the GPU has run it (a timeout to notice
-        // one not submitted yet, and the setting turned off).
-        const vk::SemaphoreWaitInfo wait{
-            .semaphoreCount = 1,
-            .pSemaphores = &semaphore,
-            .pValues = &tick,
-        };
-        if (device.waitSemaphores(wait, 50'000'000) != vk::Result::eSuccess) {
-            continue;
-        }
-        const u64 done = device.getSemaphoreCounterValue(semaphore).value;
-        boost::container::small_vector<OcclusionAnswer, 16> answers;
-        {
-            std::scoped_lock lock{occlusion_mutex};
-            while (!occlusion_pending.empty() && occlusion_pending.front().tick <= done) {
-                answers.push_back(AnswerOcclusion(occlusion_pending.front()));
-                occlusion_pending.pop_front();
-            }
-            occlusion_waiting.store(static_cast<u32>(occlusion_pending.size()),
-                                    std::memory_order_relaxed);
-        }
-        for (const auto& answer : answers) {
-            WriteOcclusionAnswer(answer);
-        }
-    }
 }
 
 u32 Rasterizer::OcclusionQueryBegin() {
@@ -5737,9 +5721,6 @@ void Rasterizer::OcclusionQueryEnd(u32 query) {
 }
 
 void Rasterizer::PollOcclusion() {
-    if (occlusion_answer_thread.joinable() && QuickOcclusionAnswers()) {
-        return; // the answer thread writes them
-    }
     boost::container::small_vector<OcclusionAnswer, 16> answers;
     {
         std::scoped_lock lock{occlusion_mutex};
@@ -5755,228 +5736,6 @@ void Rasterizer::PollOcclusion() {
     }
 }
 
-bool Rasterizer::QuickOcclusionAnswers() {
-    return EmulatorSettings.IsBbQuickOcclusionAnswers() ||
-           EmulatorSettings.IsBbOcclusionWaitForAnswers();
-}
-
-void Rasterizer::UseTolerantOcclusionDepth(RenderState& state) {
-    if (!EmulatorSettings.IsBbOcclusionTolerantDepth() || !db_desc.image_id ||
-        !state.depth_stencil_attachment.has_depth) {
-        return;
-    }
-    const auto& control = Regs().depth_control;
-    using Func = AmdGpu::CompareFunc;
-    const Func func = control.depth_func;
-    if (!control.depth_enable || control.depth_write_enable || control.stencil_enable ||
-        (func != Func::Less && func != Func::LessEqual && func != Func::Greater &&
-         func != Func::GreaterEqual)) {
-        return;
-    }
-    auto& depth = texture_cache.GetImage(db_desc.image_id);
-    if (!occlusion_depth_built || occlusion_depth_source != depth.GetImage()) {
-        if (!occlusion_depth) {
-            occlusion_depth = std::make_unique<BbOcclusionDepth>(instance, runtime, scheduler);
-        }
-        const vk::ImageLayout layout = state.depth_stencil_attachment.image_layout;
-        occlusion_depth_view = occlusion_depth->Build(
-            depth, state.width, state.height, func == Func::Less || func == Func::LessEqual);
-        if (occlusion_depth_view) {
-            // Back as the pass memo expects it for the next draws with the scene's depth.
-            runtime.Transit(&depth, layout,
-                            vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                vk::PipelineStageFlagBits2::eLateFragmentTests,
-                            vk::AccessFlagBits2::eDepthStencilAttachmentRead |
-                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite);
-            runtime.FlushBarriers();
-            occlusion_depth_copies.fetch_add(1, std::memory_order_relaxed);
-        }
-        occlusion_depth_source = depth.GetImage();
-        occlusion_depth_built = true;
-    }
-    if (!occlusion_depth_view) {
-        return;
-    }
-    auto& attachment = state.depth_stencil_attachment;
-    attachment.image_view = occlusion_depth_view;
-    attachment.image_layout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
-    attachment.depth_clear = false;
-    attachment.stencil_clear = false;
-}
-
-void Rasterizer::OcclusionEarlySubmit() {
-    // Not while background texture copies run (the submission would wait for them).
-    if (Common::CopyPool::AsyncPending()) {
-        occlusion_early_skipped.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        occlusion_early_submits.fetch_add(1, std::memory_order_relaxed);
-        SubmitInfo info{};
-        scheduler.Flush(info);
-    }
-    occlusion_submit_pending.store(false, std::memory_order_relaxed);
-}
-
-void Rasterizer::OnDrawPipeIdle(void* context) {
-    // Nothing more queued after a group of tests (the game reads their answers before it
-    // hands over more): they go to the GPU now instead of with the next draw.
-    auto& self = *static_cast<Rasterizer*>(context);
-    if (!self.occlusion_b.open && self.occlusion_submit_pending.load(std::memory_order_relaxed)) {
-        self.OcclusionEarlySubmit();
-    }
-}
-
-namespace {
-constexpr VAddr OcclusionTrapPageSize = 4096;
-} // Anonymous namespace
-
-void Rasterizer::OcclusionTrapBegin(u64* results, u32 pairs) {
-    const VAddr begin = reinterpret_cast<VAddr>(results) & ~(OcclusionTrapPageSize - 1);
-    const VAddr end = reinterpret_cast<VAddr>(results) + u64(std::max(pairs, 1u)) * 16;
-    std::scoped_lock lock{occlusion_trap_mutex};
-    for (VAddr page = begin; page < end; page += OcclusionTrapPageSize) {
-        auto& trap = occlusion_traps[page];
-        ++trap.pending;
-        ++trap.unrecorded;
-        if (!trap.tracked) {
-            trap.tracked = page_manager.UpdatePageReadWatcher(page, VideoCore::PageOp::Track);
-        }
-    }
-    occlusion_trap_count.store(static_cast<u32>(occlusion_traps.size()), std::memory_order_relaxed);
-}
-
-void Rasterizer::OcclusionTrapRecorded(u64* results, u32 pairs) {
-    if (occlusion_trap_count.load(std::memory_order_relaxed) == 0) {
-        return;
-    }
-    const VAddr begin = reinterpret_cast<VAddr>(results) & ~(OcclusionTrapPageSize - 1);
-    const VAddr end = reinterpret_cast<VAddr>(results) + u64(std::max(pairs, 1u)) * 16;
-    std::scoped_lock lock{occlusion_trap_mutex};
-    for (VAddr page = begin; page < end; page += OcclusionTrapPageSize) {
-        if (const auto it = occlusion_traps.find(page);
-            it != occlusion_traps.end() && it->second.unrecorded != 0) {
-            --it->second.unrecorded;
-        }
-    }
-}
-
-bool Rasterizer::OcclusionTrapFill(VAddr address, u64 size, u32 value) {
-    if (occlusion_trap_count.load(std::memory_order_relaxed) == 0 || size == 0) {
-        return false;
-    }
-    const VAddr begin = address & ~(OcclusionTrapPageSize - 1);
-    std::scoped_lock lock{occlusion_trap_mutex};
-    bool tracked = false;
-    for (VAddr page = begin; page < address + size; page += OcclusionTrapPageSize) {
-        if (const auto it = occlusion_traps.find(page);
-            it != occlusion_traps.end() && it->second.tracked) {
-            tracked = true;
-        }
-    }
-    if (!tracked) {
-        return false;
-    }
-    std::vector<u32> data((size + sizeof(u32) - 1) / sizeof(u32), value);
-    Core::Memory::Instance()->TryWriteBacking(reinterpret_cast<void*>(address), data.data(), size);
-    return true;
-}
-
-std::optional<u32> Rasterizer::OcclusionKnownWord(VAddr address, u32 function, u32 ref, u32 mask) {
-    if (occlusion_trap_count.load(std::memory_order_relaxed) != 0) {
-        // The game waits (before each test) for its clear of the next test's block to land, on
-        // a page kept from the game: read past the protection, which a read here would let go.
-        bool on_trap = false;
-        {
-            std::scoped_lock lock{occlusion_trap_mutex};
-            const auto it = occlusion_traps.find(address & ~(OcclusionTrapPageSize - 1));
-            on_trap = it != occlusion_traps.end() && it->second.tracked;
-        }
-        if (on_trap) {
-            u32 word = 0;
-            Core::Memory::Instance()->CopySparseMemory(address, reinterpret_cast<u8*>(&word),
-                                                       sizeof(word));
-            occlusion_known_waits.fetch_add(1, std::memory_order_relaxed);
-            return word;
-        }
-    }
-    if (!occlusion_a.open || !EmulatorSettings.IsBbOcclusionWaitForAnswers() ||
-        address < occlusion_a.begin_address ||
-        address >= occlusion_a.begin_address + u64(occlusion_a.pairs) * 16) {
-        return std::nullopt;
-    }
-    // Each counter pair: start (8 bytes), end (8 bytes); the start is known.
-    const u64 offset = (address - occlusion_a.begin_address) % 16;
-    if (offset >= 8 || offset % 4 != 0) {
-        return std::nullopt;
-    }
-    occlusion_known_waits.fetch_add(1, std::memory_order_relaxed);
-    const u64 value = occlusion_a.begin_value;
-    return offset == 0 ? u32(value) : u32(value >> 32);
-}
-
-bool Rasterizer::OcclusionTrapFault(VAddr addr, bool is_write) {
-    if (occlusion_trap_count.load(std::memory_order_relaxed) == 0) {
-        return false;
-    }
-    const VAddr page = addr & ~(OcclusionTrapPageSize - 1);
-    std::unique_lock lock{occlusion_trap_mutex};
-    auto it = occlusion_traps.find(page);
-    if (it == occlusion_traps.end() || !it->second.tracked) {
-        return false;
-    }
-    const auto release = [&](OcclusionTrap& trap) {
-        page_manager.UpdatePageReadWatcher(page, VideoCore::PageOp::Untrack);
-        trap.tracked = false;
-    };
-    if (IsGpuSideThread() || on_occlusion_answer_thread) {
-        // The emulator's own access (the game's clear of a block, a write of an answer): the
-        // page is let go (its answers are then written as they come).
-        release(it->second);
-        occlusion_trap_stats[4].fetch_add(1, std::memory_order_relaxed);
-        // Diagnostics: which thread, reading or writing (stage A 0/1, stage B 2/3, answer
-        // thread 4/5, another GPU-side thread 6/7).
-        const u32 thread = DrawPipe::OnStageA()         ? 0
-                           : DrawPipe::OnStageB()       ? 1
-                           : on_occlusion_answer_thread ? 2
-                                                        : 3;
-        occlusion_release_kinds[thread * 2 + (is_write ? 1 : 0)].fetch_add(
-            1, std::memory_order_relaxed);
-        if (occlusion_release_logged.fetch_add(1, std::memory_order_relaxed) < 24) {
-            LOG_INFO(Render_Vulkan,
-                     "Occlusion: kept page {:#x} let go by {} ({}), at {:#x} (+{:#x}); {} tests "
-                     "pending on it, {} not reached by the draw recorder; packet {}",
-                     page, Common::GetCurrentThreadName(), is_write ? "write" : "read", addr,
-                     addr - page, it->second.pending, it->second.unrecorded,
-                     AmdGpu::current_packet_opcode == ~0u
-                         ? std::string{"(between packets)"}
-                         : fmt::format("{:#x} {}", AmdGpu::current_packet_opcode,
-                                       magic_enum::enum_name(static_cast<AmdGpu::PM4ItOpcode>(
-                                           AmdGpu::current_packet_opcode))));
-        }
-        return true;
-    }
-    // A game thread reading before the answer: it waits for the page's answers, as on the PS4.
-    const Common::GameWaits::Scope wait{"occlusion answer"};
-    if (it->second.unrecorded != 0) {
-        occlusion_trap_stats[5].fetch_add(1, std::memory_order_relaxed);
-    }
-    const auto start = std::chrono::steady_clock::now();
-    occlusion_trap_cv.wait_until(lock, start + std::chrono::milliseconds(6), [&] {
-        const auto found = occlusion_traps.find(page);
-        return found == occlusion_traps.end() || !found->second.tracked;
-    });
-    if (const auto found = occlusion_traps.find(page);
-        found != occlusion_traps.end() && found->second.tracked) {
-        release(found->second);
-        occlusion_trap_stats[2].fetch_add(1, std::memory_order_relaxed);
-    }
-    occlusion_trap_stats[0].fetch_add(1, std::memory_order_relaxed);
-    occlusion_trap_stats[1].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now() - start)
-                                          .count(),
-                                      std::memory_order_relaxed);
-    return true;
-}
-
 void Rasterizer::WriteOcclusionAnswer(const OcclusionAnswer& answer) {
     // Begin and end of every counter pair, the whole count in the first pair; the game reads
     // "not ready" until then (the block was cleared before the test).
@@ -5985,49 +5744,7 @@ void Rasterizer::WriteOcclusionAnswer(const OcclusionAnswer& answer) {
         data[i * 2] = answer.begin;
         data[i * 2 + 1] = i == 0 ? answer.begin + answer.count : answer.begin;
     }
-    u64* results = answer.results;
-    const u64 bytes = data.size() * sizeof(u64);
-    if (occlusion_trap_count.load(std::memory_order_relaxed) != 0) {
-        // Wait for occlusion answers: written past the page's protection while it is kept from
-        // the game, then the page is let go once its last answer is in.
-        std::unique_lock lock{occlusion_trap_mutex};
-        const VAddr begin = reinterpret_cast<VAddr>(results) & ~(OcclusionTrapPageSize - 1);
-        const VAddr end = reinterpret_cast<VAddr>(results) + std::max<u64>(bytes, 16);
-        bool tracked = false;
-        bool found = false;
-        for (VAddr page = begin; page < end; page += OcclusionTrapPageSize) {
-            if (const auto it = occlusion_traps.find(page); it != occlusion_traps.end()) {
-                found = true;
-                tracked |= it->second.tracked;
-            }
-        }
-        if (found) {
-            if (tracked && bytes != 0) {
-                Core::Memory::Instance()->TryWriteBacking(results, data.data(), bytes);
-            }
-            if (!answer.provisional) {
-                for (VAddr page = begin; page < end; page += OcclusionTrapPageSize) {
-                    const auto it = occlusion_traps.find(page);
-                    if (it == occlusion_traps.end() || --it->second.pending != 0) {
-                        continue;
-                    }
-                    if (it->second.tracked) {
-                        page_manager.UpdatePageReadWatcher(page, VideoCore::PageOp::Untrack);
-                        occlusion_trap_stats[3].fetch_add(1, std::memory_order_relaxed);
-                    }
-                    occlusion_traps.erase(it);
-                }
-                occlusion_trap_count.store(static_cast<u32>(occlusion_traps.size()),
-                                           std::memory_order_relaxed);
-                lock.unlock();
-                occlusion_trap_cv.notify_all();
-            }
-            if (tracked) {
-                return;
-            }
-        }
-    }
-    std::memcpy(results, data.data(), bytes);
+    std::memcpy(answer.results, data.data(), data.size() * sizeof(u64));
 }
 
 Rasterizer::OcclusionAnswer Rasterizer::AnswerOcclusion(const PendingOcclusion& test) {
@@ -6045,10 +5762,6 @@ Rasterizer::OcclusionAnswer Rasterizer::AnswerOcclusion(const PendingOcclusion& 
     if (!known) {
         occlusion_unknown.fetch_add(1, std::memory_order_relaxed);
         count = OcclusionVisibleCount;
-    } else if (test.count_scale != 1.0f && EmulatorSettings.IsBbOcclusionGameResolutionCounts()) {
-        // Counted at the render size: as many pixels as at the game's resolution (the game
-        // weighs the count, not only whether it is zero).
-        count = u64(double(count) * test.count_scale + 0.5);
     }
     {
         // One-frame hidden blips: visible, hidden, visible again in consecutive game frames.
@@ -6439,54 +6152,29 @@ void Rasterizer::LogDrawPipeStats() {
                 return 100.0 * (late[i] - pipe_stats_occlusion_late[i]) / late_answers;
             };
             LOG_INFO(Render_Vulkan,
-                     "  occlusion answers{}: reached the game {:.1f} ms after the test on "
+                     "  occlusion answers: reached the game {:.1f} ms after the test on "
                      "average | in the same game frame {:.0f}%, 1 frame later {:.0f}%, 2 "
                      "{:.0f}%, 3 or more {:.0f}% | tests begun again before the previous answer "
                      "arrived {:.0f}/s",
-                     QuickOcclusionAnswers() ? " (quick answers)" : "",
                      (late[4] - pipe_stats_occlusion_late[4]) / 1e6 / late_answers, pct(0), pct(1),
                      pct(2), pct(3), (late[5] - pipe_stats_occlusion_late[5]) / seconds);
         }
         pipe_stats_occlusion_late = late;
-        const std::array<u64, 5> span{occlusion_span_ns[0].load(std::memory_order_relaxed),
+        const std::array<u64, 4> span{occlusion_span_ns[0].load(std::memory_order_relaxed),
                                       occlusion_span_ns[1].load(std::memory_order_relaxed),
                                       occlusion_span_ns[2].load(std::memory_order_relaxed),
-                                      occlusion_span_count.load(std::memory_order_relaxed),
-                                      occlusion_early_submits.load(std::memory_order_relaxed)};
+                                      occlusion_span_count.load(std::memory_order_relaxed)};
         const u64 spans = span[3] - pipe_stats_occlusion_span[3];
         if (spans != 0) {
             const auto ms = [&](u32 i) {
                 return (span[i] - pipe_stats_occlusion_span[i]) / 1e6 / spans;
             };
-            const u64 skipped = occlusion_early_skipped.exchange(0, std::memory_order_relaxed);
             LOG_INFO(Render_Vulkan,
                      "  occlusion answer time: {:.1f} ms to the draw recorder, {:.1f} ms waiting "
-                     "for its submission, {:.1f} ms on the GPU | early submissions {:.0f}/s "
-                     "({:.0f}/s left out for background texture copies)",
-                     ms(0), ms(1), ms(2), (span[4] - pipe_stats_occlusion_span[4]) / seconds,
-                     skipped / seconds);
+                     "for its submission, {:.1f} ms on the GPU",
+                     ms(0), ms(1), ms(2));
         }
         pipe_stats_occlusion_span = span;
-        std::array<u64, 6> trap{};
-        for (u32 i = 0; i < trap.size(); ++i) {
-            trap[i] = occlusion_trap_stats[i].load(std::memory_order_relaxed);
-        }
-        const u64 early_reads = trap[0] - pipe_stats_occlusion_trap[0];
-        const u64 in_time = trap[3] - pipe_stats_occlusion_trap[3];
-        if (early_reads + in_time != 0) {
-            LOG_INFO(Render_Vulkan,
-                     "  waiting for occlusion answers: the game read {:.0f}/s before the answer "
-                     "(waited {:.2f} ms on average, {:.0f}/s gave up after 6 ms), {:.0f}/s "
-                     "answered before it read; {:.0f}/s let go for the emulator's own access; "
-                     "{:.0f}/s of the early reads came before the draw recorder got to the test",
-                     early_reads / seconds,
-                     early_reads ? (trap[1] - pipe_stats_occlusion_trap[1]) / 1e6 / early_reads
-                                 : 0.0,
-                     (trap[2] - pipe_stats_occlusion_trap[2]) / seconds, in_time / seconds,
-                     (trap[4] - pipe_stats_occlusion_trap[4]) / seconds,
-                     (trap[5] - pipe_stats_occlusion_trap[5]) / seconds);
-        }
-        pipe_stats_occlusion_trap = trap;
         const u64 blips = occlusion_blips.load(std::memory_order_relaxed);
         const u64 index_blips = occlusion_index_blips.load(std::memory_order_relaxed);
         LOG_INFO(Render_Vulkan,
@@ -6502,27 +6190,6 @@ void Rasterizer::LogDrawPipeStats() {
                  occlusion_slot_gaps[2].load(std::memory_order_relaxed),
                  occlusion_slot_gaps[3].load(std::memory_order_relaxed));
         pipe_stats_occlusion_blips = blips;
-        {
-            std::array<u64, 8> kinds{};
-            for (u32 i = 0; i < kinds.size(); ++i) {
-                kinds[i] = occlusion_release_kinds[i].exchange(0, std::memory_order_relaxed);
-            }
-            LOG_INFO(Render_Vulkan, "  game waits for occlusion start counters met: {:.0f}/s",
-                     occlusion_known_waits.exchange(0, std::memory_order_relaxed) / seconds);
-            LOG_INFO(Render_Vulkan,
-                     "  kept occlusion pages let go: GPU command thread {:.0f}/s reads, {:.0f}/s "
-                     "writes | draw recorder {:.0f}/s, {:.0f}/s | answer thread {:.0f}/s, {:.0f}/s "
-                     "| other {:.0f}/s, {:.0f}/s",
-                     kinds[0] / seconds, kinds[1] / seconds, kinds[2] / seconds, kinds[3] / seconds,
-                     kinds[4] / seconds, kinds[5] / seconds, kinds[6] / seconds,
-                     kinds[7] / seconds);
-        }
-        const u64 copies = occlusion_depth_copies.load(std::memory_order_relaxed);
-        if (copies != pipe_stats_occlusion_depth_copies) {
-            LOG_INFO(Render_Vulkan, "  occlusion tests tolerant of a pixel: {:.0f} depth copies/s",
-                     (copies - pipe_stats_occlusion_depth_copies) / seconds);
-        }
-        pipe_stats_occlusion_depth_copies = copies;
         const std::array<u64, 2> depth{occlusion_depth_current.load(std::memory_order_relaxed),
                                        occlusion_depth_older.load(std::memory_order_relaxed)};
         const u64 depth_current = depth[0] - pipe_stats_occlusion_depth[0];

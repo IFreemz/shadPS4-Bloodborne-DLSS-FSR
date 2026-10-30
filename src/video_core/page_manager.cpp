@@ -574,10 +574,6 @@ struct SignalImpl : public PageManager::Impl {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread = rasterizer->IsGpuSideThread();
-        // Occlusion results kept from the game until answered (first: no other wait).
-        if (rasterizer->OcclusionTrapFault(addr, Common::IsWriteError(context))) {
-            return true;
-        }
         if (Common::IsWriteError(context)) {
             const Common::GameWaits::Scope wait{"write fault"};
             return rasterizer->OnWriteFault(addr, size, is_gpu_thread);

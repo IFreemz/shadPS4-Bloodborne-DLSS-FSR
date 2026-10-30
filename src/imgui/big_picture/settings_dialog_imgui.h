@@ -203,12 +203,6 @@ private:
     bool bbEvictKeepProtectionSetting;
     bool bbEvictKeepReturningSetting;
     bool bbProtectHelperThreadSetting;
-    bool bbQuickOcclusionAnswersSetting;
-    bool bbOcclusionVisibleUntilAnsweredSetting;
-    bool bbOcclusionEarlySubmitSetting;
-    bool bbOcclusionWaitForAnswersSetting;
-    bool bbOcclusionGameResolutionCountsSetting;
-    bool bbOcclusionTolerantDepthSetting;
     bool bbCpuCopyShaderSetting;
     bool bbCopySkipSameSetting;
     bool bbClearOneLayerSetting;

@@ -723,37 +723,6 @@ struct VulkanSettings {
     // writes) is done by one helper thread instead of the draw recorder (~6-9 ms of a traversal
     // burst); the texture's background copies wait for it. Needs background texture copies.
     Setting<bool> bb_protect_helper_thread{false};
-    // Quick occlusion answers (with real occlusion tests): a thread waits for the GPU and
-    // writes each test's answer into game memory as soon as the GPU has run it, instead of the
-    // draw recorder checking every 32 packets (none between frames). Areas coming round a
-    // corner were drawn a frame or two late (white for a moment).
-    Setting<bool> bb_quick_occlusion_answers{false};
-    // Visible until answered (with real occlusion tests): a test reads "visible" from when the
-    // game starts it until the GPU's answer replaces it, instead of "not ready". On the PS4 the
-    // answer is there within a few ms; here 20-25 ms, and a game that reads "not ready" keeps
-    // its last answer, so an area hidden last time stayed undrawn (white) round a corner.
-    Setting<bool> bb_occlusion_visible_until_answered{false};
-    // Submit occlusion tests at once (with real occlusion tests): after a group of the game's
-    // tests the work recorded so far goes to the GPU straight away, instead of with the rest of
-    // the frame, so the answers are back sooner (the game reads them 2-10 ms after the test;
-    // they took 20-25 ms). Skipped while background texture copies are still running.
-    Setting<bool> bb_occlusion_early_submit{false};
-    // Wait for occlusion answers (with real occlusion tests): a test's results are kept from the
-    // game (no access) until the GPU's answer is there; a game thread reading them sooner waits
-    // for it, up to 6 ms (then reads "visible" with "Visible until answered", or "not ready"),
-    // as on the PS4, where the answer is there before the game reads it.
-    Setting<bool> bb_occlusion_wait_for_answers{false};
-    // Occlusion counts at the game's resolution (with real occlusion tests and a render size
-    // below the output): a test drawn at the render size counts fewer pixels (a quarter at
-    // half size); its count is scaled to the game's resolution, as the game expects (it uses the
-    // count itself, e.g. for how much of an area or light shows).
-    Setting<bool> bb_occlusion_game_resolution_counts{false};
-    // Occlusion tests tolerant of a pixel (with real occlusion tests): the game's test boxes are
-    // tested against a copy of the scene's depth where each pixel holds the farthest depth
-    // around it. An area showing through a gap of about a pixel read 0 pixels in some frames
-    // (the upscaler's sub-pixel camera jitter and sub-pixel movement) and was not drawn for that
-    // frame (white or sky for a frame).
-    Setting<bool> bb_occlusion_tolerant_depth{false};
     // Copy shader on the CPU: the game's GPU copy shader (thousands of small copies a second)
     // is done in game memory when neither side holds data only the GPU has. Its destination
     // was marked GPU-written, and the game's next write near it waited for the GPU to finish
@@ -780,8 +749,21 @@ struct VulkanSettings {
     // The AO computed at half the scene's size and upscaled guided by the depth (about a
     // quarter of the cost; slightly softer fine detail). Off: at the full scene size.
     Setting<bool> bb_vbao_half_res{true};
+    // Screen-space reflections (with the game's "Enable Screen Space Reflections" patch):
+    // 0 the game's, 1 better (traced through a depth pyramid with the game's own inputs, and
+    // denoised), 2 off (none at all). Global only.
+    Setting<int> bb_ssr_mode{0};
+    // Better reflections at the scene's full size (not the game's half size), from a full-size
+    // copy of the last frame, read by the lighting directly: a little sharper, at more GPU time.
+    Setting<bool> bb_ssr_full_res{false};
     // Settings window: the threaded renderer's individual settings are listed (remembered).
     Setting<bool> bb_show_threaded_settings{false};
+    // Bloodborne's frame rate set free by hooks in the game's code instead of the
+    // frame rate patches, which must be off then. Applies at the next start. Global only.
+    Setting<bool> bb_frame_hooks{true};
+    // The frame rate limit with the frame rate hooks (30..480; 0: none), changed while the game
+    // runs. Global only.
+    Setting<int> bb_fps_limit{0};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -820,23 +802,11 @@ struct VulkanSettings {
                                           &VulkanSettings::bb_evict_keep_returning),
             make_override<VulkanSettings>("bb_protect_helper_thread",
                                           &VulkanSettings::bb_protect_helper_thread),
-            make_override<VulkanSettings>("bb_quick_occlusion_answers",
-                                          &VulkanSettings::bb_quick_occlusion_answers),
             make_override<VulkanSettings>("bb_cpu_copy_shader",
                                           &VulkanSettings::bb_cpu_copy_shader),
             make_override<VulkanSettings>("bb_copy_skip_same", &VulkanSettings::bb_copy_skip_same),
             make_override<VulkanSettings>("bb_clear_one_layer",
                                           &VulkanSettings::bb_clear_one_layer),
-            make_override<VulkanSettings>("bb_occlusion_visible_until_answered",
-                                          &VulkanSettings::bb_occlusion_visible_until_answered),
-            make_override<VulkanSettings>("bb_occlusion_early_submit",
-                                          &VulkanSettings::bb_occlusion_early_submit),
-            make_override<VulkanSettings>("bb_occlusion_wait_for_answers",
-                                          &VulkanSettings::bb_occlusion_wait_for_answers),
-            make_override<VulkanSettings>("bb_occlusion_game_resolution_counts",
-                                          &VulkanSettings::bb_occlusion_game_resolution_counts),
-            make_override<VulkanSettings>("bb_occlusion_tolerant_depth",
-                                          &VulkanSettings::bb_occlusion_tolerant_depth),
         };
     }
 };
@@ -846,11 +816,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     vkguest_markers, pipeline_cache_enabled, pipeline_cache_archived, bb_copy_threads,
     bb_cached_texture_staging, bb_lower_detail_first, bb_clear_shader_written,
     bb_ce_skip_huge_writes, bb_evict_keep_protection, bb_evict_keep_returning,
-    bb_protect_helper_thread, bb_cpu_copy_shader, bb_copy_skip_same,
-    bb_clear_one_layer, bb_quick_occlusion_answers, bb_occlusion_visible_until_answered,
-    bb_occlusion_early_submit, bb_occlusion_wait_for_answers, bb_occlusion_game_resolution_counts,
-    bb_occlusion_tolerant_depth, bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius,
-    bb_vbao_half_res, bb_show_threaded_settings)
+    bb_protect_helper_thread, bb_cpu_copy_shader, bb_copy_skip_same, bb_clear_one_layer,
+    bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius, bb_vbao_half_res,
+    bb_ssr_mode, bb_ssr_full_res, bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit)
 
 // -------------------------------
 // Main manager
@@ -1146,14 +1114,6 @@ public:
     SETTING_FORWARD_BOOL(m_vulkan, BbEvictKeepProtection, bb_evict_keep_protection)
     SETTING_FORWARD_BOOL(m_vulkan, BbEvictKeepReturning, bb_evict_keep_returning)
     SETTING_FORWARD_BOOL(m_vulkan, BbProtectHelperThread, bb_protect_helper_thread)
-    SETTING_FORWARD_BOOL(m_vulkan, BbQuickOcclusionAnswers, bb_quick_occlusion_answers)
-    SETTING_FORWARD_BOOL(m_vulkan, BbOcclusionVisibleUntilAnswered,
-                         bb_occlusion_visible_until_answered)
-    SETTING_FORWARD_BOOL(m_vulkan, BbOcclusionEarlySubmit, bb_occlusion_early_submit)
-    SETTING_FORWARD_BOOL(m_vulkan, BbOcclusionWaitForAnswers, bb_occlusion_wait_for_answers)
-    SETTING_FORWARD_BOOL(m_vulkan, BbOcclusionGameResolutionCounts,
-                         bb_occlusion_game_resolution_counts)
-    SETTING_FORWARD_BOOL(m_vulkan, BbOcclusionTolerantDepth, bb_occlusion_tolerant_depth)
     SETTING_FORWARD_BOOL(m_vulkan, BbCpuCopyShader, bb_cpu_copy_shader)
     SETTING_FORWARD_BOOL(m_vulkan, BbCopySkipSame, bb_copy_skip_same)
     SETTING_FORWARD_BOOL(m_vulkan, BbClearOneLayer, bb_clear_one_layer)
@@ -1161,7 +1121,11 @@ public:
     SETTING_FORWARD(m_vulkan, BbVbaoStrength, bb_vbao_strength)
     SETTING_FORWARD(m_vulkan, BbVbaoRadius, bb_vbao_radius)
     SETTING_FORWARD_BOOL(m_vulkan, BbVbaoHalfRes, bb_vbao_half_res)
+    SETTING_FORWARD(m_vulkan, BbSsrMode, bb_ssr_mode)
+    SETTING_FORWARD_BOOL(m_vulkan, BbSsrFullRes, bb_ssr_full_res)
     SETTING_FORWARD_BOOL(m_vulkan, BbShowThreadedSettings, bb_show_threaded_settings)
+    SETTING_FORWARD_BOOL(m_vulkan, BbFrameHooks, bb_frame_hooks)
+    SETTING_FORWARD(m_vulkan, BbFpsLimit, bb_fps_limit)
     SETTING_FORWARD_BOOL(m_gpu, BbSpreadLoads, bb_spread_loads)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)

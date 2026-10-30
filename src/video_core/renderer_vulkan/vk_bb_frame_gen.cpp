@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -423,6 +424,200 @@ std::optional<LUID> NvidiaAdapter() {
     return luid;
 }
 
+namespace {
+// ---- The frame generation model, in the driver's profile for shadPS4.exe ----
+// nvngx_dlssg.dll reads its model from the driver profile setting "Override DLSS-FG preset" when
+// it starts, the setting the NVIDIA app's model override writes (NVIDIA's NvApiDriverSettings.h:
+// 0 the default, 1 A, 2 B, 3 C; C from DLSS-G 310.9.16, older ones ignore it). Written through
+// NVAPI's public driver settings calls before Streamline loads, so it applies at this start.
+namespace Nv {
+using Status = s32;
+using Handle = void*;
+constexpr Status Ok = 0;
+constexpr Status SettingNotFound = -160;
+constexpr Status ExecutableNotFound = -166;
+constexpr u32 FgPresetSetting = 0x10E41DF1;
+constexpr u32 StringMax = 2048;
+using UnicodeString = u16[StringMax];
+
+#pragma pack(push, 8)
+struct Profile {
+    u32 version;
+    UnicodeString name;
+    u32 gpu_support;
+    u32 is_predefined;
+    u32 apps;
+    u32 settings;
+};
+struct Application {
+    u32 version;
+    u32 is_predefined;
+    UnicodeString app_name;
+    UnicodeString friendly_name;
+    UnicodeString launcher;
+    UnicodeString file_in_folder;
+    u32 flags;
+    UnicodeString command_line;
+};
+#pragma pack(pop)
+#pragma pack(push, 4)
+struct Setting {
+    u32 version;
+    UnicodeString name;
+    u32 id;
+    u32 type; // 0: a DWORD
+    u32 location;
+    u32 is_current_predefined;
+    u32 is_predefined_valid;
+    union {
+        u32 u32_value;
+        u8 binary[4 + 4096];
+        UnicodeString text;
+        u64 u64_value;
+    } predefined;
+    union {
+        u32 u32_value;
+        u8 binary[4 + 4096];
+        UnicodeString text;
+        u64 u64_value;
+    } current;
+};
+#pragma pack(pop)
+static_assert(sizeof(Profile) == 4116 && sizeof(Application) == 20492 && sizeof(Setting) == 12320);
+constexpr u32 Version(u32 size, u32 version) {
+    return size | (version << 16);
+}
+
+void Copy(UnicodeString& to, const std::wstring& from) {
+    const size_t n = std::min<size_t>(from.size(), StringMax - 1);
+    for (size_t i = 0; i < n; ++i)
+        to[i] = u16(from[i]);
+    to[n] = 0;
+}
+} // namespace Nv
+
+/// dlss.ini fg_model: default (the driver's choice), a, b or c.
+u32 FgModelPreset() {
+    const auto model = LaunchSetting("fg_model").value_or("default");
+    return model == "a" ? 1 : model == "b" ? 2 : model == "c" ? 3 : 0;
+}
+
+void ApplyFgModel() {
+    const u32 preset = FgModelPreset();
+    HMODULE nvapi = LoadLibraryW(L"nvapi64.dll");
+    if (!nvapi) {
+        if (preset)
+            LOG_WARNING(Render_Vulkan,
+                        "[FRAME-GEN] Model: nvapi64.dll not found, the driver's model");
+        return;
+    }
+    using QueryInterface = void* (*)(u32);
+    const auto query =
+        reinterpret_cast<QueryInterface>(GetProcAddress(nvapi, "nvapi_QueryInterface"));
+    const auto get = [&]<typename F>(F*& out, u32 id) {
+        out = query ? reinterpret_cast<F*>(query(id)) : nullptr;
+        return out != nullptr;
+    };
+    using Initialize = Nv::Status();
+    using CreateSession = Nv::Status(Nv::Handle*);
+    using SessionCall = Nv::Status(Nv::Handle);
+    using FindApplication = Nv::Status(Nv::Handle, const u16*, Nv::Handle*, Nv::Application*);
+    using FindProfile = Nv::Status(Nv::Handle, const u16*, Nv::Handle*);
+    using CreateProfile = Nv::Status(Nv::Handle, Nv::Profile*, Nv::Handle*);
+    using CreateApplication = Nv::Status(Nv::Handle, Nv::Handle, Nv::Application*);
+    using GetSetting = Nv::Status(Nv::Handle, Nv::Handle, u32, Nv::Setting*);
+    using SetSetting = Nv::Status(Nv::Handle, Nv::Handle, Nv::Setting*);
+    using DeleteSetting = Nv::Status(Nv::Handle, Nv::Handle, u32);
+    Initialize* initialize{};
+    CreateSession* create_session{};
+    SessionCall *destroy_session{}, *load_settings{}, *save_settings{};
+    FindApplication* find_application{};
+    FindProfile* find_profile{};
+    CreateProfile* create_profile{};
+    CreateApplication* create_application{};
+    GetSetting* get_setting{};
+    SetSetting* set_setting{};
+    DeleteSetting* delete_setting{};
+    // IDs from NVIDIA's nvapi_interface.h.
+    if (!get(initialize, 0x0150E828) || !get(create_session, 0x0694D52E) ||
+        !get(destroy_session, 0xDAD9CFF8) || !get(load_settings, 0x375DBD6B) ||
+        !get(save_settings, 0xFCBC7E14) || !get(find_application, 0xEEE566B2) ||
+        !get(find_profile, 0x7E4A9A0B) || !get(create_profile, 0xCC176068) ||
+        !get(create_application, 0x4347A9DE) || !get(get_setting, 0x73BF8338) ||
+        !get(set_setting, 0x577DD202) || !get(delete_setting, 0xE4A26362) ||
+        initialize() != Nv::Ok) {
+        LOG_WARNING(Render_Vulkan, "[FRAME-GEN] Model: NVAPI's driver settings are not available");
+        return;
+    }
+    Nv::Handle session{};
+    if (create_session(&session) != Nv::Ok)
+        return;
+    std::wstring module(MAX_PATH, L'\0');
+    module.resize(GetModuleFileNameW(nullptr, module.data(), DWORD(module.size())));
+    const std::wstring exe = std::filesystem::path{module}.filename().wstring();
+    static constexpr const char* Names[] = {"the driver's", "A", "B", "C"};
+    const auto done = [&](Nv::Status status, const char* what) {
+        if (status == Nv::Ok)
+            LOG_INFO(Render_Vulkan, "[FRAME-GEN] Model: {} ({})", Names[preset], what);
+        else
+            LOG_WARNING(Render_Vulkan, "[FRAME-GEN] Model: could not set {} ({}: NVAPI {})",
+                        Names[preset], what, status);
+        destroy_session(session);
+    };
+    Nv::Status status = load_settings(session);
+    if (status != Nv::Ok)
+        return done(status, "loading the driver settings");
+    Nv::UnicodeString name{};
+    Nv::Copy(name, exe);
+    auto application = std::make_unique<Nv::Application>();
+    application->version = Nv::Version(sizeof(Nv::Application), 4);
+    Nv::Handle profile{};
+    status = find_application(session, name, &profile, application.get());
+    if (status == Nv::ExecutableNotFound) {
+        if (!preset)
+            return done(Nv::Ok, "no profile for shadPS4");
+        // A profile of our own for shadPS4.exe (found again by name if it exists already).
+        auto created = std::make_unique<Nv::Profile>();
+        created->version = Nv::Version(sizeof(Nv::Profile), 1);
+        Nv::Copy(created->name, L"shadPS4 Bloodborne");
+        status = find_profile(session, created->name, &profile);
+        if (status != Nv::Ok)
+            status = create_profile(session, created.get(), &profile);
+        if (status != Nv::Ok)
+            return done(status, "creating the profile");
+        *application = {};
+        application->version = Nv::Version(sizeof(Nv::Application), 4);
+        Nv::Copy(application->app_name, exe);
+        status = create_application(session, profile, application.get());
+        if (status != Nv::Ok)
+            return done(status, "adding shadPS4 to the profile");
+    } else if (status != Nv::Ok) {
+        return done(status, "finding shadPS4's profile");
+    }
+    auto setting = std::make_unique<Nv::Setting>();
+    setting->version = Nv::Version(sizeof(Nv::Setting), 1);
+    status = get_setting(session, profile, Nv::FgPresetSetting, setting.get());
+    const bool present = status == Nv::Ok;
+    if (!preset) {
+        if (!present)
+            return done(Nv::Ok, "not set in shadPS4's profile");
+        status = delete_setting(session, profile, Nv::FgPresetSetting);
+    } else {
+        if (present && setting->current.u32_value == preset)
+            return done(Nv::Ok, "already set");
+        *setting = {};
+        setting->version = Nv::Version(sizeof(Nv::Setting), 1);
+        setting->id = Nv::FgPresetSetting;
+        setting->type = 0;
+        setting->current.u32_value = preset;
+        status = set_setting(session, profile, setting.get());
+    }
+    if (status == Nv::Ok)
+        status = save_settings(session);
+    done(status, "set in the driver profile for shadPS4");
+}
+} // namespace
+
 PFN_vkGetInstanceProcAddr Load() {
     if (!Requested())
         return nullptr;
@@ -453,6 +648,7 @@ PFN_vkGetInstanceProcAddr Load() {
         return fail("The frame generation files (sl.*.dll) are missing next to shadPS4.exe.");
     if (!sl::security::verifyEmbeddedSignature(interposer.c_str()))
         return fail("sl.interposer.dll is not signed by NVIDIA.");
+    ApplyFgModel();
     api.module = LoadLibraryW(interposer.c_str());
     if (!api.module) {
         LOG_ERROR(Render_Vulkan, "[FRAME-GEN] sl.interposer.dll could not be loaded");

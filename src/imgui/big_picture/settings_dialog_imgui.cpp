@@ -116,12 +116,6 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbEvictKeepProtectionSetting = EmulatorSettings.IsBbEvictKeepProtection();
     bbEvictKeepReturningSetting = EmulatorSettings.IsBbEvictKeepReturning();
     bbProtectHelperThreadSetting = EmulatorSettings.IsBbProtectHelperThread();
-    bbQuickOcclusionAnswersSetting = EmulatorSettings.IsBbQuickOcclusionAnswers();
-    bbOcclusionVisibleUntilAnsweredSetting = EmulatorSettings.IsBbOcclusionVisibleUntilAnswered();
-    bbOcclusionEarlySubmitSetting = EmulatorSettings.IsBbOcclusionEarlySubmit();
-    bbOcclusionWaitForAnswersSetting = EmulatorSettings.IsBbOcclusionWaitForAnswers();
-    bbOcclusionGameResolutionCountsSetting = EmulatorSettings.IsBbOcclusionGameResolutionCounts();
-    bbOcclusionTolerantDepthSetting = EmulatorSettings.IsBbOcclusionTolerantDepth();
     bbCpuCopyShaderSetting = EmulatorSettings.IsBbCpuCopyShader();
     bbCopySkipSameSetting = EmulatorSettings.IsBbCopySkipSame();
     bbClearOneLayerSetting = EmulatorSettings.IsBbClearOneLayer();
@@ -243,14 +237,6 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbEvictKeepProtection(bbEvictKeepProtectionSetting, isSpecific);
     EmulatorSettings.SetBbEvictKeepReturning(bbEvictKeepReturningSetting, isSpecific);
     EmulatorSettings.SetBbProtectHelperThread(bbProtectHelperThreadSetting, isSpecific);
-    EmulatorSettings.SetBbQuickOcclusionAnswers(bbQuickOcclusionAnswersSetting, isSpecific);
-    EmulatorSettings.SetBbOcclusionVisibleUntilAnswered(bbOcclusionVisibleUntilAnsweredSetting,
-                                                        isSpecific);
-    EmulatorSettings.SetBbOcclusionEarlySubmit(bbOcclusionEarlySubmitSetting, isSpecific);
-    EmulatorSettings.SetBbOcclusionWaitForAnswers(bbOcclusionWaitForAnswersSetting, isSpecific);
-    EmulatorSettings.SetBbOcclusionGameResolutionCounts(bbOcclusionGameResolutionCountsSetting,
-                                                        isSpecific);
-    EmulatorSettings.SetBbOcclusionTolerantDepth(bbOcclusionTolerantDepthSetting, isSpecific);
     EmulatorSettings.SetBbCpuCopyShader(bbCpuCopyShaderSetting, isSpecific);
     EmulatorSettings.SetBbCopySkipSame(bbCopySkipSameSetting, isSpecific);
     EmulatorSettings.SetBbClearOneLayer(bbClearOneLayerSetting, isSpecific);
@@ -1036,29 +1022,6 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "NVIDIA: less pixel shader code (needs a restart)");
                 AddSettingCheckbox("    Real occlusion tests", bbRealOcclusionSetting,
                                    "Areas hidden behind walls are skipped by the game");
-                AddSettingCheckbox("      Quick occlusion answers", bbQuickOcclusionAnswersSetting,
-                                   "Each test's answer reaches the game as soon as the GPU has "
-                                   "it (areas round a corner drawn on time)");
-                AddSettingCheckbox("      Visible until answered",
-                                   bbOcclusionVisibleUntilAnsweredSetting,
-                                   "A test reads \"visible\" until the GPU's answer arrives "
-                                   "(no white areas round corners)");
-                AddSettingCheckbox("      Submit occlusion tests at once",
-                                   bbOcclusionEarlySubmitSetting,
-                                   "The tests go to the GPU right after the game makes them "
-                                   "(answers back sooner)");
-                AddSettingCheckbox("      Wait for occlusion answers",
-                                   bbOcclusionWaitForAnswersSetting,
-                                   "The game waits for a test's answer when it reads it early "
-                                   "(up to 6 ms), as on the PS4");
-                AddSettingCheckbox("      Occlusion counts at the game's resolution",
-                                   bbOcclusionGameResolutionCountsSetting,
-                                   "Pixel counts of tests drawn at the render size scaled up "
-                                   "to the game's resolution");
-                AddSettingCheckbox("      Occlusion tests tolerant of a pixel",
-                                   bbOcclusionTolerantDepthSetting,
-                                   "Areas seen through a gap of about a pixel are not skipped "
-                                   "for a frame (no flash of sky or white)");
                 AddSettingCheckbox("    Copy thread", bbCopyThreadSetting,
                                    "Draw memory copies on their own thread (needs a restart)");
                 AddSettingCheckbox("    Keep rendering while presenting",

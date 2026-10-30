@@ -5,6 +5,7 @@
 #include "common/elf_info.h"
 #include "common/game_waits.h"
 #include "common/logging/log.h"
+#include "core/bb_frame_rate.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/system/userservice.h"
@@ -141,7 +142,9 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
-    driver->GetPort(handle)->flip_rate = rate;
+    // With Bloodborne's frame rate hooks a frame is shown as soon as it comes (the game asks for
+    // every second vblank, 30 FPS).
+    driver->GetPort(handle)->flip_rate = Core::BbFrameRate::Active() ? 0 : rate;
     return ORBIS_OK;
 }
 

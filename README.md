@@ -103,6 +103,10 @@ With DLSS on RTX 50, *Frame gen multiplier* offers 2x, 3x or 4x. Aim for the gam
 times the multiplier to be close to your refresh rate (60 x 4 on a 240 Hz screen); frames above
 it are wasted. *Lower input delay (Reflex)* (DLSS only) does what it says but can lower the
 frame rate when the GPU is saturated or the generated output is limited by VSync.
+*DLSS frame gen model* (restart to apply) picks NVIDIA's model: *Default* (the driver's choice),
+*B* (the standard one) or *C* (lighter and faster, a little softer on the UI; needs
+`nvngx_dlssg.dll` 310.9.16 or newer). It is written to the NVIDIA driver profile for
+`shadPS4.exe` at the start, as the NVIDIA app's model override does.
 
 Tips:
 
@@ -243,6 +247,9 @@ RenoDX authors.
 ### Other patches
 
 Keep *Better AA* and *Enable TAA* off: the upscaler replaces the game's anti-aliasing.
+*Frame rate hooks* (F1, on by default) unlock the frame rate themselves, so the frame rate
+patches (*60 FPS++*, *Uncap FPS++* and the like) are left out while they are on. *FPS cap* in F1
+changes while the game runs.
 *60FPS++ (no deltatime)* may crash while an area loads; use *60 FPS++*. *Enable Screen Space
 Reflections* turns off object motion for the upscaler, so characters and weapons can smear; keep
 it off for the sharpest image. Patches and mods that
@@ -452,7 +459,7 @@ Its model files are `fsr4_model_v07_i8_*`, `rcas.spv` and `spd_auto_exposure.spv
 [Q2RTX's `baseq2/fsr4_shaders`](https://github.com/FireBurn/Q2RTX/tree/ae8d628fae208813172446d1e49ed94150b04658/baseq2/fsr4_shaders).
 
 Frame generation needs the [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline/releases)
-2.14.1 headers: add `-DBB_STREAMLINE_DIR=<path to the Streamline SDK>` when configuring the
+2.14.16 headers: add `-DBB_STREAMLINE_DIR=<path to the Streamline SDK>` when configuring the
 emulator. `sl.*.dll` and `nvngx_dlssg.dll` come from its `bin/x64` folder.
 
 `nvngx_dlss.dll` comes from the DLSS SDK (`lib/Windows_x86_64/rel`), `amd_fidelityfx_vk.dll`

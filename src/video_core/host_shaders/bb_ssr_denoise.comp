@@ -1,0 +1,442 @@
+// SPDX-FileCopyrightText: Copyright 2024 Advanced Micro Devices, Inc. (FidelityFX SDK 1.1.4)
+// SPDX-FileCopyrightText: Copyright 2015 Playdead (ClipAABB, "Temporal Reprojection Anti-Aliasing")
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: MIT AND GPL-2.0-or-later
+// The better reflections' denoiser (vk_bb_ssr.h): AMD FidelityFX's reflection denoiser
+// (ffx_denoiser_reflections_reproject.h, _prefilter.h and _resolve_temporal.h of the FidelityFX
+// SDK 1.1.4, MIT licensed), its full-precision path, with the game's inputs. Three passes, one
+// per PASS_* define:
+// REPROJECT: the last frames' reflections, from where the reflection was (its mirror image, for
+//   glossy surfaces) or where the surface was, whichever matches the surface better; dropped
+//   where the surface was not there (disocclusion: another normal or depth). Also the number of
+//   frames so far, how much the reflection changes between frames (variance), and the average
+//   reflection of each 8x8 tile.
+// PREFILTER: where the reflection changes between frames, a spatial filter over 16 neighbours
+//   within 3 pixels on the same surface (normal, depth) and of a similar brightness.
+// RESOLVE: the filtered reflection blended with the reprojected history, which is first clipped
+//   to the spread of this frame's reflections around the pixel; more frames on glossier
+//   surfaces' less changing reflections. Kept as the next frame's history with the surface.
+// The reflections are RGBA (colour times fade, and the fade): the fade is filtered with them.
+// The game's roughness is taken as 1 - gloss (its lighting blurs the reflections by gloss).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D tex0;
+layout(binding = 1) uniform texture2D tex1;
+layout(binding = 2) uniform texture2D pyramid_tex; // depth (level 0)
+layout(binding = 3) uniform texture2D normal_tex;  // the G-buffer's world normals
+layout(binding = 4) uniform texture2D gloss_tex;   // the G-buffer's gloss (red), if `has_gloss`
+layout(binding = 5) uniform texture2D tex5;
+layout(binding = 6) uniform texture2D tex6;
+layout(binding = 8) uniform sampler2D sampled8;
+layout(binding = 9) uniform sampler2D sampled9;
+layout(binding = 10) uniform sampler2D sampled10;
+layout(binding = 12, rgba16f) uniform writeonly image2D out12;
+layout(binding = 13, rgba16f) uniform writeonly image2D out13;
+layout(binding = 14, rgba16f) uniform writeonly image2D out14;
+#ifdef WITH_TARGET
+layout(binding = 15, rgba16f) uniform writeonly image2D out15;
+#endif
+layout(binding = 16, std430) readonly buffer GameConstants {
+    uint data[];
+};
+
+layout(push_constant) uniform Constants {
+    vec2 size;
+    vec2 normal_scale; // G-buffer texels per pixel
+    uint offset;       // of the game's constants in `data`, in dwords
+    uint has_gloss;
+    uint history;      // 0: no last frame (the first, after a pause, or the setting off)
+    float roughness;   // without the gloss
+};
+
+float C(uint k) {
+    return uintBitsToFloat(data[offset + k]);
+}
+
+float Dot4(uint k, vec4 v) {
+    return dot(vec4(C(k), C(k + 1u), C(k + 2u), C(k + 3u)), v);
+}
+
+// FidelityFX's settings (ffx_denoiser_reflections_config.h; the sample's stability factor and
+// sample count).
+const float GAUSSIAN_K = 3.0;
+const float RADIANCE_WEIGHT_BIAS = 0.6;
+const float RADIANCE_WEIGHT_VARIANCE_K = 0.1;
+const float AVG_RADIANCE_LUMINANCE_WEIGHT = 0.3;
+const float PREFILTER_VARIANCE_WEIGHT = 4.4;
+const float REPROJECT_SURFACE_DISCARD_VARIANCE_WEIGHT = 1.5;
+const float PREFILTER_VARIANCE_BIAS = 0.1;
+const float PREFILTER_NORMAL_SIGMA = 512.0;
+const float PREFILTER_DEPTH_SIGMA = 4.0;
+const float DISOCCLUSION_NORMAL_WEIGHT = 1.4;
+const float DISOCCLUSION_DEPTH_WEIGHT = 1.0;
+const float DISOCCLUSION_THRESHOLD = 0.9;
+const float REPROJECTION_NORMAL_SIMILARITY_THRESHOLD = 0.9999;
+const float TEMPORAL_STABILITY = 0.7;
+const float MAX_SAMPLES = 32.0;
+const int NEIGHBORHOOD_RADIUS = 4;
+
+float SamplesForRoughness(float r) {
+    return 1.0 - exp(-r * 100.0);
+}
+
+ivec2 Clamped(ivec2 pixel) {
+    return clamp(pixel, ivec2(0), ivec2(size) - 1);
+}
+
+float Depth(ivec2 pixel) {
+    return texelFetch(pyramid_tex, Clamped(pixel), 0).r;
+}
+
+// View z (the game's: from its depth constants).
+float LinearDepth(float depth) {
+    return abs(-C(69u) / (C(68u) - depth));
+}
+
+vec3 Normal(ivec2 pixel) {
+    const ivec2 texel = ivec2((vec2(Clamped(pixel)) + 0.5) * normal_scale);
+    const vec3 n = texelFetch(normal_tex, texel, 0).xyz * 2.0 - 1.0;
+    return dot(n, n) > 1e-6 ? normalize(n) : vec3(0.0, 0.0, 1.0);
+}
+
+float Roughness(ivec2 pixel) {
+    if (has_gloss == 0u) {
+        return roughness;
+    }
+    const ivec2 texel = ivec2((vec2(Clamped(pixel)) + 0.5) * normal_scale);
+    return clamp(1.0 - texelFetch(gloss_tex, texel, 0).r, 0.0, 1.0);
+}
+
+float Luminance(vec3 color) {
+    return max(dot(color, vec3(0.299, 0.587, 0.114)), 0.001);
+}
+
+float TemporalVariance(vec3 history, vec3 radiance) {
+    const float history_luminance = Luminance(history);
+    const float luminance = Luminance(radiance);
+    const float diff =
+        abs(history_luminance - luminance) / max(max(history_luminance, luminance), 0.5);
+    return diff * diff;
+}
+
+vec4 ClipAABB(vec4 aabb_min, vec4 aabb_max, vec4 prev_sample) {
+    const vec4 center = 0.5 * (aabb_max + aabb_min);
+    const vec4 extent = 0.5 * (aabb_max - aabb_min) + 0.001;
+    const vec4 v = prev_sample - center;
+    const vec4 unit = abs(v / extent);
+    const float max_unit = max(max(unit.x, unit.y), max(unit.z, unit.w));
+    return max_unit > 1.0 ? center + v / max_unit : prev_sample;
+}
+
+float NeighborhoodWeight(float i) {
+    const float radius = float(NEIGHBORHOOD_RADIUS) + 1.0;
+    return exp(-GAUSSIAN_K * (i * i) / (radius * radius));
+}
+
+// A 16x16 tile around the group (4 pixels on each side).
+shared vec4 tile[16][16];
+#ifdef PASS_PREFILTER
+shared vec4 tile_surface[16][16]; // normal, linear depth
+shared float tile_variance[16][16];
+#endif
+
+void LoadTile(ivec2 pixel, ivec2 local) {
+    const ivec2 offsets[4] = ivec2[](ivec2(0, 0), ivec2(8, 0), ivec2(0, 8), ivec2(8, 8));
+    for (int i = 0; i < 4; ++i) {
+        const ivec2 at = Clamped(pixel - 4 + offsets[i]);
+        const ivec2 to = local + offsets[i];
+        tile[to.y][to.x] = texelFetch(tex0, at, 0);
+#ifdef PASS_PREFILTER
+        tile_surface[to.y][to.x] = vec4(Normal(at), LinearDepth(Depth(at)));
+        tile_variance[to.y][to.x] = texelFetch(tex1, at, 0).x;
+#endif
+    }
+}
+
+struct Moments {
+    vec4 mean;
+    vec4 variance;
+};
+
+Moments LocalNeighborhood(ivec2 center) {
+    Moments m;
+    m.mean = vec4(0.0);
+    m.variance = vec4(0.0);
+    float total = 0.0;
+    for (int j = -NEIGHBORHOOD_RADIUS; j <= NEIGHBORHOOD_RADIUS; ++j) {
+        for (int i = -NEIGHBORHOOD_RADIUS; i <= NEIGHBORHOOD_RADIUS; ++i) {
+            const vec4 radiance = tile[center.y + j][center.x + i];
+            const float weight = NeighborhoodWeight(float(i)) * NeighborhoodWeight(float(j));
+            total += weight;
+            m.mean += radiance * weight;
+            m.variance += radiance * radiance * weight;
+        }
+    }
+    m.mean /= total;
+    m.variance = abs(m.variance / total - m.mean * m.mean);
+    return m;
+}
+
+float Disocclusion(vec3 normal, vec3 history_normal, float linear_depth, float history_depth) {
+    return exp(-abs(1.0 - max(0.0, dot(normal, history_normal))) * DISOCCLUSION_NORMAL_WEIGHT) *
+           exp(-abs(history_depth - linear_depth) / linear_depth * DISOCCLUSION_DEPTH_WEIGHT);
+}
+
+bool Inside(vec2 uv) {
+    return all(greaterThan(uv, vec2(0.0))) && all(lessThan(uv, vec2(1.0)));
+}
+
+#ifdef PASS_REPROJECT
+// tex0: this frame's reflections; tex1: the distance to their hits. sampled8/9/10: the last
+// frame's reflections, statistics (variance, frames, linear depth) and surface (normal,
+// roughness). out12: the reprojected history; out13: variance, frames; out14: tile averages.
+shared vec4 averages[8][8];
+shared float average_weights[8][8];
+
+// Where `clip` (this frame) was in the last frame.
+vec2 LastFrameUv(vec4 clip) {
+    const float w = Dot4(60u, clip);
+    return w > 0.0 ? vec2(Dot4(48u, clip) / w * 0.5 + 0.5, 0.5 - Dot4(52u, clip) / w * 0.5)
+                   : vec2(-1.0);
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    LoadTile(pixel, local);
+    barrier();
+    const ivec2 center = local + 4;
+    const bool inside = pixel.x < int(size.x) && pixel.y < int(size.y);
+
+    vec4 radiance = tile[center.y][center.x];
+    float variance = 1.0;
+    float num_samples = 1.0;
+    vec4 reprojected = vec4(0.0);
+    if (inside && history != 0u) {
+        const float r = Roughness(pixel);
+        const vec3 normal = Normal(pixel);
+        const float depth = Depth(pixel);
+        const float linear_depth = LinearDepth(depth);
+        const vec2 uv = (vec2(pixel) + 0.5) / size;
+        const vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+        const Moments neighborhood = LocalNeighborhood(center);
+
+        // The surface's last position, and the reflection's: its mirror image, as far past the
+        // surface along the view ray as the hit is from it.
+        const vec2 surface_uv = LastFrameUv(clip);
+        vec2 hit_uv = surface_uv;
+        const float ray_length = texelFetch(tex1, pixel, 0).r;
+        if (ray_length > 0.0) {
+            const vec3 pos =
+                vec3(Dot4(0u, clip), Dot4(4u, clip), Dot4(8u, clip)) / Dot4(12u, clip);
+            const vec4 image = vec4(pos + normalize(pos) * ray_length, 1.0);
+            if (image.z > 1e-4) {
+                hit_uv = LastFrameUv(vec4(Dot4(16u, image) / image.z, Dot4(20u, image) / image.z,
+                                          Dot4(24u, image) / image.z, 1.0));
+            }
+        }
+        const vec4 surface_old = textureLod(sampled10, surface_uv, 0.0);
+        const vec4 hit_old = textureLod(sampled10, hit_uv, 0.0);
+        const float hit_similarity = dot(normalize(hit_old.xyz + 1e-6), normal);
+        const float surface_similarity = dot(normalize(surface_old.xyz + 1e-6), normal);
+
+        float disocclusion = 0.0;
+        vec2 reprojection_uv = vec2(-1.0);
+        vec3 history_normal = vec3(0.0);
+        float history_depth = 0.0;
+        bool found = true;
+        if (hit_similarity > REPROJECTION_NORMAL_SIMILARITY_THRESHOLD &&
+            hit_similarity + 1.0e-3 > surface_similarity &&
+            abs(hit_old.w - r) < abs(surface_old.w - r) + 1.0e-3) {
+            history_normal = hit_old.xyz;
+            history_depth = textureLod(sampled9, hit_uv, 0.0).z;
+            reprojection_uv = hit_uv;
+            reprojected = textureLod(sampled8, hit_uv, 0.0);
+        } else {
+            const vec4 surface_history = textureLod(sampled8, surface_uv, 0.0);
+            const vec4 d = surface_history - neighborhood.mean;
+            if (dot(d, d) <
+                REPROJECT_SURFACE_DISCARD_VARIANCE_WEIGHT * length(neighborhood.variance)) {
+                history_normal = surface_old.xyz;
+                history_depth = textureLod(sampled9, surface_uv, 0.0).z;
+                reprojection_uv = surface_uv;
+                reprojected = surface_history;
+            } else {
+                found = false;
+            }
+        }
+        if (found) {
+            disocclusion = Disocclusion(normal, history_normal, linear_depth, history_depth);
+            if (disocclusion < DISOCCLUSION_THRESHOLD) {
+                // The closest match around it.
+                const vec2 dudv = 1.0 / size;
+                const vec2 start = reprojection_uv;
+                for (int y = -1; y <= 1; ++y) {
+                    for (int x = -1; x <= 1; ++x) {
+                        const vec2 at = start + vec2(x, y) * dudv;
+                        const float weight =
+                            Disocclusion(normal, textureLod(sampled10, at, 0.0).xyz,
+                                         linear_depth, textureLod(sampled9, at, 0.0).z);
+                        if (weight > disocclusion) {
+                            disocclusion = weight;
+                            reprojection_uv = at;
+                        }
+                    }
+                }
+                reprojected = textureLod(sampled8, reprojection_uv, 0.0);
+            }
+            disocclusion = disocclusion < DISOCCLUSION_THRESHOLD ? 0.0 : disocclusion;
+        }
+        if (Inside(reprojection_uv) && disocclusion > 0.0) {
+            const vec4 old = textureLod(sampled9, reprojection_uv, 0.0);
+            num_samples = old.y * disocclusion;
+            const float max_samples = max(8.0, MAX_SAMPLES * SamplesForRoughness(r));
+            num_samples = min(max_samples, num_samples + 1.0);
+            const float new_variance = TemporalVariance(radiance.rgb, reprojected.rgb);
+            variance = mix(new_variance, old.x, 1.0 / num_samples);
+            radiance = mix(radiance, reprojected, 0.3);
+        } else {
+            reprojected = vec4(0.0);
+            num_samples = 1.0;
+            variance = 1.0;
+        }
+    }
+    if (inside) {
+        imageStore(out12, pixel, reprojected);
+        imageStore(out13, pixel, vec4(variance, num_samples, 0.0, 0.0));
+    }
+
+    // The tile's average, weighted towards its darker reflections.
+    float weight = max(exp(-Luminance(radiance.rgb) * AVG_RADIANCE_LUMINANCE_WEIGHT), 1.0e-2);
+    radiance *= weight;
+    if (!inside || any(isinf(radiance)) || any(isnan(radiance)) || weight > 1.0e3) {
+        radiance = vec4(0.0);
+        weight = 0.0;
+    }
+    averages[local.y][local.x] = radiance;
+    average_weights[local.y][local.x] = weight;
+    barrier();
+    for (int step = 2; step <= 8; step *= 2) {
+        const int ox = local.x * step, oy = local.y * step;
+        const int ix = ox + step / 2, iy = oy + step / 2;
+        if (ix < 8 && iy < 8) {
+            averages[oy][ox] = averages[oy][ox] + averages[oy][ix] + averages[iy][ox] +
+                               averages[iy][ix];
+            average_weights[oy][ox] = average_weights[oy][ox] + average_weights[oy][ix] +
+                                      average_weights[iy][ox] + average_weights[iy][ix];
+        }
+        barrier();
+    }
+    if (local == ivec2(0)) {
+        imageStore(out14, pixel / 8, averages[0][0] / max(average_weights[0][0], 1.0e-3));
+    }
+}
+#endif
+
+#ifdef PASS_PREFILTER
+// tex0: this frame's reflections; tex1: variance; sampled8: the tile averages. out12: the
+// filtered reflections; out13: their variance.
+float RadianceWeight(vec4 center, vec4 neighbor, float variance) {
+    return max(exp(-(RADIANCE_WEIGHT_BIAS + variance * RADIANCE_WEIGHT_VARIANCE_K) *
+                   length(center - neighbor)),
+               1.0e-2);
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    LoadTile(pixel, local);
+    barrier();
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const ivec2 center = local + 4;
+    const vec4 radiance = tile[center.y][center.x];
+    const float variance = tile_variance[center.y][center.x];
+    const vec4 surface = tile_surface[center.y][center.x];
+    vec4 resolved = radiance;
+    float resolved_variance = variance;
+    if (variance > 0.0 && Roughness(pixel) >= 0.0001) {
+        const vec2 uv8 = (vec2(pixel) + 0.5) / vec2((ivec2(size) + 7) / 8 * 8);
+        const vec4 avg = textureLod(sampled8, uv8, 0.0);
+        float total = RadianceWeight(avg, radiance, variance);
+        vec4 sum = radiance * total;
+        float variance_sum = variance * total * total;
+        // The first 15 of Halton(2, 3) over [-3, 3], without the centre.
+        const ivec2 offsets[15] = ivec2[](ivec2(0, 1), ivec2(-2, 1), ivec2(2, -3), ivec2(-3, 0),
+                                          ivec2(1, 2), ivec2(-1, -2), ivec2(3, 0), ivec2(-3, 3),
+                                          ivec2(0, -3), ivec2(-1, -1), ivec2(2, 1), ivec2(-2, -2),
+                                          ivec2(1, 0), ivec2(0, 2), ivec2(3, -1));
+        const float variance_weight =
+            max(PREFILTER_VARIANCE_BIAS, 1.0 - exp(-(variance * PREFILTER_VARIANCE_WEIGHT)));
+        for (int i = 0; i < 15; ++i) {
+            const ivec2 at = center + offsets[i];
+            const vec4 neighbor = tile[at.y][at.x];
+            const vec4 neighbor_surface = tile_surface[at.y][at.x];
+            float weight =
+                pow(max(dot(surface.xyz, neighbor_surface.xyz), 0.0), PREFILTER_NORMAL_SIGMA);
+            weight *= exp(-abs(surface.w - neighbor_surface.w) * surface.w * PREFILTER_DEPTH_SIGMA);
+            weight *= RadianceWeight(avg, neighbor, variance);
+            weight *= variance_weight;
+            total += weight;
+            sum += weight * neighbor;
+            variance_sum += weight * weight * tile_variance[at.y][at.x];
+        }
+        resolved = sum / total;
+        resolved_variance = variance_sum / (total * total);
+    }
+    imageStore(out12, pixel, resolved);
+    imageStore(out13, pixel, vec4(resolved_variance));
+}
+#endif
+
+#ifdef PASS_RESOLVE
+// tex0: the filtered reflections; tex1: their variance; tex5: variance, frames (REPROJECT);
+// tex6: the reprojected history; sampled8: the tile averages. out12: the result (the history);
+// out13: its statistics (variance, frames, linear depth); out14: the surface (normal,
+// roughness); out15: the game's target too (WITH_TARGET).
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 local = ivec2(gl_LocalInvocationID.xy);
+    LoadTile(pixel, local);
+    barrier();
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const ivec2 center = local + 4;
+    vec4 signal = tile[center.y][center.x];
+    float variance = texelFetch(tex1, pixel, 0).x;
+    const float r = Roughness(pixel);
+    const float num_samples = texelFetch(tex5, pixel, 0).y;
+    if (history != 0u) {
+        const vec2 uv8 = (vec2(pixel) + 0.5) / vec2((ivec2(size) + 7) / 8 * 8);
+        const vec4 avg = textureLod(sampled8, uv8, 0.0);
+        const vec4 old = texelFetch(tex6, pixel, 0);
+        Moments neighborhood = LocalNeighborhood(center);
+        // The history clipped to this frame's spread around the pixel.
+        const vec4 spread = (sqrt(neighborhood.variance) + length(neighborhood.mean - avg)) *
+                            TEMPORAL_STABILITY * 1.4;
+        neighborhood.mean = mix(neighborhood.mean, avg, 0.2);
+        const vec4 clipped = ClipAABB(neighborhood.mean - spread, neighborhood.mean + spread, old);
+        const float weight = 1.0 - 1.0 / max(num_samples, 1.0);
+        // Towards the tile's average while there are few frames, and without outliers.
+        signal = mix(signal, avg, 1.0 / max(num_samples + 1.0, 1.0));
+        signal = ClipAABB(avg - spread, avg + spread, signal);
+        signal = mix(signal, clipped, weight);
+        variance = mix(TemporalVariance(signal.rgb, clipped.rgb), variance, weight);
+        if (any(isinf(signal)) || any(isnan(signal)) || isinf(variance) || isnan(variance)) {
+            signal = vec4(0.0);
+            variance = 0.0;
+        }
+    }
+    imageStore(out12, pixel, signal);
+    imageStore(out13, pixel, vec4(variance, num_samples, LinearDepth(Depth(pixel)), 0.0));
+    imageStore(out14, pixel, vec4(Normal(pixel), r));
+#ifdef WITH_TARGET
+    imageStore(out15, pixel, signal);
+#endif
+}
+#endif

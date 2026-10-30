@@ -1,0 +1,227 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Better screen-space reflections: the game's reflection pass (vk_bb_ssr.h) redone with the
+// game's own inputs and constants, traced through a depth pyramid (bb_ssr_hiz.comp): one ray
+// from each pixel's centre, then denoised over neighbours and frames (bb_ssr_denoise.comp). A
+// ray's result is the game's: the previous frame's colour where it hit, reprojected, times the
+// game's fade, and the fade in alpha (the game blurs it into its mips and blends it by roughness
+// itself). Rays the game drops (facing the camera, past its distance) stay dropped; hits near
+// the screen's edges fade out.
+// FULL_RES: traced at the scene's full size instead (its depth and normals), reading the colour
+// from a full-size copy of the last frame with its mips, blurred by the surface's gloss as the
+// game's lighting would (its mip level from gloss) but less where the ray was short, so
+// reflections sharpen towards where they touch what they reflect.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D pyramid_tex;             // nearest depth, by level
+layout(binding = 1, rgba16f) uniform writeonly image2D out_img; // this frame's reflections
+layout(binding = 2) uniform texture2D normal_tex;              // the G-buffer's world normals
+layout(binding = 3) uniform sampler2D color_tex;               // the previous frame's colour
+layout(binding = 4, std430) readonly buffer GameConstants {
+    uint data[];
+};
+layout(binding = 5, r32f) uniform writeonly image2D distance_img; // to the hits, for the history
+#ifdef FULL_RES
+layout(binding = 6) uniform texture2D gloss_tex; // the G-buffer's gloss (red)
+#endif
+
+layout(push_constant) uniform Constants {
+    vec2 size;         // pixels traced (the game's depth)
+    vec2 normal_scale; // normal texels per pixel
+    uint offset;       // of the game's constants in `data`, in dwords
+    int max_level;
+    int max_steps;
+    float edge_fade; // part of the screen at each edge over which hits fade out
+    float cone;      // FULL_RES: blur, in pixels per pixel of ray length
+    float max_lod;   // FULL_RES: the colour's last mip level
+};
+
+// The game's constants (its reflection pixel shader, 6c2323c2):
+// 0..15 clip to view; 16..27 view to clip (rows x, y, depth; w is view z); 32..42 world to view
+// normals; 48..63 this frame's clip to the last frame's; 64 the lowest reflected direction z
+// kept; 68, 69 view z from depth; 72 its steps across the screen; 76, 77 thickness (depth, and
+// per step); 78 the farthest view z; 79 its step scale.
+float C(uint k) {
+    return uintBitsToFloat(data[offset + k]);
+}
+
+vec4 Row(uint k, vec4 v) {
+    return vec4(C(k), C(k + 1u), C(k + 2u), C(k + 3u)) * v;
+}
+
+float Dot4(uint k, vec4 v) {
+    const vec4 r = Row(k, v);
+    return r.x + r.y + r.z + r.w;
+}
+
+const float FAR = 3.0e38;
+
+// The view position (+z away from the camera) at `uv` and `depth`, as the game makes it.
+vec3 ViewPos(vec2 uv, float depth) {
+    const vec4 clip = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    return vec3(Dot4(0u, clip), Dot4(4u, clip), Dot4(8u, clip)) / Dot4(12u, clip);
+}
+
+// The reflected colour at `prev_uv` (last frame) of a ray `ray_px` pixels long.
+vec3 ReflectedColor(vec2 prev_uv, float ray_px, float gloss) {
+#ifdef FULL_RES
+    // The game's lighting reads the reflections at mip min(6, 6.5 - 6.5 gloss) of a half-size
+    // image: about that many full-size pixels of blur, capped by the ray's cone.
+    const float game_lod = clamp(6.5 - 6.5 * gloss, 0.0, 6.0);
+    const float footprint = max(1.0, min(exp2(game_lod + 1.0) - 1.0, ray_px * cone));
+    const float lod = clamp(log2(max(footprint, 1.0)), 0.0, max_lod);
+    if (lod < 1.0) {
+        return textureLod(color_tex, prev_uv, lod).rgb;
+    }
+    // Four taps a level finer, spread over the footprint: smoother than one tap of a coarse
+    // level (blocky when stretched over the screen).
+    const vec2 axis = vec2(0.5 * footprint) * 0.70710678 / size;
+    const vec2 side = vec2(-axis.y, axis.x);
+    return 0.25 * (textureLod(color_tex, prev_uv + axis, lod - 1.0).rgb +
+                   textureLod(color_tex, prev_uv - axis, lod - 1.0).rgb +
+                   textureLod(color_tex, prev_uv + side, lod - 1.0).rgb +
+                   textureLod(color_tex, prev_uv - side, lod - 1.0).rgb);
+#else
+    return textureLod(color_tex, prev_uv, 0.0).rgb;
+#endif
+}
+
+// One ray from `uv`, at the depth of its texel; rgb: its colour times its fade, a: the fade.
+// `hit_distance`: from the surface to what the ray hit (view units; 0 where it hit nothing).
+vec4 Trace(vec2 uv, float depth, float gloss, out float hit_distance) {
+    hit_distance = 0.0;
+    // The view position and the reflected direction, as the game makes them.
+    const vec3 pos = ViewPos(uv, depth);
+    const vec3 view_dir = normalize(pos);
+    const vec3 world = texelFetch(normal_tex, ivec2(uv * size * normal_scale), 0).xyz;
+    const vec3 wn = world * 2.0 - 1.0;
+    if (dot(wn, wn) < 1e-6) {
+        return vec4(0.0);
+    }
+    const vec3 n = normalize(wn);
+    const vec3 normal = vec3(dot(vec3(C(32u), C(33u), C(34u)), n),
+                             dot(vec3(C(36u), C(37u), C(38u)), n),
+                             dot(vec3(C(40u), C(41u), C(42u)), n));
+    const vec3 r = normalize(view_dir - 2.0 * dot(normal, view_dir) * normal);
+    const vec3 end = pos + r;
+    if (r.z < C(64u) || end.z <= 1e-4) {
+        return vec4(0.0);
+    }
+
+    // The ray in (pixel, depth) space, where it is a straight line.
+    const vec4 end1 = vec4(end, 1.0);
+    const vec3 end_clip = vec3(Dot4(16u, end1), Dot4(20u, end1), Dot4(24u, end1)) / end.z;
+    const vec2 end_uv = vec2(end_clip.x * 0.5 + 0.5, 0.5 - end_clip.y * 0.5);
+    const vec3 origin = vec3(uv * size, depth);
+    const vec3 dir = vec3((end_uv - uv) * size, end_clip.z - depth);
+    const vec3 inv_dir = vec3(dir.x != 0.0 ? 1.0 / dir.x : FAR, dir.y != 0.0 ? 1.0 / dir.y : FAR,
+                              dir.z != 0.0 ? 1.0 / dir.z : FAR);
+    // The game's thickness: how far behind the depth a ray still hits it (in depth, at least
+    // its constant, or what the ray moves in depth over one of the game's steps).
+    const float uv_length = length(dir.xy / size);
+    const float game_step = uv_length > 0.0 ? dir.z / (uv_length * C(72u)) * (1.0 + C(79u)) : 0.0;
+    const float thickness = max(C(76u), C(77u) * game_step);
+
+    // Hierarchical traversal (after AMD FidelityFX SSSR): at each cell, the ray goes to the
+    // cell's far side if it stays in front of the cell's nearest depth (and up a level), else
+    // to where it meets that depth (and down a level), until it meets the depth at level 0.
+    const vec2 floor_offset = vec2(dir.x < 0.0 ? 0.0 : 1.0, dir.y < 0.0 ? 0.0 : 1.0);
+    const vec2 cross_offset = vec2(dir.x < 0.0 ? -0.005 : 0.005, dir.y < 0.0 ? -0.005 : 0.005);
+    // Out of the pixel it starts in first (it would meet its own depth).
+    vec2 t_xy = (floor(origin.xy) + floor_offset + cross_offset - origin.xy) * inv_dir.xy;
+    float t = min(t_xy.x, t_xy.y);
+    vec3 p = origin + t * dir;
+    int level = 0;
+    bool hit = false;
+    for (int i = 0; i < max_steps; ++i) {
+        if (any(lessThan(p.xy, vec2(0.0))) || any(greaterThanEqual(p.xy, size)) || p.z >= 1.0) {
+            break;
+        }
+        const float cell = exp2(float(level));
+        const vec2 cell_pos = floor(p.xy / cell);
+        const float surface = texelFetch(pyramid_tex, ivec2(cell_pos), level).r;
+        const vec2 planes = (cell_pos + floor_offset) * cell + cross_offset;
+        t_xy = (planes - origin.xy) * inv_dir.xy;
+        const float t_side = min(t_xy.x, t_xy.y);
+        const float t_surface = dir.z > 0.0 ? (surface - origin.z) * inv_dir.z : FAR;
+        if (surface > p.z) {
+            // In front of the cell's nearest depth.
+            if (t_surface < t_side) {
+                t = max(t, t_surface);
+                p = origin + t * dir;
+                if (level == 0) {
+                    hit = true;
+                    break;
+                }
+                --level;
+            } else {
+                t = t_side;
+                p = origin + t * dir;
+                level = min(level + 1, max_level);
+            }
+        } else if (level > 0) {
+            --level;
+        } else if (p.z - surface < thickness) {
+            hit = true;
+            break;
+        } else {
+            // Behind something thinner than the ray is far from it: on past this texel.
+            t = t_side;
+            p = origin + t * dir;
+        }
+    }
+    if (!hit) {
+        return vec4(0.0);
+    }
+    const vec2 hit_uv = p.xy / size;
+    const float hit_depth = texelFetch(pyramid_tex, ivec2(p.xy), 0).r;
+    // The game's distance limit, on the view z of the hit.
+    if (hit_depth >= 1.0 || C(78u) < -C(69u) / (C(68u) - hit_depth)) {
+        return vec4(0.0);
+    }
+    // Where the hit was in the last frame, whose colour is read.
+    const vec4 hit_clip = vec4(hit_uv.x * 2.0 - 1.0, 1.0 - hit_uv.y * 2.0, hit_depth, 1.0);
+    const float w = Dot4(60u, hit_clip);
+    const vec2 prev_uv =
+        vec2(Dot4(48u, hit_clip) / w * 0.5 + 0.5, 0.5 - Dot4(52u, hit_clip) / w * 0.5);
+    const vec3 color = ReflectedColor(prev_uv, length(p.xy - origin.xy), gloss);
+    if (any(isnan(color)) || any(isinf(color))) {
+        return vec4(0.0);
+    }
+    // The game's fade: rays close to its lowest direction, and pixels far from the centre.
+    const float angle = clamp(r.z - C(64u), 0.0, 1.0);
+    const float edge = clamp(length(uv - 0.5) * 2.0, 0.0, 1.0);
+    float fade = min(1.0, min(angle * angle, 1.0 - edge * edge));
+    // Hits near the screen's edges (and where the last frame did not see them).
+    const vec2 border = smoothstep(vec2(0.0), vec2(edge_fade), hit_uv) *
+                        (1.0 - smoothstep(vec2(1.0 - edge_fade), vec2(1.0), hit_uv)) *
+                        smoothstep(vec2(0.0), vec2(edge_fade), prev_uv) *
+                        (1.0 - smoothstep(vec2(1.0 - edge_fade), vec2(1.0), prev_uv));
+    fade *= border.x * border.y;
+    hit_distance = length(ViewPos(hit_uv, hit_depth) - pos);
+    return vec4(color * fade, fade);
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const float depth = texelFetch(pyramid_tex, pixel, 0).r;
+#ifdef FULL_RES
+    const float gloss = texelFetch(gloss_tex, pixel, 0).r;
+#else
+    const float gloss = 1.0;
+#endif
+    if (depth >= 1.0) {
+        imageStore(out_img, pixel, vec4(0.0));
+        imageStore(distance_img, pixel, vec4(0.0));
+        return;
+    }
+    float hit_distance;
+    imageStore(out_img, pixel, Trace((vec2(pixel) + 0.5) / size, depth, gloss, hit_distance));
+    imageStore(distance_img, pixel, vec4(hit_distance));
+}

@@ -73,7 +73,22 @@ Status as of 29 Oct 2026. Test setup as in `bb-dlc-judder-investigation.md` (RTX
   shader, geometry, constants), then a log that follows that box and starts a RenderDoc capture
   by itself when its count drops sharply (the flash frame), with the box's draw state that frame
   and the frame before.
-- Settings now: Real occlusion tests, Quick occlusion answers, Visible until answered, Submit
-  occlusion tests at once, Wait for occlusion answers, Occlusion counts at the game's resolution,
-  Occlusion tests tolerant of a pixel, and the debug option. Later: one "Real occlusion" toggle
-  with the parts that are needed always on, the rest removed.
+- Already tried, did not fix the flash, and removed (code in commit 47f61bf; do not try these
+  again as fixes):
+  - Quick occlusion answers (a thread writing each answer as soon as the GPU has it): answers
+    reached the game in the same frame 93% of the time, still flashed.
+  - Visible until answered (a test reads "visible" until its answer arrives): still flashed.
+  - Submit occlusion tests at once (tests sent to the GPU right after the game makes them):
+    answers back sooner, still flashed.
+  - Wait for occlusion answers (results held from the game until answered, up to 6 ms): still
+    flashed, and it ruined frame pacing with Uncap FPS++: answers take ~8 ms, so the game's
+    render thread lost the full 6 ms in some frames (game frames alternating ~10/14 ms, 80 fps
+    feeling like 40-50).
+  - Occlusion counts at the game's resolution (counts scaled from the render size): still
+    flashed.
+  - Occlusion tests tolerant of a pixel (tests against a dilated depth copy): removed the
+    one-pixel-gap zeros, still flashed.
+  - The debug option "tell the game every test is visible" (removed earlier): confirmed the
+    cause is a "hidden" answer.
+- Settings now: Real occlusion tests and Occlusion results in order only. The logs still count
+  one-frame hidden blips and how late answers reach the game (the starting point next time).

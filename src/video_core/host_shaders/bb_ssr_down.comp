@@ -1,0 +1,32 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Halves an image for the better reflections (vk_bb_ssr.h): the average of the 2x2 texels of
+// `src_level` under each texel written (the mips of the last frame's colour, and the full-size
+// reflections brought down into the game's half-size target).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D src_tex;
+layout(binding = 1, rgba16f) uniform writeonly image2D dst_img;
+
+layout(push_constant) uniform Constants {
+    ivec2 size;     // written
+    ivec2 src_size; // of src_level
+    int src_level;
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+    const ivec2 src = pixel * 2;
+    const ivec2 last = src_size - 1;
+    const vec4 sum = texelFetch(src_tex, min(src, last), src_level) +
+                     texelFetch(src_tex, min(src + ivec2(1, 0), last), src_level) +
+                     texelFetch(src_tex, min(src + ivec2(0, 1), last), src_level) +
+                     texelFetch(src_tex, min(src + ivec2(1, 1), last), src_level);
+    imageStore(dst_img, pixel, sum * 0.25);
+}

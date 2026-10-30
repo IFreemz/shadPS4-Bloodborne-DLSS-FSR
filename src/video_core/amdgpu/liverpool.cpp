@@ -1319,19 +1319,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
-                if (rasterizer &&
-                    wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
-                    // The game waits for an occlusion test's start counters to land: known
-                    // here, as the PS4's GPU has them a moment after the test starts (reading
-                    // the results here let them go to the game before their answers).
-                    if (const auto word = rasterizer->OcclusionKnownWord(
-                            wait_reg_mem->Address<VAddr>(),
-                            static_cast<u32>(wait_reg_mem->function.Value()), wait_reg_mem->ref,
-                            wait_reg_mem->mask);
-                        word && wait_reg_mem->TestValue(*word)) {
-                        break;
-                    }
-                }
                 if (rasterizer && !wait_reg_mem->Test(regs.reg_array)) {
                     if (MetByPendingFence(*wait_reg_mem)) {
                         break;

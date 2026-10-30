@@ -12,6 +12,7 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/bb_frame_rate.h"
 #include "core/bb_game_fixes.h"
 #include "core/bb_mouse_camera.h"
 #include "core/bb_resolution.h"
@@ -152,6 +153,7 @@ static void CheckForResolution(const std::string& name, const std::string& addre
         return;
     }
     Core::BbResolution::CheckPatch(name, is_offset ? address + 0x400000 : address, bytes);
+    Core::BbFrameRate::CheckPatch(name, is_offset ? address + 0x400000 : address, bytes.size());
 }
 
 static void CheckXmlForResolution(pugi::xml_node patchXML, std::string_view app_version) {
@@ -273,6 +275,8 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
 void OnGameLoaded() {
     // F1's resolution: decided first, so the patch file's resolution patches can be skipped.
     Core::BbResolution::Prepare();
+    // The frame rate hooks: decided first too, so the patch file's frame rate patches are skipped.
+    Core::BbFrameRate::Prepare();
     std::filesystem::path patch_dir = Common::FS::GetUserPath(Common::FS::PathType::PatchesDir);
     if (!patch_file.empty()) {
 
@@ -327,6 +331,7 @@ void OnGameLoaded() {
     ApplyPendingPatches();
     Core::BbResolution::Install();
     Core::BbGameFixes::Install();
+    Core::BbFrameRate::Install();
     // Keyboard and mouse controls: the mouse turns Bloodborne's camera directly.
     if (Input::BbKbm::Active())
         Core::BbMouseCamera::Install();
@@ -373,6 +378,13 @@ void PatchMemory(const patchInfo& patch) {
         static bool logged = false;
         if (!std::exchange(logged, true))
             LOG_INFO(Loader, "Skipped patch {}: it breaks the upscalers", patch.modNameStr);
+        return;
+    }
+    if (Core::BbFrameRate::ShouldSkipPatch(patch.modNameStr)) {
+        static std::string skipped;
+        if (std::exchange(skipped, patch.modNameStr) != patch.modNameStr)
+            LOG_INFO(Loader, "Frame rate: skipped patch {} (the frame rate hooks are on)",
+                     patch.modNameStr);
         return;
     }
     if (Core::BbResolution::ShouldSkipPatch(patch.modNameStr)) {

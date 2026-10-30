@@ -1230,8 +1230,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_bb_object_motion.h
                src/video_core/renderer_vulkan/vk_bb_velocity_mirror.cpp
                src/video_core/renderer_vulkan/vk_bb_velocity_mirror.h
-               src/video_core/renderer_vulkan/vk_bb_occlusion_depth.cpp
-               src/video_core/renderer_vulkan/vk_bb_occlusion_depth.h
+               src/video_core/renderer_vulkan/vk_bb_ssr.cpp
+               src/video_core/renderer_vulkan/vk_bb_ssr.h
                src/video_core/renderer_vulkan/vk_bb_vbao.cpp
                src/video_core/renderer_vulkan/vk_bb_vbao.h
                src/video_core/renderer_vulkan/vk_dlss_ngx.cpp
@@ -1357,6 +1357,8 @@ set(INPUT src/input/controller.cpp
           src/input/input_handler.h
           src/core/bb_mouse_camera.cpp
           src/core/bb_mouse_camera.h
+          src/core/bb_frame_rate.cpp
+          src/core/bb_frame_rate.h
           src/core/bb_game_fixes.cpp
           src/core/bb_game_fixes.h
           src/core/bb_resolution.cpp

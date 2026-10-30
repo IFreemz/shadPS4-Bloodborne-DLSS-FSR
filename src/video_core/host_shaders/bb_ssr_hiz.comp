@@ -1,0 +1,41 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+// The depth pyramid the better reflections trace through (bb_ssr_trace.comp): level 0 is the
+// game's reflection depth, padded to a multiple of the coarsest cell with the far plane; each
+// further level keeps the nearest depth of the 2x2 below it, so a ray that passes over a cell
+// passes over everything in it.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D depth_tex;              // the game's depth (level 0 only)
+layout(binding = 1, r32f) uniform writeonly image2D level_img; // the level written
+layout(binding = 2) uniform texture2D pyramid_tex;            // the levels below it
+
+layout(push_constant) uniform Constants {
+    ivec2 size;       // of the level written
+    ivec2 depth_size; // of the game's depth
+    int level;
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) {
+        return;
+    }
+    float depth = 1.0;
+    if (level == 0) {
+        if (pixel.x < depth_size.x && pixel.y < depth_size.y) {
+            depth = texelFetch(depth_tex, pixel, 0).r;
+        }
+    } else {
+        const ivec2 src = pixel * 2;
+        const int below = level - 1;
+        depth = min(min(texelFetch(pyramid_tex, src, below).r,
+                        texelFetch(pyramid_tex, src + ivec2(1, 0), below).r),
+                    min(texelFetch(pyramid_tex, src + ivec2(0, 1), below).r,
+                        texelFetch(pyramid_tex, src + ivec2(1, 1), below).r));
+    }
+    imageStore(level_img, pixel, vec4(depth));
+}

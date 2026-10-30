@@ -18,6 +18,7 @@
 
 #include "common/guest_stats.h"
 #include "common/path_util.h"
+#include "core/bb_frame_rate.h"
 #include "core/bb_mouse_camera.h"
 #include "core/bb_resolution.h"
 #include "core/devtools/layer.h"
@@ -145,16 +146,30 @@ bool EnableRecommendedPatches() {
     return bool(file);
 }
 
-// Relaunches the game for a new resolution, after a confirmation: it goes back to the last
-// autosave, like quitting from the system menu.
+// Settings waiting for a restart: their notes, the footer and its button.
+constexpr ImVec4 RestartColor{1.0f, 0.75f, 0.3f, 1.0f};
+
+void RestartHint(bool pending, const char* text) {
+    if (pending)
+        TextColored(RestartColor, "%s", text);
+    else
+        TextDisabled("%s", text);
+}
+
+// Relaunches the game for settings that apply at a start, after a confirmation: it goes back to
+// the last autosave, like quitting from the system menu.
 void RestartButton() {
-    if (Button("Apply and restart the game"))
+    const ImVec2 padding = GetStyle().FramePadding;
+    PushStyleVar(ImGuiStyleVar_FramePadding, {padding.x * 2.0f, padding.y * 2.0f});
+    const bool pressed = Button("Apply and restart the game");
+    PopStyleVar();
+    if (pressed)
         OpenPopup("Restart the game?");
     SetNextWindowPos(GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {0.5f, 0.5f});
     SetNextWindowSize({360.0f, 0.0f});
     if (BeginPopupModal("Restart the game?", nullptr,
                         ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove)) {
-        TextWrapped("The game restarts with the new resolution. You continue from your last "
+        TextWrapped("The game restarts with the new settings. You continue from your last "
                     "autosave.");
         TextWrapped("Don't restart while the save icon is showing.");
         if (Button("Restart"))
@@ -218,6 +233,17 @@ private:
     int capture_slot = 0;
     int capture_frames = 0;
     void DrawKeyBindings();
+    // The settings as the game started with them, for the ones that apply at a start.
+    struct Launch {
+        bool taken{};
+        SettingsFile file;
+        bool frame_hooks{};
+    } launch;
+    bool patches_changed{};
+    // Settings changed that apply at the next start (this frame's, and the last frame's for the
+    // footer's height).
+    std::vector<const char*> restart_needed;
+    bool restart_footer{};
 };
 
 DlssLayer layer;
@@ -303,6 +329,11 @@ void DlssLayer::UpdateMouseLook() {
 }
 
 void DlssLayer::Draw() {
+    if (!launch.taken) {
+        launch.taken = true;
+        launch.file.Load();
+        launch.frame_hooks = EmulatorSettings.IsBbFrameHooks();
+    }
     UpdateMouseLook();
     if (toggle_requested.exchange(false)) {
         if (open)
@@ -328,11 +359,21 @@ void DlssLayer::Draw() {
         return;
     }
     if (!keep_open ||
-        (capture_action < 0 && IsWindowFocused() && IsKeyPressed(ImGuiKey_Escape, false))) {
+        (capture_action < 0 && IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+         IsKeyPressed(ImGuiKey_Escape, false))) {
         End();
         Close();
         return;
     }
+    restart_needed.clear();
+    const auto changed = [&](const char* key, const char* fallback) {
+        return settings.Get(key, fallback) != launch.file.Get(key, fallback);
+    };
+    // The footer with the restart button stays at the bottom; the settings scroll above it.
+    BeginChild("##f1_settings", {0.0f, restart_footer ? -(GetFrameHeightWithSpacing() * 2.0f +
+                                                          GetStyle().FramePadding.y * 2.0f +
+                                                          GetStyle().ItemSpacing.y * 2.0f)
+                                                      : 0.0f});
     const auto status = Vulkan::BbTemporalDlssStatus();
     if (status.active) {
         TextColored({0.4f, 1.0f, 0.4f, 1.0f}, "Active");
@@ -372,6 +413,53 @@ void DlssLayer::Draw() {
                     "parts of the world at random (with or without upscaling). Press F3, go to "
                     "Experimental and set Readbacks Mode to Relaxed, then restart the game.");
         PopStyleColor();
+    }
+
+    SeparatorText("Frame rate");
+    {
+        namespace FrameRate = ::Core::BbFrameRate;
+        bool hooks = EmulatorSettings.IsBbFrameHooks();
+        if (Checkbox("Frame rate hooks", &hooks)) {
+            EmulatorSettings.SetBbFrameHooks(hooks);
+            EmulatorSettings.Save();
+        }
+        if (IsItemHovered())
+            SetTooltip("Unlocks the frame rate by hooks in the game's code instead of the frame "
+                       "rate patches:\nthe game steps by each frame's real time, and cloth, "
+                       "running, the camera and the rest follow it.\nThe frame rate patches "
+                       "(60 FPS++, Uncap FPS++ and the like) are left out while it is on.\n"
+                       "Applies at the next start.");
+        if (hooks != launch.frame_hooks) {
+            SameLine();
+            RestartHint(true, "(restart to apply)");
+            restart_needed.push_back("Frame rate hooks");
+        }
+        static constexpr std::array<int, 8> limits = {0, 30, 60, 90, 120, 144, 165, 240};
+        static constexpr std::array<const char*, 8> labels = {"Uncapped", "30",  "60",  "90",
+                                                              "120",      "144", "165", "240"};
+        const int limit = EmulatorSettings.GetBbFpsLimit();
+        int index = 0;
+        for (int i = 0; i < int(limits.size()); ++i) {
+            if (limits[i] == limit)
+                index = i;
+        }
+        BeginDisabled(!FrameRate::Active());
+        SetNextItemWidth(200.0f);
+        if (BeginCombo("FPS cap", labels[index])) {
+            for (int i = 0; i < int(limits.size()); ++i) {
+                if (Selectable(labels[i], i == index)) {
+                    EmulatorSettings.SetBbFpsLimit(limits[i]);
+                    EmulatorSettings.Save();
+                    FrameRate::SetLimit(limits[i]);
+                }
+            }
+            EndCombo();
+        }
+        EndDisabled();
+        if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            SetTooltip("Changes at once, with the frame rate hooks. The game's own frame pacer "
+                       "waits for it.\nThe vblank frequency is a limit too: set it at least as "
+                       "high.");
     }
 
     SeparatorText("Resolution");
@@ -488,12 +576,13 @@ void DlssLayer::Draw() {
                                 now.render_width == next.render_width &&
                                 now.render_height == next.render_height && now.heap == next.heap &&
                                 now.regular == next.regular;
-            if (in_use)
+            if (in_use) {
                 TextDisabled("(in use)");
-            else if (now.problem.empty())
-                RestartButton();
-            else
-                TextDisabled("(restart the game to apply)");
+            } else {
+                RestartHint(now.problem.empty(), "(restart the game to apply)");
+                if (now.problem.empty())
+                    restart_needed.push_back("Resolution");
+            }
             if (!now.problem.empty())
                 TextDisabled("%s", now.problem.c_str());
             // A scene above 1080p raises the game's graphics heap: it needs extra dmem.
@@ -507,9 +596,8 @@ void DlssLayer::Draw() {
                             fmt::format("{}", fmt::join(Res::SkippedPatches(), ", ")).c_str());
         } else {
             if (now.enabled) {
-                TextDisabled("Restart the game to use the patch file's resolution again.");
-                SameLine();
-                RestartButton();
+                RestartHint(true, "Restart the game to use the patch file's resolution again.");
+                restart_needed.push_back("Resolution");
             }
             TextWrapped("Off: the render resolution comes from the Resolution Patch you enable "
                         "for Bloodborne (shadPS4 patches or BBLauncher), upscaled to your window.");
@@ -556,19 +644,25 @@ void DlssLayer::Draw() {
         if (Checkbox("Restore original moon lighting (restart)", &moon_restore))
             settings.Set("hdr_moon_restore", moon_restore ? "1" : "0");
         EndDisabled();
+        if (changed("hdr_mod_compat", "1"))
+            restart_needed.push_back("Remaster HDR compatibility");
+        if (changed("hdr_moon_restore", "0"))
+            restart_needed.push_back("Moon lighting");
     }
 
     bool frame_gen = settings.Get("frame_gen", "0") != "0";
     if (Checkbox("Frame generation", &frame_gen))
         settings.Set("frame_gen", frame_gen ? "1" : "0");
+    if (frame_gen && !Vulkan::FrameGen::Requested())
+        restart_needed.push_back("Frame generation");
     if (!Vulkan::FrameGen::Active()) {
         const auto problem = Vulkan::FrameGen::Problem();
         if (frame_gen && !problem.empty()) {
             TextDisabled("%s", problem.c_str());
         } else {
             SameLine();
-            TextDisabled(frame_gen ? "(restart the game to turn it on)"
-                                   : "(DLSS on RTX 40/50, FSR on other GPUs)");
+            RestartHint(frame_gen, frame_gen ? "(restart the game to turn it on)"
+                                             : "(DLSS on RTX 40/50, FSR on other GPUs)");
         }
     } else {
         const auto stats = Vulkan::FrameGen::GetStats();
@@ -598,7 +692,9 @@ void DlssLayer::Draw() {
             TextDisabled("RenoDX HDR is loaded: DLSS frame generation does not work with its HDR "
                          "output, FSR is used.");
         SameLine();
-        TextDisabled("(restart to apply)");
+        RestartHint(changed("fg_backend", "auto"), "(restart to apply)");
+        if (changed("fg_backend", "auto"))
+            restart_needed.push_back("Frame gen type");
     }
     if (Vulkan::FrameGen::Active()) {
         // 3x and up only where Streamline offers them (RTX 50 series).
@@ -615,6 +711,33 @@ void DlssLayer::Draw() {
                 TextDisabled("(%dx needs an RTX 50 card)", chosen);
             }
         }
+    }
+
+    // DLSS frame generation's model, set in the NVIDIA driver's profile for shadPS4.exe when the
+    // game starts (as the NVIDIA app's model override does).
+    {
+        static constexpr std::array ModelNames{"Default", "B", "C (faster)"};
+        static constexpr std::array ModelValues{"default", "b", "c"};
+        const auto model = settings.Get("fg_model", "default");
+        int index = 0;
+        for (size_t i = 0; i < ModelValues.size(); ++i)
+            if (model == ModelValues[i])
+                index = int(i);
+        BeginDisabled(std::string_view{Vulkan::FrameGen::BackendName()} == "FSR");
+        SetNextItemWidth(200.0f);
+        if (Combo("DLSS frame gen model", &index, ModelNames.data(), int(ModelNames.size())))
+            settings.Set("fg_model", ModelValues[index]);
+        EndDisabled();
+        if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            SetTooltip("Default: the driver's choice (the NVIDIA app's override, if set).\n"
+                       "B: the standard model. C: a lighter model, faster, a little softer on "
+                       "the UI;\nneeds DLSS frame generation 310.9.16 or newer (nvngx_dlssg.dll), "
+                       "older ones use B.\nWritten to the NVIDIA driver profile for shadPS4.exe "
+                       "when the game starts.");
+        SameLine();
+        RestartHint(changed("fg_model", "default"), "(restart to apply)");
+        if (changed("fg_model", "default"))
+            restart_needed.push_back("DLSS frame gen model");
     }
 
     // NVIDIA Reflex's wait before each frame: less input delay with frame generation, but on
@@ -698,8 +821,10 @@ void DlssLayer::Draw() {
     if (retro_hdr.state == RetroHdr::State::Active)
         TextDisabled(retro_hdr_on ? "(untick to compare with SDR)" : "(showing SDR)");
     else if (retro_hdr.state == RetroHdr::State::Disabled)
-        TextDisabled(retro_hdr_on ? "(restart the game to turn it on)"
-                                  : "(Special K style HDR from the SDR image)");
+        RestartHint(retro_hdr_on, retro_hdr_on ? "(restart the game to turn it on)"
+                                               : "(Special K style HDR from the SDR image)");
+    if (retro_hdr_on && retro_hdr.state == RetroHdr::State::Disabled)
+        restart_needed.push_back("SDR to HDR");
     else
         TextDisabled("(%s)", RetroHdr::Describe(retro_hdr.state).data());
 
@@ -769,6 +894,8 @@ void DlssLayer::Draw() {
         bool auto_rotation = settings.Get("camera_auto_rotation", "0") == "1";
         if (Checkbox("Camera auto-rotation (restart)", &auto_rotation))
             settings.Set("camera_auto_rotation", auto_rotation ? "1" : "0");
+        if (changed("camera_auto_rotation", "0"))
+            restart_needed.push_back("Camera auto-rotation");
         if (IsItemHovered())
             SetTooltip("The game turning the camera by itself as you move. Off with keyboard and "
                        "mouse: it fights\nevery mouse turn.");
@@ -813,14 +940,19 @@ void DlssLayer::Draw() {
             TextWrapped("The game's own anti-aliasing, chromatic aberration and depth of field "
                         "blur the image before the upscaler sees it.");
             if (Button("Apply recommended patches")) {
-                patch_message = EnableRecommendedPatches() ? "Done. Restart the game to apply."
-                                                           : "Could not write the patch file.";
+                patches_changed = EnableRecommendedPatches();
+                patch_message = patches_changed ? "Done. Restart the game to apply."
+                                                : "Could not write the patch file.";
                 patches = ReadPatches();
             }
         }
-        if (!patch_message.empty())
+        if (patches_changed)
+            RestartHint(true, patch_message.c_str());
+        else if (!patch_message.empty())
             TextWrapped("%s", patch_message.c_str());
     }
+    if (patches_changed)
+        restart_needed.push_back("Game patches");
 
     // Applies at once: toggled while watching the game.
     SeparatorText("Ambient occlusion");
@@ -870,6 +1002,36 @@ void DlssLayer::Draw() {
         EndDisabled();
     }
 
+    SeparatorText("Reflections");
+    {
+        static constexpr std::array<const char*, 3> modes = {"Game's", "Better", "Off"};
+        const int mode = std::clamp(EmulatorSettings.GetBbSsrMode(), 0, 2);
+        SetNextItemWidth(200.0f);
+        if (BeginCombo("Screen space reflections", modes[mode])) {
+            for (int i = 0; i < int(modes.size()); ++i) {
+                if (Selectable(modes[i], i == mode)) {
+                    EmulatorSettings.SetBbSsrMode(i);
+                    EmulatorSettings.Save();
+                }
+            }
+            EndCombo();
+        }
+        if (IsItemHovered())
+            SetTooltip("With the game's \"Enable Screen Space Reflections\" patch. Game's: as "
+                       "the game draws them.\nBetter: traced more precisely and denoised, "
+                       "steadier and cheaper. Off: no screen-space reflections at all.");
+        BeginDisabled(mode != 1);
+        bool full_res = EmulatorSettings.IsBbSsrFullRes();
+        if (Checkbox("Full resolution", &full_res)) {
+            EmulatorSettings.SetBbSsrFullRes(full_res);
+            EmulatorSettings.Save();
+        }
+        if (IsItemHovered())
+            SetTooltip("Better reflections at the full render size instead of the game's half "
+                       "size: a little sharper,\nat more GPU time.");
+        EndDisabled();
+    }
+
     // Down here on purpose: hardly anyone wants it back.
     SeparatorText("Game effects");
     bool motion_blur = settings.Get("motion_blur", "0") != "0";
@@ -890,6 +1052,14 @@ void DlssLayer::Draw() {
         Common::GuestStats::texture_reload_requested.store(true, std::memory_order_relaxed);
     SameLine();
     TextDisabled("(press while a texture looks wrong)");
+    EndChild();
+    restart_footer = !restart_needed.empty();
+    if (restart_footer) {
+        Separator();
+        TextColored(RestartColor, "Applies after a restart: %s",
+                    fmt::format("{}", fmt::join(restart_needed, ", ")).c_str());
+        RestartButton();
+    }
     End();
 }
 
