@@ -402,13 +402,14 @@ bool EmulatorSettingsImpl::UpdateBbDefaults(const json& file, bool game_specific
         return false;
     }
     // Saved before these defaults: switch them on once. A game's file only overrides what it holds.
-    const auto switch_on = [&](Setting<bool>& setting) {
+    const auto set = [&]<typename T>(Setting<T>& setting, T value) {
         if (!game_specific) {
-            setting.value = true;
+            setting.value = value;
         } else if (setting.game_specific_value) {
-            setting.game_specific_value = true;
+            setting.game_specific_value = value;
         }
     };
+    const auto switch_on = [&](Setting<bool>& setting) { set(setting, true); };
     if (version < 1) {
         switch_on(m_gpu.bb_buffer_eviction);
         switch_on(m_gpu.bb_background_texture_copies);
@@ -424,15 +425,28 @@ bool EmulatorSettingsImpl::UpdateBbDefaults(const json& file, bool game_specific
         switch_on(m_gpu.bb_skip_left_out_levels);
         switch_on(m_gpu.bb_direct_texture_copies);
     }
+    if (version < 4) {
+        switch_on(m_gpu.bb_copy_thread);
+        switch_on(m_vulkan.bb_cached_texture_staging);
+        switch_on(m_vulkan.bb_lower_detail_first);
+        switch_on(m_vulkan.bb_clear_shader_written);
+        switch_on(m_vulkan.bb_ce_skip_huge_writes);
+        switch_on(m_vulkan.bb_evict_keep_protection);
+        switch_on(m_vulkan.bb_evict_keep_returning);
+        switch_on(m_vulkan.bb_protect_helper_thread);
+        switch_on(m_vulkan.bb_cpu_copy_shader);
+        switch_on(m_vulkan.bb_copy_skip_same);
+        switch_on(m_vulkan.bb_clear_one_layer);
+        set(m_gpu.bb_real_occlusion, false);
+        set(m_vulkan.bb_ssr_mode, 0);
+        switch_on(m_general.redzone_patches);
+        switch_on(m_vulkan.pipeline_cache_enabled);
+    }
     if (game_specific && m_gpu.bb_defaults.game_specific_value) {
         m_gpu.bb_defaults.game_specific_value = BbDefaultsVersion;
     }
     m_gpu.bb_defaults.value = BbDefaultsVersion;
-    LOG_INFO(Config, "Bloodborne settings: {}{}{} switched on (new defaults, {} config)",
-             version < 1 ? "idle buffer freeing, background texture copies, " : "",
-             version < 2 ? "real occlusion tests, " : "",
-             "more VRAM, overlapped frames, early write-back, rendering while presenting, kept "
-             "texture levels only and direct texture copies",
+    LOG_INFO(Config, "Bloodborne settings: new defaults from version {} ({} config)", version,
              game_specific ? "game" : "global");
     return true;
 }
@@ -558,9 +572,9 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 ApplyGroupOverrides(m_audio, gj.at("Audio"), changed);
             if (gj.contains("GPU"))
                 ApplyGroupOverrides(m_gpu, gj.at("GPU"), changed);
-            UpdateBbDefaults(gj, true);
             if (gj.contains("Vulkan"))
                 ApplyGroupOverrides(m_vulkan, gj.at("Vulkan"), changed);
+            UpdateBbDefaults(gj, true);
 
             // Backwards compat for red-zone setting
             if (gj.contains("WindowsGuestRedZoneProtection") &&

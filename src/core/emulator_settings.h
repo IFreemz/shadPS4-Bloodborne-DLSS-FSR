@@ -198,7 +198,7 @@ struct GeneralSettings {
     Setting<int> console_language{1};
     Setting<int> big_picture_scale{1000};
     Setting<int> big_picture_folder_depth{2};
-    Setting<bool> redzone_patches{false};
+    Setting<bool> redzone_patches{true};
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -412,8 +412,11 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
 // (each saved config holds every value, so a new default never reached them). 1: "Also free idle
 // buffers" and "Background texture copies". 2: "Real occlusion tests". 3: "Use more VRAM",
 // "Overlap game and GPU frames", "Early GPU data write-back", "Keep rendering while presenting",
-// "Copy only kept texture levels" and "Direct texture copies".
-constexpr int BbDefaultsVersion = 3;
+// "Copy only kept texture levels" and "Direct texture copies". 4: the threaded renderer's settings
+// that F3 lists only as advanced on, "Real occlusion tests" off (white flicker), the
+// screen-space reflections back to the game's (hidden from F1 for now), "Windows Guest Red Zone
+// Protection" on (crashes without it) and "Enable Shader Cache" on.
+constexpr int BbDefaultsVersion = 4;
 
 struct GPUSettings {
     Setting<u32> window_width{1280};
@@ -545,10 +548,10 @@ struct GPUSettings {
     Setting<bool> bb_hardware_interpolation{true};
     // Threaded renderer: the game's occlusion tests (one box per area behind walls) counted by
     // the GPU, so the game skips areas that are hidden. Off: every test reads "visible".
-    Setting<bool> bb_real_occlusion{true};
+    Setting<bool> bb_real_occlusion{false};
     // Threaded renderer: stage A's copies of game memory (constants, small vertex and index
     // data) made on a thread of their own; applies after a restart. Off: made by stage A.
-    Setting<bool> bb_copy_thread{false};
+    Setting<bool> bb_copy_thread{true};
     // Threaded renderer: while a frame is presented (a frame limiter such as RTSS may sleep in
     // the present), the GPU threads' submissions queue up and go to the GPU right after it
     // returns, instead of the threads waiting for the queue. Off: they wait for the present.
@@ -684,7 +687,7 @@ struct VulkanSettings {
     Setting<bool> vkcrash_diagnostic_enabled{false};
     Setting<bool> vkhost_markers{false};
     Setting<bool> vkguest_markers{false};
-    Setting<bool> pipeline_cache_enabled{false};
+    Setting<bool> pipeline_cache_enabled{true};
     Setting<bool> pipeline_cache_archived{false};
     // Bloodborne threaded renderer (here: GPUSettings' JSON field list is at its 64 limit).
     // Copy threads for texture and buffer data (0 = auto: half the logical cores, 2 to 8;
@@ -695,48 +698,48 @@ struct VulkanSettings {
     Setting<int> bb_rdoc_capture_frames{1};
     // Texture uploads staged in cached system memory instead of write-combined (uncached)
     // memory: faster for the CPU's copy, possibly slower for the GPU's read. Off: uncached.
-    Setting<bool> bb_cached_texture_staging{false};
+    Setting<bool> bb_cached_texture_staging{true};
     // Lower detail first: in a burst of new textures (a traversal load) their largest level
     // waits and arrives over the next frames within a per-frame budget; meanwhile shaders
     // sample the next level down (softer for a few frames). Needs VK_EXT_image_view_min_lod.
-    Setting<bool> bb_lower_detail_first{false};
+    Setting<bool> bb_lower_detail_first{true};
     // Clear new shader-written images: a new image a compute shader only writes, bound whole
     // with a thread for every texel, is cleared on the GPU instead of uploaded from guest memory
     // first (the shader overwrites it). Traversal bursts uploaded 180-410 MiB of them.
-    Setting<bool> bb_clear_shader_written{false};
+    Setting<bool> bb_clear_shader_written{true};
     // Constant dumps past huge shader writes: a queued shader's storage write declared over
     // 256 MiB (a descriptor over all of memory, ~3.7 GiB in Bloodborne) does not hold up a
     // constant dump to memory inside it; the dump is written at once, as with nothing queued
     // (the command thread waited 20-40 ms for the draw recorder in traversal bursts).
-    Setting<bool> bb_ce_skip_huge_writes{false};
+    Setting<bool> bb_ce_skip_huge_writes{true};
     // Cheaper buffer refill (buffer eviction): evicted buffers keep their page protection and
     // are uploaded straight from guest memory when made resident again, instead of being marked
     // changed (unprotected) at eviction and protected again, page run by page run, at their next
     // use (~12-15 ms per traversal burst).
-    Setting<bool> bb_evict_keep_protection{false};
+    Setting<bool> bb_evict_keep_protection{true};
     // Keep returning buffers (buffer eviction): a loading screen evicts only what VRAM needs
     // (down to 1 GiB below the pressure limit) instead of every buffer idle for 2 s (~700 MiB
     // per respawn, ~170 MiB of it uploaded again in the next area's first frames), and buffers
     // that came back after an eviction are evicted last.
-    Setting<bool> bb_evict_keep_returning{false};
+    Setting<bool> bb_evict_keep_returning{true};
     // Protection on a helper thread: a new texture's memory protection (noticing the game's
     // writes) is done by one helper thread instead of the draw recorder (~6-9 ms of a traversal
     // burst); the texture's background copies wait for it. Needs background texture copies.
-    Setting<bool> bb_protect_helper_thread{false};
+    Setting<bool> bb_protect_helper_thread{true};
     // Copy shader on the CPU: the game's GPU copy shader (thousands of small copies a second)
     // is done in game memory when neither side holds data only the GPU has. Its destination
     // was marked GPU-written, and the game's next write near it waited for the GPU to finish
     // (3-16 ms each, the slow in-play frames when running into new parts of an area).
-    Setting<bool> bb_cpu_copy_shader{false};
+    Setting<bool> bb_cpu_copy_shader{true};
     // With "Copy shader on the CPU": a copy whose destination already holds the source's bytes is
     // left out. Writing them again still marked the memory changed, so the buffers over it were
     // uploaded again.
-    Setting<bool> bb_copy_skip_same{false};
+    Setting<bool> bb_copy_skip_same{true};
     // Clear one face of a cube or one layer of an array: the game clears its point lights'
     // shadow cube a face at a time with a compute shader. Only whole images were cleared as
     // images; a face was left to the shader, which wrote memory only, and the face kept its
     // older shadows (wedges of light in lamp shadows).
-    Setting<bool> bb_clear_one_layer{false};
+    Setting<bool> bb_clear_one_layer{true};
     // Better ambient occlusion: the game's screen-space AO replaced with GT-VBAO (ground-truth
     // AO with a visibility bitmask) from the scene's depth and normals: contact shadows in
     // corners, under objects and in carvings, without the game's halos.

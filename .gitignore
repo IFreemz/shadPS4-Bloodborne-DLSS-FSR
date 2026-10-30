@@ -421,3 +421,6 @@ cmake-build-*
 
 # Nix Result symlink
 result
+
+# A PGO profile merged locally (pgo/README.md): commit the .profraw files instead
+/pgo/bb.profdata

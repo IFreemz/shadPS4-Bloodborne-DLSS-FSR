@@ -51,6 +51,13 @@ if (NOT BB_PGO STREQUAL "")
     endif()
     if (BB_PGO STREQUAL "generate")
         add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-instr-generate>)
+        # The emulator's threads run the same code at once: atomic counters, or their counts
+        # are lost and the profile marks busy code colder than it is.
+        if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+            add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/clang:-fprofile-update=atomic>)
+        else()
+            add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-fprofile-update=atomic>)
+        endif()
         add_compile_definitions(BB_PGO_GENERATE)
         if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
             # lld-link / link.exe take the profile runtime as a library.

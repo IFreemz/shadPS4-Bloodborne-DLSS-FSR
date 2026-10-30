@@ -181,6 +181,10 @@ void RestartButton() {
     }
 }
 
+// Screen-space reflections: hidden until "Better" is better (the setting is reset to the game's
+// own, BbDefaultsVersion 4).
+constexpr bool ShowReflections = false;
+
 constexpr std::array UpscalerValues{"auto", "dlss", "fsr", "fsr4"};
 constexpr std::array UpscalerNames{"Automatic", "DLSS", "FSR 3.1", "FSR 4 (add-on)"};
 constexpr std::array PresetValues{13, 11, 10, 12, 0};
@@ -1002,34 +1006,36 @@ void DlssLayer::Draw() {
         EndDisabled();
     }
 
-    SeparatorText("Reflections");
-    {
-        static constexpr std::array<const char*, 3> modes = {"Game's", "Better", "Off"};
-        const int mode = std::clamp(EmulatorSettings.GetBbSsrMode(), 0, 2);
-        SetNextItemWidth(200.0f);
-        if (BeginCombo("Screen space reflections", modes[mode])) {
-            for (int i = 0; i < int(modes.size()); ++i) {
-                if (Selectable(modes[i], i == mode)) {
-                    EmulatorSettings.SetBbSsrMode(i);
-                    EmulatorSettings.Save();
+    if (ShowReflections) {
+        SeparatorText("Reflections");
+        {
+            static constexpr std::array<const char*, 3> modes = {"Game's", "Better", "Off"};
+            const int mode = std::clamp(EmulatorSettings.GetBbSsrMode(), 0, 2);
+            SetNextItemWidth(200.0f);
+            if (BeginCombo("Screen space reflections", modes[mode])) {
+                for (int i = 0; i < int(modes.size()); ++i) {
+                    if (Selectable(modes[i], i == mode)) {
+                        EmulatorSettings.SetBbSsrMode(i);
+                        EmulatorSettings.Save();
+                    }
                 }
+                EndCombo();
             }
-            EndCombo();
+            if (IsItemHovered())
+                SetTooltip("With the game's \"Enable Screen Space Reflections\" patch. Game's: as "
+                           "the game draws them.\nBetter: traced more precisely and denoised, "
+                           "steadier and cheaper. Off: no screen-space reflections at all.");
+            BeginDisabled(mode != 1);
+            bool full_res = EmulatorSettings.IsBbSsrFullRes();
+            if (Checkbox("Full resolution", &full_res)) {
+                EmulatorSettings.SetBbSsrFullRes(full_res);
+                EmulatorSettings.Save();
+            }
+            if (IsItemHovered())
+                SetTooltip("Better reflections at the full render size instead of the game's half "
+                           "size: a little sharper,\nat more GPU time.");
+            EndDisabled();
         }
-        if (IsItemHovered())
-            SetTooltip("With the game's \"Enable Screen Space Reflections\" patch. Game's: as "
-                       "the game draws them.\nBetter: traced more precisely and denoised, "
-                       "steadier and cheaper. Off: no screen-space reflections at all.");
-        BeginDisabled(mode != 1);
-        bool full_res = EmulatorSettings.IsBbSsrFullRes();
-        if (Checkbox("Full resolution", &full_res)) {
-            EmulatorSettings.SetBbSsrFullRes(full_res);
-            EmulatorSettings.Save();
-        }
-        if (IsItemHovered())
-            SetTooltip("Better reflections at the full render size instead of the game's half "
-                       "size: a little sharper,\nat more GPU time.");
-        EndDisabled();
     }
 
     // Down here on purpose: hardly anyone wants it back.
@@ -1039,19 +1045,22 @@ void DlssLayer::Draw() {
         settings.Set("motion_blur", motion_blur ? "1" : "0");
     SameLine();
     TextDisabled("(off = sharper in motion)");
-    // The whole picture but the character blurred (after a respawn): every input of the game's
-    // motion blur passes goes to the log, to compare with a frame that looks right.
-    if (Button("Log motion blur inputs"))
-        Common::GuestStats::blur_dump_requested.store(true, std::memory_order_relaxed);
-    SameLine();
-    TextDisabled("(press while the picture is blurred, and once when it looks right)");
-    // A texture that looks wrong: uploaded again from game memory. If it then looks right, the
-    // emulator's copy was out of date (the log lists textures still waiting for their largest
-    // level).
-    if (Button("Reload textures from game memory"))
-        Common::GuestStats::texture_reload_requested.store(true, std::memory_order_relaxed);
-    SameLine();
-    TextDisabled("(press while a texture looks wrong)");
+    // Debugging tools, with F3's advanced settings shown.
+    if (EmulatorSettings.IsBbShowThreadedSettings()) {
+        // The whole picture but the character blurred (after a respawn): every input of the game's
+        // motion blur passes goes to the log, to compare with a frame that looks right.
+        if (Button("Log motion blur inputs"))
+            Common::GuestStats::blur_dump_requested.store(true, std::memory_order_relaxed);
+        SameLine();
+        TextDisabled("(press while the picture is blurred, and once when it looks right)");
+        // A texture that looks wrong: uploaded again from game memory. If it then looks right, the
+        // emulator's copy was out of date (the log lists textures still waiting for their largest
+        // level).
+        if (Button("Reload textures from game memory"))
+            Common::GuestStats::texture_reload_requested.store(true, std::memory_order_relaxed);
+        SameLine();
+        TextDisabled("(press while a texture looks wrong)");
+    }
     EndChild();
     restart_footer = !restart_needed.empty();
     if (restart_footer) {

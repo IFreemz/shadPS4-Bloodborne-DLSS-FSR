@@ -24,6 +24,28 @@
       }
     },
     {
+      "name": "x64-Clang-PGO-Training",
+      "displayName": "Clang x64 Release, PGO training (instrumented, LTO)",
+      "inherits": ["x64-Clang-Base"],
+      "binaryDir": "${sourceDir}/Build/pgo-training-x64-Clang-Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE": "ON",
+        "BB_PGO": "generate"
+      }
+    },
+    {
+      "name": "x64-Clang-Release-PGO",
+      "displayName": "Clang x64 Release with LTO and the PGO profile (pgo/bb.profdata)",
+      "inherits": ["x64-Clang-Base"],
+      "binaryDir": "${sourceDir}/Build/pgo-x64-Clang-Release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE": "ON",
+        "BB_PGO": "${sourceDir}/pgo/bb.profdata"
+      }
+    },
+    {
       "name": "x64-Clang-RelWithDebInfo",
       "displayName": "Clang x64 RelWithDebInfo",
       "inherits": ["x64-Clang-Base"],

@@ -8,6 +8,11 @@ SPDX-License-Identifier: GPL-2.0-or-later
 Status as of 29 Oct 2026. Test setup as in `bb-dlc-judder-investigation.md` (RTX 3060 Laptop
 6 GB, BB PC Remaster mod, DLSS).
 
+The debugging tools named below (F1 "Log motion blur inputs" and "Reload textures from game
+memory", F3's threaded renderer parts, GPU time per pass, RenderDoc) are listed only after F3
+"Show advanced settings". "Real occlusion tests" is off by default since BbDefaultsVersion 4, and
+F1's screen-space reflections choice is hidden (the game's own reflections).
+
 ## Whole picture blurred after a respawn — fix under test
 
 - Cause found: the game's 640x360 motion target (drawn and read as 8_8_8_8 unorm) shares memory

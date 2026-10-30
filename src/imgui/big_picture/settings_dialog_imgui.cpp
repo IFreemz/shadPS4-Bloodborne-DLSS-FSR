@@ -951,7 +951,8 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                               "Threaded Renderer to get standard shadPS4 behaviour.",
                               true);
             {
-                // Its individual settings are many: listed only when shown (remembered).
+                // Advanced settings (the threaded renderer's parts, developer tools): listed only
+                // when shown (remembered).
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::TextWrapped("Threaded Renderer");
@@ -959,30 +960,34 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 ImGui::Checkbox("##Threaded Renderer", &threadedRendererSetting);
                 // With the Show/Hide button beside it, d-pad right goes to the button first
                 // (ImGui's own navigation); from the button it jumps to Save as usual.
-                if (!threadedRendererSetting) {
-                    NoteRowFocus();
-                }
                 const bool shown = EmulatorSettings.IsBbShowThreadedSettings();
-                if (threadedRendererSetting) {
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton(shown ? "Hide settings##threaded_parts"
-                                                 : "Show settings##threaded_parts")) {
-                        EmulatorSettings.SetBbShowThreadedSettings(!shown);
-                        EmulatorSettings.Save();
-                    }
-                    NoteRowFocus();
+                ImGui::SameLine();
+                if (ImGui::SmallButton(shown ? "Hide advanced settings##threaded_parts"
+                                             : "Show advanced settings##threaded_parts")) {
+                    EmulatorSettings.SetBbShowThreadedSettings(!shown);
+                    EmulatorSettings.Save();
                 }
+                NoteRowFocus();
                 ImGui::SameLine();
                 AddHint("Faster rendering and smoother frame pacing. Switches all below");
             }
-            if (threadedRendererSetting && EmulatorSettings.IsBbShowThreadedSettings()) {
+            const bool advanced = EmulatorSettings.IsBbShowThreadedSettings();
+            if (threadedRendererSetting) {
+                AddSettingCheckbox("    Real occlusion tests", bbRealOcclusionSetting,
+                                   "More fps in busy areas; can make textures flicker white");
+                AddSettingCheckbox("    Merged copy shaders", bbMergedCopiesSetting,
+                                   "Less GPU copy work; can cause white dots to flicker");
+                AddSettingCheckbox("    Background shader compiles", bbBackgroundPipelinesSetting,
+                                   "New objects appear a frame late instead of a stutter");
+                AddSettingCheckbox("    Show frames when ready", bbFlipWhenReadySetting,
+                                   "Smoother above 60 fps. Off: frames on vblank ticks");
+            }
+            if (threadedRendererSetting && advanced) {
                 // Each off: the emulator's original behaviour for that part (troubleshooting).
                 AddSettingCheckbox("    Streaming optimisations", bbStreamingSetting,
                                    "Smaller hitches entering new areas");
                 AddSettingCheckbox("    GPU readbacks on the copy queue", bbReadbackQueueSetting,
                                    "Fewer small stutters (needs a restart)");
-                AddSettingCheckbox("    Merged copy shaders", bbMergedCopiesSetting,
-                                   "Less GPU copy work");
                 if (bbMergedCopiesSetting) {
                     AddSettingCheckbox("        As copy commands", bbMergedCopyCommandsSetting,
                                        "White dots test: GPU copy commands instead of the "
@@ -990,16 +995,12 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 }
                 AddSettingCheckbox("    Faster Windows locks and sleeps", bbFastLocksSetting,
                                    "Less CPU overhead (needs a restart)");
-                AddSettingCheckbox("    Show frames when ready", bbFlipWhenReadySetting,
-                                   "Smoother above 60 fps. Off: frames on vblank ticks");
                 AddSettingCheckbox("    Geometry in place", bbGeometryInPlaceSetting,
                                    "Static vertex/index data not copied for every draw");
                 AddSettingCheckbox("    Background copies", bbBackgroundTextureCopiesSetting,
                                    "Copies textures and new geometry for the GPU on other threads");
                 AddSettingCheckbox("    Skip draws with no output", bbSkipEmptyDrawsSetting,
                                    "Occlusion test geometry the emulator does not use");
-                AddSettingCheckbox("    Background shader compiles", bbBackgroundPipelinesSetting,
-                                   "New objects appear a frame late instead of a stutter");
                 AddSettingCheckbox("    Reuse texture lookups", bbTextureSetMemoSetting,
                                    "A draw's textures found once, not every draw");
                 AddSettingCheckbox("    Copy geometry ahead", bbRingGeometrySetting,
@@ -1020,8 +1021,6 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                 AddSettingCheckbox("    GPU interpolation where safe",
                                    bbHardwareInterpolationSetting,
                                    "NVIDIA: less pixel shader code (needs a restart)");
-                AddSettingCheckbox("    Real occlusion tests", bbRealOcclusionSetting,
-                                   "Areas hidden behind walls are skipped by the game");
                 AddSettingCheckbox("    Copy thread", bbCopyThreadSetting,
                                    "Draw memory copies on their own thread (needs a restart)");
                 AddSettingCheckbox("    Keep rendering while presenting",
@@ -1127,19 +1126,23 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                               false);
             AddSettingCheckbox("Diagnostics in the log", threadedRendererDiagnosticsSetting,
                                "Frame time, stutter, VRAM and readback reports");
-            AddSettingCheckbox("GPU time per pass in the log", threadedRendererGpuProfileSetting,
-                               "Which render passes take the GPU's time");
             AddSettingCheckbox("Detailed stutter reports", bbStutterDetailSetting,
                                "With diagnostics: where each stutter's time went");
             // Times every draw: heavy on the CPU.
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.2f, 1.0f), "(costs fps)");
-            // Testing the VRAM cleanup: act as if the GPU had this much VRAM (0 = real amount).
-            AddSettingSliderInt("VRAM budget override (MB, 0 = real)", bbVramBudgetTestSetting, 0,
-                                24000);
-            AddSettingCheckbox("RenderDoc captures (F12)", renderdocSetting,
-                               "Loads an installed RenderDoc (needs a restart)");
-            AddSettingSliderInt("Frames per RenderDoc capture", bbRdocCaptureFramesSetting, 1, 120);
+            if (advanced) {
+                AddSettingCheckbox("GPU time per pass in the log",
+                                   threadedRendererGpuProfileSetting,
+                                   "Which render passes take the GPU's time");
+                // Testing the VRAM cleanup: act as if the GPU had this much VRAM (0 = real).
+                AddSettingSliderInt("VRAM budget override (MB, 0 = real)", bbVramBudgetTestSetting,
+                                    0, 24000);
+                AddSettingCheckbox("RenderDoc captures (F12)", renderdocSetting,
+                                   "Loads an installed RenderDoc (needs a restart)");
+                AddSettingSliderInt("Frames per RenderDoc capture", bbRdocCaptureFramesSetting, 1,
+                                    120);
+            }
 
             ImGui::EndTable();
         }
