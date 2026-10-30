@@ -12,7 +12,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 > for the threaded renderer, frame pacing, character motion vectors and VRAM work he has already
 > contributed. Old links to `IFreemz/shadPS4-Bloodborne-DLSS-FSR` redirect here.
 
-> **New: [2.1.0-pre.4](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.4) (experimental).** Resolution in F1 (no patch file editing), faster rendering and fewer stutters: a lighter threaded renderer, background shader compiles and a saved driver cache, batched texture uploads. Should fix the white screen edge on AMD with upscaling (#24) and the crash when loading a save. The stable build is still [2.0.1](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.1). Feedback is welcome in the [issues](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues).
+> **New: [2.1.0-pre.5](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.1.0-pre.5) (experimental), most likely the last pre-release before these changes go into the stable build.** The BB Remaster mod runs smoothly on a 6 GB RTX 3060, about 99% of stutters fixed, GT-VBAO ambient occlusion, an FPS cap in F1 that changes while you play (no FPS patch needed), updated DLSS and DLSS frame generation with model presets, and a faster LTO and PGO build. The stable build is still [2.0.1](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/releases/tag/v2.0.1). Bug reports are welcome in the [issues](https://github.com/eFMann/shadPS4-Bloodborne-DLSS-FSR/issues).
 
 Temporal upscaling for Bloodborne on [shadPS4](https://github.com/shadps4-emu/shadPS4): NVIDIA
 DLSS on GeForce RTX cards, AMD FSR 3.1 on everything else, plus frame generation (DLSS on RTX 40
