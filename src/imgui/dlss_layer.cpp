@@ -465,6 +465,18 @@ void DlssLayer::Draw() {
             SetTooltip("Changes at once, with the frame rate hooks. The game's own frame pacer "
                        "waits for it.\nThe vblank frequency is a limit too: set it at least as "
                        "high.");
+        bool even = EmulatorSettings.IsBbEvenCappedFlips();
+        BeginDisabled(!FrameRate::Active());
+        if (Checkbox("Even frames with a cap", &even)) {
+            EmulatorSettings.SetBbEvenCappedFlips(even);
+            EmulatorSettings.Save();
+        }
+        EndDisabled();
+        if (IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            SetTooltip("With an FPS cap the game moves by exactly the cap's frame time every "
+                       "frame, but finishes its frames a millisecond or two early or late.\nOn: "
+                       "each frame is shown one cap period after the last (an early one waits "
+                       "for its turn).\nOff: each as soon as it is ready. Changes at once.");
     }
 
     SeparatorText("Resolution");

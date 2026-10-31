@@ -7,6 +7,7 @@
 #include "common/debug.h"
 #include "common/frame_pacing.h"
 #include "common/thread.h"
+#include "core/bb_frame_rate.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
@@ -441,9 +442,22 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     auto last_flip = Clock::now();
     auto next_tick = Clock::now();
     bool ready_mode = false;
+    // With the frame rate hooks' FPS cap the game moves by exactly the cap's frame time each frame
+    // (its pacer reports the target), but finishes frames up to 1-2 ms early or late: shown as
+    // they come, 15.5, 18, 16 ms apart, panning judders. The flips' rhythm is the cap's period
+    // then, an early frame waiting for its turn (a late one is shown at once, without a catch-up
+    // flip after it).
+    auto rhythm = std::chrono::nanoseconds{vblank_period};
+    const auto update_rhythm = [&] {
+        const float cap =
+            EmulatorSettings.IsBbEvenCappedFlips() ? Core::BbFrameRate::CapPeriod() : 0.0f;
+        const auto cap_period = std::chrono::nanoseconds{static_cast<s64>(cap * 1e9)};
+        rhythm = std::max(std::chrono::nanoseconds{vblank_period}, cap_period);
+    };
     const auto take_flip = [&](const Request& request, Clock::time_point now) {
         if (ready_mode) {
-            next_flip = std::max(next_flip + vblank_period, now + min_gap);
+            update_rhythm();
+            next_flip = std::max(next_flip + rhythm, now + rhythm * 7 / 8);
             last_flip = now;
         }
         if (request.index != -1) {
@@ -499,8 +513,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         const auto now = Clock::now();
         // On a tick, a flip up to `slack` before its slot is fine (ticks and flips run on
         // separate schedules), as long as it keeps the minimum gap.
+        // With a cap's rhythm, not early either: the wait below takes it on time.
+        const auto early = rhythm > vblank_period ? std::chrono::nanoseconds{0} : slack;
         const bool flip_slot =
-            !ready_mode || (now + slack >= next_flip && now >= last_flip + min_gap);
+            !ready_mode || (now + early >= next_flip && now >= last_flip + rhythm * 7 / 8);
         if (flip_slot && vblank_status.count % (main_port.flip_rate + 1) == 0) {
             const auto request = receive_request();
             Vulkan::FrameGen::RecordTiming("flip_dequeue", request.game_frame, 0,

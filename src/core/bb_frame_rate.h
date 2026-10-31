@@ -36,4 +36,7 @@ bool Active();
 // waits for it, before the frame's simulation.
 void SetLimit(int fps);
 
+/// The FPS cap's frame time in seconds, 0 without a cap (or without the hooks).
+float CapPeriod();
+
 } // namespace Core::BbFrameRate

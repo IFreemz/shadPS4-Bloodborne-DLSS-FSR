@@ -550,6 +550,13 @@ bool Active() {
     return active.load(std::memory_order_acquire);
 }
 
+float CapPeriod() {
+    if (!Active() || live->shortest <= 1.01f / MaxRate) {
+        return 0.0f;
+    }
+    return live->shortest;
+}
+
 void SetLimit(int fps) {
     if (!Active()) {
         return;
