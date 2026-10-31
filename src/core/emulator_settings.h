@@ -457,9 +457,6 @@ struct GPUSettings {
     Setting<bool> bb_streaming{true};
     // Copy shader batches in one compute dispatch, merged within 64 KiB.
     Setting<bool> bb_merged_copies{true};
-    // Test (issue #25, white dots): the merged copy batches as GPU copy commands instead of the
-    // multi-copy compute shader. Off: the compute shader.
-    Setting<bool> bb_merged_copy_commands{false};
     // Faster Windows locks and sleeps (applies at game start).
     Setting<bool> bb_fast_locks{true};
     // Flip a frame as soon as it's ready (between vblanks), evenly paced, instead of on the
@@ -629,8 +626,6 @@ struct GPUSettings {
             make_override<GPUSettings>("bb_anisotropy", &GPUSettings::bb_anisotropy),
             make_override<GPUSettings>("bb_draw_data_memory", &GPUSettings::bb_draw_data_memory),
             make_override<GPUSettings>("bb_exact_protection", &GPUSettings::bb_exact_protection),
-            make_override<GPUSettings>("bb_merged_copy_commands",
-                                       &GPUSettings::bb_merged_copy_commands),
             make_override<GPUSettings>("bb_batched_uploads", &GPUSettings::bb_batched_uploads),
             make_override<GPUSettings>("bb_texture_set_memo", &GPUSettings::bb_texture_set_memo),
             make_override<GPUSettings>("bb_ring_geometry", &GPUSettings::bb_ring_geometry),
@@ -670,9 +665,9 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_geometry_in_place, bb_skip_empty_draws, bb_background_pipelines, bb_anisotropy,
     bb_exact_protection, bb_batched_uploads, bb_texture_set_memo, bb_ring_geometry,
     bb_submit_overlap, bb_overlap_frames, bb_early_writeback, bb_stutter_detail, bb_defaults,
-    bb_merged_copy_commands, bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait,
-    bb_hardware_interpolation, bb_real_occlusion, bb_copy_thread, bb_spread_loads,
-    bb_render_during_present, bb_skip_left_out_levels, bb_direct_texture_copies)
+    bb_occlusion_in_order, bb_fast_pixel_math, bb_constants_no_wait, bb_hardware_interpolation,
+    bb_real_occlusion, bb_copy_thread, bb_spread_loads, bb_render_during_present,
+    bb_skip_left_out_levels, bb_direct_texture_copies)
 
 // -------------------------------
 // Vulkan settings
@@ -764,6 +759,11 @@ struct VulkanSettings {
     // Bloodborne's frame rate set free by hooks in the game's code instead of the
     // frame rate patches, which must be off then. Applies at the next start. Global only.
     Setting<bool> bb_frame_hooks{true};
+    // Tests (issue #25, white dots), with merged copy shaders: the copies' sources never
+    // snapshotted from game memory into the stream buffer (read from the buffer cache, as with
+    // merged copies off), and the old 64 MiB batches instead of 64 KiB ones.
+    Setting<bool> bb_merged_no_stream_sources{false};
+    Setting<bool> bb_merged_large_batches{false};
     // The frame rate limit with the frame rate hooks (30..480; 0: none), changed while the game
     // runs. Global only.
     Setting<int> bb_fps_limit{0};
@@ -810,6 +810,10 @@ struct VulkanSettings {
             make_override<VulkanSettings>("bb_copy_skip_same", &VulkanSettings::bb_copy_skip_same),
             make_override<VulkanSettings>("bb_clear_one_layer",
                                           &VulkanSettings::bb_clear_one_layer),
+            make_override<VulkanSettings>("bb_merged_no_stream_sources",
+                                          &VulkanSettings::bb_merged_no_stream_sources),
+            make_override<VulkanSettings>("bb_merged_large_batches",
+                                          &VulkanSettings::bb_merged_large_batches),
         };
     }
 };
@@ -821,7 +825,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(
     bb_ce_skip_huge_writes, bb_evict_keep_protection, bb_evict_keep_returning,
     bb_protect_helper_thread, bb_cpu_copy_shader, bb_copy_skip_same, bb_clear_one_layer,
     bb_rdoc_capture_frames, bb_vbao, bb_vbao_strength, bb_vbao_radius, bb_vbao_half_res,
-    bb_ssr_mode, bb_ssr_full_res, bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit)
+    bb_ssr_mode, bb_ssr_full_res, bb_show_threaded_settings, bb_frame_hooks, bb_fps_limit,
+    bb_merged_no_stream_sources, bb_merged_large_batches)
 
 // -------------------------------
 // Main manager
@@ -1092,7 +1097,6 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, BbSkipEmptyDraws, bb_skip_empty_draws)
     SETTING_FORWARD_BOOL(m_gpu, BbBackgroundPipelines, bb_background_pipelines)
     SETTING_FORWARD_BOOL(m_gpu, BbExactProtection, bb_exact_protection)
-    SETTING_FORWARD_BOOL(m_gpu, BbMergedCopyCommands, bb_merged_copy_commands)
     SETTING_FORWARD_BOOL(m_gpu, BbBatchedUploads, bb_batched_uploads)
     SETTING_FORWARD_BOOL(m_gpu, BbTextureSetMemo, bb_texture_set_memo)
     SETTING_FORWARD_BOOL(m_gpu, BbRingGeometry, bb_ring_geometry)
@@ -1129,6 +1133,8 @@ public:
     SETTING_FORWARD_BOOL(m_vulkan, BbShowThreadedSettings, bb_show_threaded_settings)
     SETTING_FORWARD_BOOL(m_vulkan, BbFrameHooks, bb_frame_hooks)
     SETTING_FORWARD(m_vulkan, BbFpsLimit, bb_fps_limit)
+    SETTING_FORWARD_BOOL(m_vulkan, BbMergedNoStreamSources, bb_merged_no_stream_sources)
+    SETTING_FORWARD_BOOL(m_vulkan, BbMergedLargeBatches, bb_merged_large_batches)
     SETTING_FORWARD_BOOL(m_gpu, BbSpreadLoads, bb_spread_loads)
     SETTING_FORWARD_BOOL(m_gpu, BbStutterDetail, bb_stutter_detail)
     SETTING_FORWARD(m_gpu, BbVramBudgetTestMb, bb_vram_budget_test_mb)

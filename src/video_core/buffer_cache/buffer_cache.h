@@ -141,9 +141,12 @@ public:
     void WriteBack(const PendingWriteback& writeback);
 
     /// Finds a buffer for the specified region.
+    /// allow_stream false: a small read-only region still comes from the buffer itself, not a
+    /// snapshot of guest memory in the stream buffer.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
-                                                             bool is_texel_buffer = false);
+                                                             bool is_texel_buffer = false,
+                                                             bool allow_stream = true);
 
     /// Vertex and index data: like ObtainBuffer(read-only), but with the threaded renderer a
     /// clean range of 1 KiB or more is used where it is in the arena instead of being copied

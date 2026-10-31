@@ -1364,7 +1364,9 @@ void Rasterizer::OnSubmit() {
                             std::memory_order_relaxed);
         BB::merged_copies.store(pipe_enabled && EmulatorSettings.IsBbMergedCopies(),
                                 std::memory_order_relaxed);
-        BB::merged_copy_commands.store(EmulatorSettings.IsBbMergedCopyCommands(),
+        BB::merged_no_stream_sources.store(EmulatorSettings.IsBbMergedNoStreamSources(),
+                                           std::memory_order_relaxed);
+        BB::merged_large_batches.store(EmulatorSettings.IsBbMergedLargeBatches(),
                                        std::memory_order_relaxed);
         BB::readback_queue.store(pipe_enabled && EmulatorSettings.IsBbReadbackQueue(),
                                  std::memory_order_relaxed);

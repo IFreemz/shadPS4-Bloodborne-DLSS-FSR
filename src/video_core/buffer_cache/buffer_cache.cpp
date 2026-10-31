@@ -650,9 +650,11 @@ bool BufferCache::DownloadMemoryFromBuffer(const Buffer* arena, VAddr device_add
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
-                                                        bool is_written, bool is_texel_buffer) {
+                                                        bool is_written, bool is_texel_buffer,
+                                                        bool allow_stream) {
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && size <= STREAM_THRESHOLD && !IsRegionGpuModified(device_addr, size)) {
+    if (allow_stream && !is_written && size <= STREAM_THRESHOLD &&
+        !IsRegionGpuModified(device_addr, size)) {
         Common::GuestStats::DetailTimer timer{Common::GuestStats::Detail::BufStream};
         Common::GuestStats::stream_copies.fetch_add(1, std::memory_order_relaxed);
         Common::GuestStats::stream_copy_bytes.fetch_add(size, std::memory_order_relaxed);

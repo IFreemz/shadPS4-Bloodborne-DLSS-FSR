@@ -582,16 +582,17 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
              "Bloodborne threadedRenderer: {} streaming: {} readbackQueue: {} mergedCopies: {} "
              "fastLocks: {} flipWhenReady: {} geometryInPlace: {} backgroundCopies: {} "
              "skipEmptyDraws: {} backgroundShaderCompiles: {} textureSetMemo: {} "
-             "ringGeometry: {} submitOverlap: {} mergedCopyCommands: {} occlusionInOrder: {} "
-             "constantsNoWait: {}",
+             "ringGeometry: {} submitOverlap: {} mergedNoStreamSources: {} "
+             "mergedLargeBatches: {} occlusionInOrder: {} constantsNoWait: {}",
              EmulatorSettings.IsThreadedRenderer(), EmulatorSettings.IsBbStreaming(),
              EmulatorSettings.IsBbReadbackQueue(), EmulatorSettings.IsBbMergedCopies(),
              EmulatorSettings.IsBbFastLocks(), EmulatorSettings.IsBbFlipWhenReady(),
              EmulatorSettings.IsBbGeometryInPlace(), EmulatorSettings.IsBbBackgroundTextureCopies(),
              EmulatorSettings.IsBbSkipEmptyDraws(), EmulatorSettings.IsBbBackgroundPipelines(),
              EmulatorSettings.IsBbTextureSetMemo(), EmulatorSettings.IsBbRingGeometry(),
-             EmulatorSettings.IsBbSubmitOverlap(), EmulatorSettings.IsBbMergedCopyCommands(),
-             EmulatorSettings.IsBbOcclusionInOrder(), EmulatorSettings.IsBbConstantsNoWait());
+             EmulatorSettings.IsBbSubmitOverlap(), EmulatorSettings.IsBbMergedNoStreamSources(),
+             EmulatorSettings.IsBbMergedLargeBatches(), EmulatorSettings.IsBbOcclusionInOrder(),
+             EmulatorSettings.IsBbConstantsNoWait());
     LOG_INFO(Config,
              "Bloodborne anisotropy: {} resizableBar: {} exactProtection: {} batchedUploads: {} "
              "vramCleanup: {} bufferEviction: {}",

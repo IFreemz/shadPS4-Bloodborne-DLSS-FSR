@@ -33,6 +33,7 @@ struct CopyStats {
     std::atomic<u64> small, unaligned, overlapping, too_large;
     std::atomic<u64> after_write, overwrite_write, overwrite_read;
     std::atomic<u64> cpu_batches, cpu_bytes, same_copies, same_bytes;
+    std::atomic<u64> stream_sources, stream_bytes, gpu_batches;
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 };
 CopyStats copy_stats;
@@ -57,6 +58,18 @@ void LogCopyStats() {
     const u64 overwrite_read = take(c.overwrite_read);
     const u64 cpu_batches = take(c.cpu_batches), cpu_bytes = take(c.cpu_bytes);
     const u64 same_copies = take(c.same_copies), same_bytes = take(c.same_bytes);
+    const u64 stream_sources = take(c.stream_sources), stream_bytes = take(c.stream_bytes);
+    const u64 gpu_batches = take(c.gpu_batches);
+    if (gpu_batches != 0) {
+        LOG_INFO(Render_Vulkan,
+                 "Copy shader sources (issue #25): {:.0f} of {:.0f} GPU batches/s ({:.0f}%, "
+                 "{:.2f} MiB/s) read from a snapshot of game memory in the stream buffer; "
+                 "merged {} sources from buffer memory {} large batches {}",
+                 stream_sources / seconds, gpu_batches / seconds,
+                 100.0 * stream_sources / gpu_batches, stream_bytes / seconds / (1 << 20),
+                 Common::BbTuning::MergedCopies(), Common::BbTuning::MergedNoStreamSources(),
+                 Common::BbTuning::MergedLargeBatches());
+    }
     if (same_copies != 0) {
         LOG_INFO(Render_Vulkan,
                  "Copy shader: {:.0f} copies/s ({:.1f} MiB/s) left out, their destinations "
@@ -327,7 +340,10 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
     // copy shader's GPU time 1.5 -> 0.6 ms/frame.
     // Off (threaded renderer toggle): the original 64 MiB and one copy command per batch.
     const bool merged = Common::BbTuning::MergedCopies();
-    const vk::DeviceSize MaxDistanceForMerge = merged ? 64_KB : 64_MB;
+    // Tests (issue #25): the old 64 MiB batches, and sources never snapshotted.
+    const vk::DeviceSize MaxDistanceForMerge =
+        merged && !Common::BbTuning::MergedLargeBatches() ? 64_KB : 64_MB;
+    const bool allow_stream = !(merged && Common::BbTuning::MergedNoStreamSources());
     struct Batch {
         u32 start, end;
         const VideoCore::Buffer* src;
@@ -416,8 +432,16 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         }
 
         // Obtain buffers for the total source and destination ranges.
-        const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBuffer(
-            src_buf_sharp.base_address + src_offset_min, src_offset_max - src_offset_min, false);
+        const auto [src_buf, src_buf_offset] =
+            buffer_cache.ObtainBuffer(src_buf_sharp.base_address + src_offset_min,
+                                      src_offset_max - src_offset_min, false, false, allow_stream);
+        if (diagnostics) {
+            Count(copy_stats.gpu_batches);
+            if (src_buf == &buffer_cache.GetStreamBuffer()) {
+                Count(copy_stats.stream_sources);
+                Count(copy_stats.stream_bytes, src_offset_max - src_offset_min);
+            }
+        }
         const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(
             dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min, true);
 
@@ -511,8 +535,7 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             }
             const auto group = batch_copies(first, last);
             if (CopiesIndependent(src, dst, group)) {
-                // Test (issue #25): one copy command for the group instead of the compute shader.
-                record(src, dst, group, ranges, !Common::BbTuning::MergedCopyCommands());
+                record(src, dst, group, ranges, true);
             } else {
                 if (diagnostics) {
                     Count(copy_stats.overlapping);

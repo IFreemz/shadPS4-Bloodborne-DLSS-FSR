@@ -30,8 +30,9 @@ inline std::atomic<bool> fast_locks{false};
 inline std::atomic<bool> threaded{false};      ///< the threaded renderer itself
 inline std::atomic<bool> streaming{false};     ///< parallel copies, resident memory slabs, staging
 inline std::atomic<bool> merged_copies{false}; ///< copy shader batches in one dispatch
-inline std::atomic<bool> merged_copy_commands{false}; ///< test: those batches as copy commands
-inline std::atomic<bool> readback_queue{false};       ///< GPU readbacks on the second queue
+inline std::atomic<bool> merged_no_stream_sources{false}; ///< test: sources never snapshotted
+inline std::atomic<bool> merged_large_batches{false};     ///< test: 64 MiB batches when merged
+inline std::atomic<bool> readback_queue{false};           ///< GPU readbacks on the second queue
 /// The graphics card's own memory in bytes (0: not known yet), set when the GPU is opened.
 inline std::atomic<unsigned long long> vram_bytes{0};
 /// The size of the game's mods folder in bytes (texture mods such as BB PC Remaster), measured
@@ -56,8 +57,11 @@ inline bool Streaming() {
 inline bool MergedCopies() {
     return merged_copies.load(std::memory_order_relaxed);
 }
-inline bool MergedCopyCommands() {
-    return merged_copy_commands.load(std::memory_order_relaxed);
+inline bool MergedNoStreamSources() {
+    return merged_no_stream_sources.load(std::memory_order_relaxed);
+}
+inline bool MergedLargeBatches() {
+    return merged_large_batches.load(std::memory_order_relaxed);
 }
 inline bool ReadbackQueue() {
     return readback_queue.load(std::memory_order_relaxed);

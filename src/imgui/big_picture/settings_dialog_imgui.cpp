@@ -75,7 +75,8 @@ void SettingsWindow::LoadSettings(std::string profile) {
     bbReadbackQueueSetting = EmulatorSettings.IsBbReadbackQueue();
     bbStreamingSetting = EmulatorSettings.IsBbStreaming();
     bbMergedCopiesSetting = EmulatorSettings.IsBbMergedCopies();
-    bbMergedCopyCommandsSetting = EmulatorSettings.IsBbMergedCopyCommands();
+    bbMergedNoStreamSourcesSetting = EmulatorSettings.IsBbMergedNoStreamSources();
+    bbMergedLargeBatchesSetting = EmulatorSettings.IsBbMergedLargeBatches();
     bbFastLocksSetting = EmulatorSettings.IsBbFastLocks();
     bbFlipWhenReadySetting = EmulatorSettings.IsBbFlipWhenReady();
     bbVramReclaimSetting = EmulatorSettings.IsBbVramReclaim();
@@ -197,7 +198,8 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetBbReadbackQueue(bbReadbackQueueSetting, isSpecific);
     EmulatorSettings.SetBbStreaming(bbStreamingSetting, isSpecific);
     EmulatorSettings.SetBbMergedCopies(bbMergedCopiesSetting, isSpecific);
-    EmulatorSettings.SetBbMergedCopyCommands(bbMergedCopyCommandsSetting, isSpecific);
+    EmulatorSettings.SetBbMergedNoStreamSources(bbMergedNoStreamSourcesSetting, isSpecific);
+    EmulatorSettings.SetBbMergedLargeBatches(bbMergedLargeBatchesSetting, isSpecific);
     EmulatorSettings.SetBbFastLocks(bbFastLocksSetting, isSpecific);
     EmulatorSettings.SetBbFlipWhenReady(bbFlipWhenReadySetting, isSpecific);
     EmulatorSettings.SetBbVramReclaim(bbVramReclaimSetting, isSpecific);
@@ -977,6 +979,14 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "More fps in busy areas; can make textures flicker white");
                 AddSettingCheckbox("    Merged copy shaders", bbMergedCopiesSetting,
                                    "Less GPU copy work; can cause white dots to flicker");
+                if (advanced && bbMergedCopiesSetting) {
+                    AddSettingCheckbox("        Sources from buffer memory",
+                                       bbMergedNoStreamSourcesSetting,
+                                       "White dots test: small copy sources not snapshotted "
+                                       "from game memory");
+                    AddSettingCheckbox("        Large batches", bbMergedLargeBatchesSetting,
+                                       "White dots test: the old 64 MB batches instead of 64 KB");
+                }
                 AddSettingCheckbox("    Background shader compiles", bbBackgroundPipelinesSetting,
                                    "New objects appear a frame late instead of a stutter");
                 AddSettingCheckbox("    Show frames when ready", bbFlipWhenReadySetting,
@@ -988,11 +998,6 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
                                    "Smaller hitches entering new areas");
                 AddSettingCheckbox("    GPU readbacks on the copy queue", bbReadbackQueueSetting,
                                    "Fewer small stutters (needs a restart)");
-                if (bbMergedCopiesSetting) {
-                    AddSettingCheckbox("        As copy commands", bbMergedCopyCommandsSetting,
-                                       "White dots test: GPU copy commands instead of the "
-                                       "copy shader");
-                }
                 AddSettingCheckbox("    Faster Windows locks and sleeps", bbFastLocksSetting,
                                    "Less CPU overhead (needs a restart)");
                 AddSettingCheckbox("    Geometry in place", bbGeometryInPlaceSetting,
