@@ -592,8 +592,7 @@ void Rasterizer::BetterAoAfterDraw(const GraphicsPipeline* pipeline) {
         vbao->OnSsaoPass(texture1);
         return;
     }
-    if (!BbVbao::AoShader(ps->pgm_hash) ||
-        std::popcount(pipeline->GetGraphicsKey().mrt_mask) < 1) {
+    if (!BbVbao::AoShader(ps->pgm_hash) || std::popcount(pipeline->GetGraphicsKey().mrt_mask) < 1) {
         return;
     }
     vbao->OnAoPass(cb_descs[0].image_id, cb_descs[0].desc.view_info.format,

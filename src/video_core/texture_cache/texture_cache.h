@@ -652,14 +652,14 @@ private:
     std::mutex restore_mutex;
     std::vector<std::pair<ImageId, u64>> restore_full_quality; ///< image and its uid
 
-    u64 load_window_bytes = 0; ///< image upload bytes at the start of this second
+    u64 load_window_bytes = 0;          ///< image upload bytes at the start of this second
     u64 load_window_reupload_bytes = 0; ///< of them re-uploads of freed images, at that start
     u64 load_burst_ignored_second = 0;
     u64 load_until_second = 0; ///< VRAM cleanup frees ahead of a load until this second
     u64 gc_loads = 0;
     bool spread_loads_enabled = false;
-    std::atomic<u64> spread_frame_bytes{0}; ///< uploaded this game frame while spreading
-    std::atomic<u64> detail_frame_bytes{0}; ///< texture bytes uploaded this game frame
+    std::atomic<u64> spread_frame_bytes{0};    ///< uploaded this game frame while spreading
+    std::atomic<u64> detail_frame_bytes{0};    ///< texture bytes uploaded this game frame
     std::atomic<u32> detail_frame_restores{0}; ///< largest levels uploaded later this frame
     static inline thread_local bool sampled_update = false; ///< in UpdateTexture/UpdateImages
     /// Protection on a helper thread: the image being refreshed's deferred protection calls.

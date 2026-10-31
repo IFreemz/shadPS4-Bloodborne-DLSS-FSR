@@ -22,8 +22,8 @@
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_ssr.h"
-#include "video_core/renderer_vulkan/vk_bb_vbao.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
+#include "video_core/renderer_vulkan/vk_bb_vbao.h"
 #include "video_core/renderer_vulkan/vk_bb_velocity_mirror.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -773,7 +773,7 @@ private:
         AmdGpu::CbDbExtent extent{};
         u64 frame{};    ///< game frame it was last drawn with depth writes in
         bool written{}; ///< drawn with depth writes at all
-    } scene_depth; ///< GPU command thread
+    } scene_depth;      ///< GPU command thread
     /// Tests moved to the scene's depth: drawn in this game frame with depth writes, or only in
     /// an earlier one (the test then sees where things were a frame ago).
     std::atomic<u64> occlusion_depth_current{};

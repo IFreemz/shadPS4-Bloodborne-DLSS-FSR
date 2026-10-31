@@ -360,7 +360,7 @@ private:
     std::array<u64, 4> readback_writer_ns{};                  ///< GPU wait time by writer state
     u64 readback_max_wait_ns{};
     std::mutex gpu_write_mutex;
-    std::unordered_map<u64, u64> gpu_write_ticks;    ///< 64 KiB block -> tick of the last GPU write
+    std::unordered_map<u64, u64> gpu_write_ticks; ///< 64 KiB block -> tick of the last GPU write
     /// Diagnostics: the last GPU write of each 64 KiB block (shader, the range it was bound
     /// over), for the log of game writes that waited for unfinished GPU work.
     struct GpuWriter {

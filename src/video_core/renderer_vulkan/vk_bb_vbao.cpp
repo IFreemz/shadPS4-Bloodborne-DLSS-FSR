@@ -75,7 +75,7 @@ struct TemporalConstants {
 };
 static_assert(sizeof(TemporalConstants) <= sizeof(PushConstants));
 
-constexpr float TemporalBlend = 0.85f;    // about 7 frames of history
+constexpr float TemporalBlend = 0.85f; // about 7 frames of history
 constexpr float TemporalTolerance = 0.05f;
 
 // 3x4 affine matrices (rows; the last column is the translation), as in bbport's camera motion.
@@ -117,9 +117,9 @@ std::array<float, 12> InverseAffine(const std::array<float, 12>& m) {
 }
 
 constexpr float Thickness = 0.4f;
-constexpr s32 BlurRadius = 2;       // taps per side (5x5)
-constexpr float BlurDepth = 0.05f;  // relative depth difference that stops the blur
-constexpr float BlurNormal = 8.0f;  // how sharply the blur stops at normal changes
+constexpr s32 BlurRadius = 2;      // taps per side (5x5)
+constexpr float BlurDepth = 0.05f; // relative depth difference that stops the blur
+constexpr float BlurNormal = 8.0f; // how sharply the blur stops at normal changes
 
 } // Anonymous namespace
 
@@ -194,9 +194,9 @@ struct BbVbao::Impl {
                      "(now {:.4f} {:.4f} {:.6f} {:.6f})",
                      stats.ao_passes, stats.ran, stats.with_normals, stats.game_format_views,
                      stats.ssao_passes, stats.ssao_no_texture, stats.game_draws_skipped,
-                     stats.accumulated, stats.with_history, stats.no_camera,
-                     stats.no_depth, stats.not_fitting, stats.depth_changes, stats.side_passes,
-                     stats.cameras, stats.proj_changes, proj[0], proj[1], proj[2], proj[3]);
+                     stats.accumulated, stats.with_history, stats.no_camera, stats.no_depth,
+                     stats.not_fitting, stats.depth_changes, stats.side_passes, stats.cameras,
+                     stats.proj_changes, proj[0], proj[1], proj[2], proj[3]);
         }
         stats = {};
         next_log = now + std::chrono::seconds(5);
@@ -357,8 +357,7 @@ struct BbVbao::Impl {
                             "Better AO: skipped (depth {} {}x{}, AO target {} {}x{} drawn as {})",
                             vk::to_string(depth_format), depth.info.size.width,
                             depth.info.size.height, vk::to_string(ao.info.pixel_format),
-                            ao.info.size.width, ao.info.size.height,
-                            vk::to_string(view_format));
+                            ao.info.size.width, ao.info.size.height, vk::to_string(view_format));
             }
             ++stats.not_fitting;
             return false;
@@ -380,8 +379,8 @@ struct BbVbao::Impl {
         }
         // The scene's viewport; the targets may be allocated larger (aligned height).
         auto [width, height] = render_size;
-        width = width ? std::min((width + scale - 1) / scale, ao.info.size.width)
-                      : ao.info.size.width;
+        width =
+            width ? std::min((width + scale - 1) / scale, ao.info.size.width) : ao.info.size.width;
         height = height ? std::min((height + scale - 1) / scale, ao.info.size.height)
                         : ao.info.size.height;
         {
@@ -389,9 +388,9 @@ struct BbVbao::Impl {
             if (!logged[half]) {
                 logged[half] = true;
                 LOG_INFO(Render_Vulkan,
-                         "Better AO: on, {}x{} into the game's {} AO ({} {}x{}, kept as {})",
-                         width, height, half ? "half-size" : "upsampled",
-                         vk::to_string(ao_format), ao.info.size.width, ao.info.size.height,
+                         "Better AO: on, {}x{} into the game's {} AO ({} {}x{}, kept as {})", width,
+                         height, half ? "half-size" : "upsampled", vk::to_string(ao_format),
+                         ao.info.size.width, ao.info.size.height,
                          vk::to_string(ao.info.pixel_format));
             }
         }
@@ -515,8 +514,7 @@ struct BbVbao::Impl {
                           hist_write_view = *history[write_index].view,
                           hist_read = history[write_index ^ 1u].image->image,
                           hist_read_view = *history[write_index ^ 1u].view, clear_history,
-                          pipeline = *pipeline,
-                          temporal_pipeline = *temporal_pipeline,
+                          pipeline = *pipeline, temporal_pipeline = *temporal_pipeline,
                           blur_pipeline = half ? *blur_rgba_pipeline : *blur_pipeline,
                           layout = *pipeline_layout](vk::CommandBuffer cmdbuf) {
             const auto push_images = [&](vk::ImageView sampled, vk::ImageView storage,
@@ -525,8 +523,8 @@ struct BbVbao::Impl {
                     .imageView = sampled, .imageLayout = vk::ImageLayout::eGeneral};
                 const vk::DescriptorImageInfo storage_info{
                     .imageView = storage, .imageLayout = vk::ImageLayout::eGeneral};
-                const vk::DescriptorImageInfo extra_info{
-                    .imageView = extra, .imageLayout = vk::ImageLayout::eGeneral};
+                const vk::DescriptorImageInfo extra_info{.imageView = extra,
+                                                         .imageLayout = vk::ImageLayout::eGeneral};
                 const std::array<vk::WriteDescriptorSet, 3> writes = {{
                     {.dstBinding = 0,
                      .descriptorCount = 1,
@@ -565,8 +563,7 @@ struct BbVbao::Impl {
                 vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
             push_images(depth_view, raw_view, normal_view);
-            cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
-                                 &push);
+            cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
             cmdbuf.dispatch(groups_x, groups_y, 1);
 
             barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
@@ -580,13 +577,13 @@ struct BbVbao::Impl {
                 for (int i = 0; i < 2; ++i) {
                     history_barriers[i] = vk::ImageMemoryBarrier2{
                         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                        .srcAccessMask = vk::AccessFlagBits2::eShaderRead |
-                                         vk::AccessFlagBits2::eShaderWrite,
+                        .srcAccessMask =
+                            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
                         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                         .dstAccessMask = i == 0 ? vk::AccessFlagBits2::eShaderWrite
                                                 : vk::AccessFlagBits2::eShaderRead,
-                        .oldLayout = clear_history ? vk::ImageLayout::eUndefined
-                                                   : vk::ImageLayout::eGeneral,
+                        .oldLayout =
+                            clear_history ? vk::ImageLayout::eUndefined : vk::ImageLayout::eGeneral,
                         .newLayout = vk::ImageLayout::eGeneral,
                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -733,8 +730,7 @@ void BbVbao::OnAoPass(VideoCore::ImageId target, vk::Format view_format,
         return;
     }
     try {
-        s.stats.ran +=
-            s.Run(target, view_format, normals ? normals : s.ssao_normals) ? 1 : 0;
+        s.stats.ran += s.Run(target, view_format, normals ? normals : s.ssao_normals) ? 1 : 0;
     } catch (const std::exception& e) {
         s.failed = true;
         LOG_ERROR(Render_Vulkan, "Better AO: unavailable ({})", e.what());

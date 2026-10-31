@@ -21,6 +21,7 @@ path = [
     "src/dist/net.shadps4.shadPS4.svg",
     "src/dist/shadps4.ico",
     "src/dist/shadps4.rc",
+    "src/resources/big_picture/bloodborne.png",
     "src/resources/big_picture/controller.png",
     "src/resources/big_picture/experimental.png",
     "src/resources/big_picture/folder.png",
