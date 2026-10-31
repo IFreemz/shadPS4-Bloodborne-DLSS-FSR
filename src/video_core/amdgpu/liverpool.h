@@ -257,7 +257,12 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    /// A submission's own copy of its command buffers (dcb, then ccb), kept by its task.
+    struct CmdCopy {
+        std::vector<u32> words;
+        const u32* guest_dcb; ///< where the dcb part was copied from (null: no copy)
+    };
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, CmdCopy copy = {});
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);

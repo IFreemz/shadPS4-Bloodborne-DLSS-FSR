@@ -11,6 +11,7 @@
 #include <tuple>
 #include <vector>
 #include <boost/preprocessor/stringize.hpp>
+#include <xxhash.h>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -494,11 +495,7 @@ struct PacketTrail {
 };
 
 u64 HashCommands(std::span<const u32> words) {
-    u64 hash = 0xcbf29ce484222325ull;
-    for (const u32 word : words) {
-        hash = (hash ^ word) * 0x100000001b3ull;
-    }
-    return hash;
+    return XXH3_64bits(words.data(), words.size_bytes());
 }
 
 void LogBadPacket(std::span<const u32> commands, const u32* bad, u64 start_hash,
@@ -538,9 +535,24 @@ void LogBadPacket(std::span<const u32> commands, const u32* bad, u64 start_hash,
                  recent);
 }
 
+// A bad packet means the decoder has lost its place in the buffer (or the buffer was changed under
+// it): nothing after it can be trusted, so the rest of that command buffer is dropped.
+void StopAtBadPacket(std::span<const u32> commands, std::span<const u32>& dcb, u64 start_hash,
+                     const PacketTrail& trail, std::string_view what) {
+    static std::atomic<u32> bad_buffers{0};
+    const u32 seen = ++bad_buffers;
+    if (seen <= 8) {
+        LogBadPacket(commands, dcb.data(), start_hash, trail);
+    }
+    LOG_ERROR(Render, "{}: dropped the last {} of {} dwords of this command buffer ({} so far)",
+              what, dcb.size(), commands.size(), seen);
+    dcb = {};
+}
+
 } // namespace
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                                           CmdCopy copy) {
     FIBER_ENTER(dcb_task_name);
 
     cblock.Reset();
@@ -577,22 +589,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         switch (type) {
         default:
-            LogBadPacket(commands, dcb.data(), commands_hash, trail);
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
-            break;
-        case 0: {
-            static std::atomic<u32> type0_packets{0};
-            const u32 seen = ++type0_packets;
-            if (seen <= 8) {
-                LogBadPacket(commands, dcb.data(), commands_hash, trail);
-            }
-            LOG_WARNING(Render,
-                        "Skipped PM4 type 0 packet (register writes are not emulated), base reg: "
-                        "{:#x}, size: {}, skipped so far: {}",
-                        header->type0.base.Value(), header->type0.NumWords(), seen);
-            dcb = NextPacket(dcb, std::min<size_t>(header->type0.NumWords() + 1, dcb.size()));
+            StopAtBadPacket(commands, dcb, commands_hash, trail,
+                            fmt::format("Wrong PM4 type {}", type));
             continue;
-        }
+        case 0:
+            StopAtBadPacket(commands, dcb, commands_hash, trail,
+                            fmt::format("PM4 type 0 packet (base reg {:#x}, {} dwords)",
+                                        header->type0.base.Value(), header->type0.NumWords()));
+            continue;
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -1305,6 +1309,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                if (copy.guest_dcb && dcb.data() >= commands.data() &&
+                    dcb.data() < commands.data() + commands.size()) {
+                    // The game sets the valid bit in its own buffer later, not in our copy.
+                    rewind = reinterpret_cast<const PM4CmdRewind*>(copy.guest_dcb +
+                                                                   (dcb.data() - commands.data()));
+                }
                 while (!rewind->Valid()) {
                     rasterizer->DrainDrawPipe();
                     YIELD_GFX();
@@ -1398,9 +1408,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             default:
-                LogBadPacket(commands, dcb.data(), commands_hash, trail);
-                UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                                static_cast<u32>(opcode), count);
+                StopAtBadPacket(commands, dcb, commands_hash, trail,
+                                fmt::format("Unknown PM4 type 3 opcode {:#x} with count {}",
+                                            static_cast<u32>(opcode), count));
+                continue;
             }
             if (time_packet) {
                 const auto index = static_cast<size_t>(opcode) & 0xff;
@@ -1811,11 +1822,25 @@ void Liverpool::RetireFrames() {
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
+    // Overlapped frames: the game may reuse a command buffer's memory once the next frame's
+    // submissions start, which can be before the command thread has read it. Each submission gets
+    // a copy of its own then, freed with its task. (Indirect buffers it calls are still read in
+    // place.)
+    static const bool copy_for_overlap =
+        EmulatorSettings.IsThreadedRenderer() && EmulatorSettings.IsBbOverlapFrames();
+    CmdCopy copy{};
+    if (copy_for_overlap) {
+        copy.guest_dcb = dcb.data();
+        copy.words.resize(dcb.size() + ccb.size());
+        std::copy(dcb.begin(), dcb.end(), copy.words.begin());
+        std::copy(ccb.begin(), ccb.end(), copy.words.begin() + dcb.size());
+        dcb = {copy.words.data(), dcb.size()};
+        ccb = {copy.words.data() + dcb.size(), ccb.size()};
+    } else if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
 
-    auto task = ProcessGraphics(dcb, ccb);
+    auto task = ProcessGraphics(dcb, ccb, std::move(copy));
     u64 seq;
     {
         std::scoped_lock lk{submit_mutex};
