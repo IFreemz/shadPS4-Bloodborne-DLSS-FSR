@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -108,6 +109,26 @@ std::mutex exit_mutex{};
 // The window was closed: everything is saved by the time the quick_exit handler has run.
 static bool closing_normally = false;
 
+// Closing the window: each step is logged, and if one hangs (closing with frame generation on once
+// left the game running without input), the process is ended after a while anyway.
+static std::atomic<const char*> exit_step{"starting"};
+static void ExitStep(const char* step) {
+    exit_step = step;
+    if (closing_normally || Core::BbResolution::restarting) {
+        LOG_INFO(Loader, "Exit: {}", step);
+    }
+}
+static void StartExitWatchdog() {
+#ifdef _WIN32
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds{30});
+        LOG_CRITICAL(Loader, "Exit stuck for 30 s at: {}; ending the process", exit_step.load());
+        Common::Log::Flush();
+        TerminateProcess(GetCurrentProcess(), 0);
+    }).detach();
+#endif
+}
+
 #ifdef BB_PGO_GENERATE
 // PGO training build: the profile runtime writes its counters at exit, but the emulator ends
 // with quick_exit (no atexit), so they are written from the quick_exit handler.
@@ -142,14 +163,17 @@ Emulator::Emulator() {
         const bool restarting = Core::BbResolution::restarting;
         // A restart ends the process below without the DLLs' own shutdown, so NGX needs no
         // release first (it waits for the GPU thread, which once took 12 s and stuttered sound).
-        if (!restarting)
+        if (!restarting) {
+            ExitStep("releasing DLSS (again)");
             ShutdownDlss();
+        }
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
 #ifdef _WIN32
         // A restart from F1 or closing the window: end at once. Otherwise the process spends
         // seconds in every loaded DLL's shutdown (driver, NGX, Streamline), and frame generation's
         // DLL crashed in its own, being unloaded without Streamline shut down.
         if (restarting || closing_normally) {
+            ExitStep("ending the process");
             Common::Log::Flush();
             TerminateProcess(GetCurrentProcess(), 0);
         }
@@ -166,13 +190,18 @@ void Emulator::Shutdown() {
         return;
     }
     Common::Log::Flush();
+    ExitStep("stopping the save backup thread");
     Libraries::SaveData::Backup::StopThread();
+    ExitStep("writing the pipeline cache");
     Storage::DataBase::Instance().Close();
+    ExitStep("stopping the play time thread");
     play_time_thread.request_stop();
     if (play_time_thread.joinable()) {
         play_time_thread.join();
     }
+    ExitStep("saving the play time");
     UpdatePlayTime(Common::Singleton<Common::ElfInfo>::Instance()->GameSerial());
+    ExitStep("resetting controller lights");
     if (controllers) {
         controllers->ResetLightbarColors();
         // need to give SDL time to do this before the runtime exits
@@ -900,8 +929,11 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         window->WaitEvent();
     }
 
-    ShutdownDlss();
     closing_normally = true;
+    StartExitWatchdog();
+    ExitStep("releasing DLSS");
+    ShutdownDlss();
+    ExitStep("running the exit handler");
     std::quick_exit(0);
 }
 
