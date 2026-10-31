@@ -213,6 +213,16 @@ Enter work the menus. Every action can be rebound in F1 (click a cell, press the
 sensitivity and invert. F7 turns the mouse camera off and on. Your previous controls are kept:
 **Restore previous controls** puts them back. A controller keeps working alongside.
 
+### Benchmark route
+
+F1 → **Benchmark route** records a route once (the controller, keys and mouse camera) and plays it
+back, so every run repeats the same movement, for before/after comparisons and videos. Press
+**Record route**, close F1 and play the route, then open F1 and press **Stop recording**. To
+replay, go back to the same spot (rest at a lamp or load the same save), press **Play route** and
+close F1. Each replay shows its average FPS, 1% low, worst frame and stutters in F1 and adds them
+to `routes/results.csv` in the user folder; the route is `routes/route.txt`. Loading screens are
+left out of the timing. Routes without enemies repeat best: enemies can act differently each run.
+
 ### HDR with RenoDX
 
 > [!WARNING]

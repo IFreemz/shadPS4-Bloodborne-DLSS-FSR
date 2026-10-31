@@ -30,6 +30,7 @@
 #include "imgui/imgui_layer.h"
 #include "imgui/renderer/imgui_core.h"
 #include "input/bb_kbm.h"
+#include "input/bb_route.h"
 #include "input/controller.h"
 #include "input/input_mouse.h"
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
@@ -917,6 +918,59 @@ void DlssLayer::Draw() {
     }
     if (!kbm_message.empty())
         TextWrapped("%s", kbm_message.c_str());
+
+    SeparatorText("Benchmark route");
+    {
+        namespace Route = ::Input::BbRoute;
+        const auto mode = Route::GetMode();
+        TextWrapped("Record a route once, then play it back to repeat the same movement and "
+                    "measure the frame rate. Start each run from the same spot (rest at a lamp "
+                    "or load the same save). Enemies can act differently each run.");
+        switch (mode) {
+        case Route::Mode::Idle:
+            if (Button("Record route"))
+                Route::StartRecording();
+            if (IsItemHovered())
+                SetTooltip("Records from when F1 is closed. Open F1 again to stop.\nThe "
+                           "controller, keys and mouse camera are recorded; loading screens are "
+                           "left out.");
+            SameLine();
+            BeginDisabled(!Route::HasRoute());
+            if (Button("Play route"))
+                Route::Play();
+            EndDisabled();
+            if (Route::HasRoute()) {
+                SameLine();
+                TextDisabled("(%.0f s recorded)", Route::RouteSeconds());
+            }
+            break;
+        case Route::Mode::Recording:
+            TextColored(RestartColor, "Recording: %.0f s", Route::ElapsedSeconds());
+            SameLine();
+            if (Button("Stop recording"))
+                Route::StopRecording();
+            break;
+        case Route::Mode::Armed:
+            TextColored(RestartColor, "Close F1 to start the replay");
+            SameLine();
+            if (Button("Cancel"))
+                Route::Stop();
+            break;
+        case Route::Mode::Playing:
+            TextColored(RestartColor, "Playing: %.0f of %.0f s", Route::ElapsedSeconds(),
+                        Route::RouteSeconds());
+            SameLine();
+            if (Button("Stop"))
+                Route::Stop();
+            break;
+        }
+        if (const auto r = Route::LastResult(); r.valid) {
+            Text("Last replay: %.1f FPS average, %.1f FPS 1%% low, worst frame %.1f ms, %u "
+                 "stutters",
+                 r.average_fps, r.low_fps, r.worst_ms, r.stutters);
+            TextDisabled("(each replay is added to routes/results.csv in the user folder)");
+        }
+    }
 
     SeparatorText("Recommended game patches");
     if (!patches.file_found) {

@@ -9,6 +9,7 @@
 #include "core/libraries/pad/pad_errors.h"
 #include "core/user_settings.h"
 #include "imgui/renderer/imgui_core.h"
+#include "input/bb_route.h"
 #include "input/controller.h"
 #include "pad.h"
 
@@ -425,6 +426,7 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[i].connectedCount = states[i].connected_count;
         pData[i].deviceUniqueDataLen = 0;
     }
+    Input::BbRoute::OnPadRead(pData, num, gamepad_input_intercepted);
 
     return num;
 }

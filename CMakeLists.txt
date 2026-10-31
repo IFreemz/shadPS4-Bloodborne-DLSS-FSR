@@ -1372,6 +1372,8 @@ set(INPUT src/input/controller.cpp
           src/core/bb_resolution.h
           src/input/bb_kbm.cpp
           src/input/bb_kbm.h
+          src/input/bb_route.cpp
+          src/input/bb_route.h
           src/input/input_mouse.cpp
           src/input/input_mouse.h
 )

@@ -30,6 +30,7 @@
 #include "imgui/friends_layer.h"
 #include "imgui/renderer/imgui_core.h"
 #include "input/bb_kbm.h"
+#include "input/bb_route.h"
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
@@ -253,7 +254,8 @@ void WindowSDL::WaitEvent() {
     // Bloodborne's native mouse camera: every motion event as it arrives (the mouse timer below
     // runs every 33 ms, which turned the camera on one frame in three at 90 fps).
     if (event.type == SDL_EVENT_MOUSE_MOTION &&
-        Input::GetMouseMode() == Input::MouseMode::Joystick && Core::BbMouseCamera::Installed()) {
+        Input::GetMouseMode() == Input::MouseMode::Joystick && Core::BbMouseCamera::Installed() &&
+        Input::BbRoute::OnMouseMotion(event.motion.xrel, event.motion.yrel)) {
         Core::BbMouseCamera::AddMotion(event.motion.xrel, event.motion.yrel);
     }
     if (ImGui::Core::ProcessEvent(&event)) {

@@ -13,6 +13,7 @@
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
 #include "core/platform.h"
+#include "input/bb_route.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -162,6 +163,7 @@ s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode
         LOG_ERROR(Lib_VideoOut, "Invalid handle = {}", handle);
         return ORBIS_VIDEO_OUT_ERROR_INVALID_HANDLE;
     }
+    Input::BbRoute::OnGameFrame();
 
     if (flipMode != 1) {
         LOG_WARNING(Lib_VideoOut, "flipmode = {}", flipMode);
