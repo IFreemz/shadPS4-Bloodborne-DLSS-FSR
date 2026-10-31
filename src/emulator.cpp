@@ -105,6 +105,8 @@ void ShutdownDlss() {
 } // namespace
 
 std::mutex exit_mutex{};
+// The window was closed: everything is saved by the time the quick_exit handler has run.
+static bool closing_normally = false;
 
 #ifdef BB_PGO_GENERATE
 // PGO training build: the profile runtime writes its counters at exit, but the emulator ends
@@ -144,10 +146,13 @@ Emulator::Emulator() {
             ShutdownDlss();
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
 #ifdef _WIN32
-        // A restart from F1: end at once. A normal exit then spends seconds in every loaded
-        // DLL's shutdown (driver, NGX, Streamline) while the new process waits for this one.
-        if (restarting)
+        // A restart from F1 or closing the window: end at once. Otherwise the process spends
+        // seconds in every loaded DLL's shutdown (driver, NGX, Streamline), and frame generation's
+        // DLL crashed in its own, being unloaded without Streamline shut down.
+        if (restarting || closing_normally) {
+            Common::Log::Flush();
             TerminateProcess(GetCurrentProcess(), 0);
+        }
 #endif
     });
 }
@@ -896,6 +901,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     ShutdownDlss();
+    closing_normally = true;
     std::quick_exit(0);
 }
 
