@@ -173,10 +173,12 @@ bool Swapchain::AcquireNextImage() {
     switch (result) {
     case vk::Result::eSuccess:
         break;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
     case vk::Result::eErrorFullScreenExclusiveModeLostEXT:
         exclusive_held = false;
         needs_recreation = true;
         break;
+#endif
     case vk::Result::eSuboptimalKHR:
     case vk::Result::eErrorSurfaceLostKHR:
     case vk::Result::eErrorOutOfDateKHR:
@@ -213,9 +215,11 @@ bool Swapchain::Present() {
                       : instance.GetPresentQueue().presentKHR(present_info);
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
     } else if (result == vk::Result::eErrorFullScreenExclusiveModeLostEXT) {
         exclusive_held = false;
         needs_recreation = true;
+#endif
     } else if (result != vk::Result::eSuccess && FrameGen::Active()) {
         // Streamline presents asynchronously and reports a failed present on a later one.
         LOG_WARNING(Render_Vulkan, "Swapchain presentation returned {}", vk::to_string(result));
