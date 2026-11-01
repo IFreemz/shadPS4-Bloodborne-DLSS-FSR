@@ -96,8 +96,7 @@ struct CmdFrameTiming {
             Reset();
             return;
         }
-        const double ms =
-            std::chrono::duration<double, std::milli>(now - frame_start).count();
+        const double ms = std::chrono::duration<double, std::milli>(now - frame_start).count();
         if (ms > 1000.0) {
             // Stutter detail was off in between: start a fresh frame.
             for (size_t i = 0; i < last_opcode_ns.size(); ++i) {
@@ -135,9 +134,9 @@ struct CmdFrameTiming {
             std::ranges::sort(ops, std::greater<>{});
             std::string ce_ops;
             for (size_t i = 0; i < 4 && ops[i].first >= 50'000; ++i) {
-                ce_ops += fmt::format("{}{:#x} {:.1f} ({})", ce_ops.empty() ? "" : ", ",
-                                      ops[i].second, ops[i].first / 1e6,
-                                      ce_op_count[ops[i].second]);
+                ce_ops +=
+                    fmt::format("{}{:#x} {:.1f} ({})", ce_ops.empty() ? "" : ", ", ops[i].second,
+                                ops[i].first / 1e6, ce_op_count[ops[i].second]);
             }
             const auto text = fmt::format(
                 "Command thread frame {:.1f} ms (usual {:.1f}): graphics tasks {:.1f} in {} runs "
@@ -308,7 +307,8 @@ void Liverpool::ProcessCeQueue() {
         task = ce_submits.front();
     }
     const bool timed = CmdFrameTiming::On();
-    const auto ce_start = timed ? CmdFrameTiming::Clock::now() : CmdFrameTiming::Clock::time_point{};
+    const auto ce_start =
+        timed ? CmdFrameTiming::Clock::now() : CmdFrameTiming::Clock::time_point{};
     task.resume();
     if (timed) {
         const u64 ce_ns = CmdFrameTiming::Since(ce_start);
@@ -363,8 +363,8 @@ void Liverpool::Process(std::stop_token stoken) {
         {
             set_state(CmdState::Idle);
             const bool idle_timed = CmdFrameTiming::On();
-            const auto idle_start = idle_timed ? CmdFrameTiming::Clock::now()
-                                               : CmdFrameTiming::Clock::time_point{};
+            const auto idle_start =
+                idle_timed ? CmdFrameTiming::Clock::now() : CmdFrameTiming::Clock::time_point{};
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken, [this] {
                 return num_commands || num_submits || submit_done || !frame_ends.empty();
@@ -400,8 +400,8 @@ void Liverpool::Process(std::stop_token stoken) {
                 task = queue.submits.front();
             }
             const bool task_timed = CmdFrameTiming::On();
-            const auto task_start = task_timed ? CmdFrameTiming::Clock::now()
-                                               : CmdFrameTiming::Clock::time_point{};
+            const auto task_start =
+                task_timed ? CmdFrameTiming::Clock::now() : CmdFrameTiming::Clock::time_point{};
             const bool gfx_task = curr_qid == GfxQueueId;
             cmd_frame.in_gfx = gfx_task;
             task.resume();
@@ -533,12 +533,11 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, CmdCopy cop
         // already reuse the buffer.
         const u32 packet_words = header->type3.NumWords() + 1;
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
-        const bool time_ce_op = CmdFrameTiming::On() &&
-                                opcode != PM4ItOpcode::WaitOnDeCounterDiff &&
-                                opcode != PM4ItOpcode::IndirectBufferConst &&
-                                opcode != PM4ItOpcode::Rewind;
-        const auto ce_op_start = time_ce_op ? CmdFrameTiming::Clock::now()
-                                            : CmdFrameTiming::Clock::time_point{};
+        const bool time_ce_op =
+            CmdFrameTiming::On() && opcode != PM4ItOpcode::WaitOnDeCounterDiff &&
+            opcode != PM4ItOpcode::IndirectBufferConst && opcode != PM4ItOpcode::Rewind;
+        const auto ce_op_start =
+            time_ce_op ? CmdFrameTiming::Clock::now() : CmdFrameTiming::Clock::time_point{};
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             // const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -635,8 +634,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, CmdCopy cop
             if (copy.guest && ccb.data() >= copy.words.data() &&
                 ccb.data() < copy.words.data() + copy.words.size()) {
                 // The game sets the valid bit in its own buffer later, not in our copy.
-                rewind = reinterpret_cast<const PM4CmdRewind*>(
-                    copy.guest + (ccb.data() - copy.words.data()));
+                rewind = reinterpret_cast<const PM4CmdRewind*>(copy.guest +
+                                                               (ccb.data() - copy.words.data()));
             }
             while (!rewind->Valid()) {
                 YIELD_CE();

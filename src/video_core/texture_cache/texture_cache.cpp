@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
 #include <iterator>
-#include <algorithm>
 #include <limits>
 #include <map>
 #include <optional>
@@ -201,8 +201,7 @@ bool TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
 
     tile_manager.TileImage(image, buffer_copies, download.buffer, download.offset);
 
-    const auto write_data = [this, image_addr, copy_size, download, discard_buffer_cache,
-                             is_sync] {
+    const auto write_data = [this, image_addr, copy_size, download, discard_buffer_cache, is_sync] {
         download.Invalidate();
         const bool written = Core::Memory::Instance()->TryWriteBacking(
             std::bit_cast<u8*>(image_addr), download.mapped, copy_size);
@@ -1757,15 +1756,16 @@ void TextureCache::TrackImage(ImageId image_id, ProtectRanges* deferred) {
 
     std::scoped_lock lk{image.mutex};
     if (image.IsUntracked()) {
-        page_manager.UpdatePageWatchers(image_begin, image.info.guest_size, PageOp::Track, deferred);
+        page_manager.UpdatePageWatchers(image_begin, image.info.guest_size, PageOp::Track,
+                                        deferred);
     } else {
         if (image_begin < image.track_addr) {
-            page_manager.UpdatePageWatchers(image_begin, image.track_addr - image_begin, PageOp::Track,
-                                       deferred);
+            page_manager.UpdatePageWatchers(image_begin, image.track_addr - image_begin,
+                                            PageOp::Track, deferred);
         }
         if (image.track_addr_end < image_end) {
             page_manager.UpdatePageWatchers(image.track_addr_end, image_end - image.track_addr_end,
-                                       PageOp::Track, deferred);
+                                            PageOp::Track, deferred);
         }
     }
     image.track_addr = image_begin;

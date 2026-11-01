@@ -278,7 +278,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         if (for_game_thread && EarlyWriteback()) {
             MarkHot(window_start, window_end - window_start);
         }
-        const bool downloaded = DownloadMemory(arena, window_start, window_end - window_start, async);
+        const bool downloaded =
+            DownloadMemory(arena, window_start, window_end - window_start, async);
         readback_context.active = false;
         if (!downloaded) {
             LOG_WARNING(Render, "Guest buffer readback failed; retaining GPU-modified state");
@@ -582,8 +583,9 @@ bool BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
             download.buffer->Invalidate(download.offset, download.size);
             for (const auto& copy : copies) {
                 auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-                if (!memory->TryWriteBacking(
-                        dst_addr, download.mapped + (copy.dstOffset - download.offset), copy.size)) {
+                if (!memory->TryWriteBacking(dst_addr,
+                                             download.mapped + (copy.dstOffset - download.offset),
+                                             copy.size)) {
                     LOG_WARNING(Render, "Asynchronous guest buffer readback failed at {:#x}",
                                 arena_base + copy.srcOffset);
                 }
