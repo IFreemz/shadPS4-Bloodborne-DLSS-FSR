@@ -8,11 +8,14 @@ namespace Shader::Backend::SPIRV {
 
 Id Decorate(EmitContext& ctx, IR::Inst* inst, Id op) {
     // A pixel shader's arithmetic is the driver's to fuse unless it writes depth
-    // (Profile::fragment_fp_contraction).
-    if (ctx.fp_contraction) {
-        return op;
+    // (Profile::fragment_fp_contraction). With fast_shader_math, pixel and compute shaders are;
+    // pre-rasterization stages keep it, so position math stays the same across pipelines.
+    const bool can_contract =
+        ctx.fp_contraction || (ctx.profile.fast_shader_math && (ctx.sw_stage == SwStage::Fragment ||
+                                                                ctx.sw_stage == SwStage::Compute));
+    if (!can_contract) {
+        ctx.Decorate(op, spv::Decoration::NoContraction);
     }
-    ctx.Decorate(op, spv::Decoration::NoContraction);
     return op;
 }
 

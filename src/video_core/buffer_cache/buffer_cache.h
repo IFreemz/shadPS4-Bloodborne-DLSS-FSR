@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <boost/container/small_vector.hpp>
 
+#include "common/enum.h"
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -21,6 +22,7 @@
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/texture_cache/image.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -35,6 +37,7 @@ class GraphicsPipeline;
 struct SubmitInfo;
 class Runtime;
 class StagingBufferPool;
+struct StagingBufferRef;
 } // namespace Vulkan
 
 namespace VideoCore {
@@ -42,6 +45,15 @@ namespace VideoCore {
 class TextureCache;
 class MemoryTracker;
 class PageManager;
+
+enum class ObtainBufferFlags {
+    None = 0,
+    IsWritten = 1 << 0,
+    IsTexelBuffer = 1 << 1,
+    IgnoreStreamBuffer = 1 << 2,
+    InvalidateTextureCache = 1 << 3,
+};
+DECLARE_ENUM_FLAG_OPERATORS(ObtainBufferFlags)
 
 class BufferCache {
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
@@ -105,8 +117,15 @@ public:
     /// window around it (see RegionManager::ExtendWriteFault).
     void ExtendWriteFault(VAddr device_addr);
 
+    /// Unmark a region as modified from the GPU.
+    void UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write = false);
+
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
-    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
+    void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool async = false,
+                    bool assume_locks = false);
+
+    /// Flushes GPU modified ranges of the uncovered part of the edge pages of an image.
+    void ReadEdgeImagePages(const Image& image);
 
     /// Diagnostics: GPU readbacks since the last call (where, who, how long, and whether the
     /// GPU work that wrote the data had been submitted or had finished), logged every 10 s.
@@ -141,12 +160,10 @@ public:
     void WriteBack(const PendingWriteback& writeback);
 
     /// Finds a buffer for the specified region.
-    /// allow_stream false: a small read-only region still comes from the buffer itself, not a
+    /// IgnoreStreamBuffer: a small read-only region still comes from the buffer itself, not a
     /// snapshot of guest memory in the stream buffer.
-    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
-                                                             bool is_written,
-                                                             bool is_texel_buffer = false,
-                                                             bool allow_stream = true);
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(
+        VAddr device_addr, u32 size, ObtainBufferFlags flags = ObtainBufferFlags::None);
 
     /// Vertex and index data: like ObtainBuffer(read-only), but with the threaded renderer a
     /// clean range of 1 KiB or more is used where it is in the arena instead of being copied
@@ -171,6 +188,9 @@ public:
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
+
+    /// Mark region as modified from the GPU
+    void MarkRegionAsGpuModified(VAddr addr, size_t size);
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
@@ -227,7 +247,9 @@ private:
     /// whatever the VRAM use. False when it couldn't run yet (binds still pending).
     bool GarbageCollectResidentMemory(bool load_screen = false);
 
-    bool DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    /// async: the copy reaches guest memory once the GPU has run it, without waiting. False when
+    /// a synchronous download could not be written back (the GPU-modified state is kept).
+    bool DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);

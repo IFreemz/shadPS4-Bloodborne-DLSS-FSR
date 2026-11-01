@@ -357,6 +357,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
         .fragment_fp_contraction = EmulatorSettings.IsBbFastPixelMath(),
         .hardware_interpolation = EmulatorSettings.IsBbHardwareInterpolation(),
+        .fast_shader_math = EmulatorSettings.IsFastShaderMath(),
+        .support_bda = instance_.IsBufferDeviceAddressSupported(),
     };
     LOG_INFO(Render_Vulkan, "Pixel shader float math: {}",
              profile.fragment_fp_contraction ? "fused by the driver (fast pixel math)"

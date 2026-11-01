@@ -90,6 +90,13 @@ public:
         VideoOut,
     };
 
+    enum class DownloadMemoryFlags : u32 {
+        None = 0,
+        Sync = 1 << 0,
+        Priority = 1 << 1,
+        DiscardBufferCache = 1 << 2,
+    };
+
     struct ImageDesc {
         ImageInfo info;
         ImageViewInfo view_info;
@@ -114,7 +121,7 @@ public:
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                  Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool, BufferCache& buffer_cache,
-                 PageManager& tracker);
+                 PageManager& page_manager);
     ~TextureCache();
 
     TileManager& GetTileManager() noexcept {
@@ -126,6 +133,9 @@ public:
 
     /// Marks an image as dirty if it exists at the provided address.
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+
+    /// Marks all images as maybe GPU dirty within the provided range.
+    void MarkAsMaybeGpuDirty(VAddr addr, size_t size);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
@@ -546,7 +556,8 @@ private:
     }
 
     /// Copies image memory back to CPU.
-    bool DownloadImageMemory(ImageId image_id, bool sync = false);
+    bool DownloadImageMemory(ImageId image_id,
+                             DownloadMemoryFlags flags = DownloadMemoryFlags::None);
 
     /// VRAM cleanup: synchronously writes an image back to guest memory before it is freed.
     bool BeginWriteBack(ImageId image_id);
@@ -569,6 +580,9 @@ private:
     void UntrackImage(ImageId image_id);
     void UntrackImageHead(ImageId image_id);
     void UntrackImageTail(ImageId image_id);
+
+    /// Marks the image CPU dirty if the guest wrote to its untracked head or tail page.
+    void MarkDirtyIfEdgesModified(Image& image);
 
     void MarkAsMaybeDirty(ImageId image_id, Image& image);
 
@@ -615,7 +629,7 @@ private:
     Vulkan::Runtime& runtime;
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
-    PageManager& tracker;
+    PageManager& page_manager;
     PageTable page_table;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
@@ -723,5 +737,6 @@ private:
     std::mutex download_images_mutex;
     absl::flat_hash_map<VAddr, MetaDataInfo> surface_metas;
 };
+DECLARE_ENUM_FLAG_OPERATORS(TextureCache::DownloadMemoryFlags)
 
 } // namespace VideoCore

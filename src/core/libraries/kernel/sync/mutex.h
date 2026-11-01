@@ -77,7 +77,7 @@ public:
             }
             const auto now = Clock::now();
             if (abs_time <= now) {
-                return false;
+                return try_lock();
             }
             const auto rel_ms = std::chrono::ceil<std::chrono::milliseconds>(abs_time - now);
             Wait(static_cast<u32>(std::min<s64>(static_cast<s64>(rel_ms.count()), 0x7FFFFFFF)));

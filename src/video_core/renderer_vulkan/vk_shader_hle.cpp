@@ -432,9 +432,10 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         }
 
         // Obtain buffers for the total source and destination ranges.
-        const auto [src_buf, src_buf_offset] =
-            buffer_cache.ObtainBuffer(src_buf_sharp.base_address + src_offset_min,
-                                      src_offset_max - src_offset_min, false, false, allow_stream);
+        const auto [src_buf, src_buf_offset] = buffer_cache.ObtainBuffer(
+            src_buf_sharp.base_address + src_offset_min, src_offset_max - src_offset_min,
+            allow_stream ? VideoCore::ObtainBufferFlags::None
+                         : VideoCore::ObtainBufferFlags::IgnoreStreamBuffer);
         if (diagnostics) {
             Count(copy_stats.gpu_batches);
             if (src_buf == &buffer_cache.GetStreamBuffer()) {
@@ -442,8 +443,11 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
                 Count(copy_stats.stream_bytes, src_offset_max - src_offset_min);
             }
         }
+        // The whole destination span counts as GPU-written, as before 0.21.0 (which marks each
+        // copy's bytes only): batches copied on the CPU leave gaps that must not be marked.
         const auto [dst_buf, dst_buf_offset] = buffer_cache.ObtainBuffer(
-            dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min, true);
+            dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min,
+            VideoCore::ObtainBufferFlags::IsWritten);
 
         // Apply found buffer base.
         for (auto& c : std::span{copies}.subspan(batch_start, batch_end - batch_start)) {
