@@ -83,6 +83,10 @@ jobs:
   windows-sdl:
     runs-on: windows-2025-vs2026
     needs: get-info
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
     - uses: actions/checkout@v6
       with:
@@ -155,8 +159,146 @@ jobs:
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $env:NUMBER_OF_PROCESSORS
 
+    - name: Attest
+      if: github.event_name != 'pull_request'
+      uses: actions/attest-build-provenance@v4
+      with:
+        subject-path: ${{github.workspace}}/build/shadPS4.exe
+
     - name: Upload Windows SDL artifact
       uses: actions/upload-artifact@v7
       with:
         name: shadPS4-exe-only-win64-${{ needs.get-info.outputs.shorthash }}${{ steps.pgo.outputs.suffix }}
         path: ${{github.workspace}}/build/shadPS4.exe
+
+  linux:
+    runs-on: ubuntu-24.04
+    needs: get-info
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    # Clang 19 and libstdc++ 14 (std::ranges::to), the emulator's dependencies, and SDL's for
+    # X11 and Wayland windows.
+    - name: Install
+      run: |
+        sudo apt update
+        sudo apt install -y clang-19 clang-tools-19 libstdc++-14-dev ninja-build \
+          libasound2-dev libpulse-dev libopenal-dev libssl-dev zlib1g-dev libedit-dev \
+          libudev-dev libevdev-dev libjack-dev libsndio-dev libvulkan-dev libpng-dev \
+          libusb-1.0-0-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+          libxss-dev libxtst-dev libxfixes-dev libxkbcommon-dev libwayland-dev \
+          wayland-protocols libdecor-0-dev libdrm-dev libgbm-dev libegl-dev libgl-dev
+
+    - name: Cache CMake Build
+      uses: hendrikmuhs/ccache-action@v1.2.21
+      env:
+          cache-name: ${{ runner.os }}-sdl-cache-cmake-build
+      with:
+        append-timestamp: false
+        key: ${{ env.cache-name }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+    # The SDKs the upscaler libraries are built from, at the versions they were tested with.
+    - name: Get DLSS SDK
+      uses: actions/checkout@v6
+      with:
+        repository: NVIDIA/DLSS
+        ref: v310.9.16
+        path: sdk/dlss
+        sparse-checkout: |
+          include
+          lib/Linux_x86_64/rel
+
+    - name: Get FidelityFX SDK
+      uses: actions/checkout@v6
+      with:
+        repository: GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+        ref: v1.1.4
+        path: sdk/ffx
+        sparse-checkout: |
+          ffx-api
+          sdk/src/backends/vk/FrameInterpolationSwapchain
+
+    - name: Get FSR-Vulkan
+      uses: actions/checkout@v6
+      with:
+        repository: FireBurn/FSR-Vulkan
+        ref: 69fecd7c477a87aff148d41d3b454cb40295f154
+        path: sdk/fsr-vulkan
+
+    - name: Get FSR 4 model files
+      uses: actions/checkout@v6
+      with:
+        repository: FireBurn/Q2RTX
+        ref: ae8d628fae208813172446d1e49ed94150b04658
+        path: sdk/q2rtx
+        sparse-checkout: baseq2/fsr4_shaders
+
+    - name: Configure CMake
+      run: cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19 -DCMAKE_CXX_COMPILER_CLANG_SCAN_DEPS=clang-scan-deps-19 -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+    - name: Build
+      run: cmake --build build --parallel $(nproc)
+
+    - name: Build upscaler libraries
+      run: |
+        set -e
+        common="-G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-19 -DCMAKE_CXX_COMPILER=clang++-19"
+        cmake -S dlss_bridge -B build-dlss $common -DDLSS_SDK_ROOT=$PWD/sdk/dlss
+        cmake --build build-dlss
+        cmake -S fsr3_linux -B build-fsr3 $common -DFFX_SDK_ROOT=$PWD/sdk/ffx -DFSR_VULKAN_ROOT=$PWD/sdk/fsr-vulkan
+        cmake --build build-fsr3
+        cmake -S fsr4_addon -B build-fsr4 $common -DFSR_VULKAN_ROOT=$PWD/sdk/fsr-vulkan
+        cmake --build build-fsr4
+
+    # A folder like the Windows release: the emulator with the upscaler libraries next to it, and
+    # the FSR 4 add-on as its own download (its fsr4 folder goes next to shadps4).
+    - name: Package
+      run: |
+        set -e
+        name=shadPS4-Bloodborne-linux-x64-${{ needs.get-info.outputs.shorthash }}
+        mkdir -p pkg/main/LICENSES pkg/addon/fsr4
+        cp build/shadps4 build-dlss/shadps4_dlss.so build-fsr3/libamd_fidelityfx_vk.so pkg/main/
+        cp sdk/dlss/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.* pkg/main/
+        strip pkg/main/shadps4
+        strip --strip-unneeded pkg/main/shadps4_dlss.so pkg/main/libamd_fidelityfx_vk.so
+        cp LICENSE pkg/main/LICENSES/shadPS4-GPL-2.0.txt
+        cp dlss_bridge/LICENSE.txt pkg/main/LICENSES/dlss_bridge-MIT.txt
+        cp sdk/dlss/LICENSE.txt pkg/main/LICENSES/NVIDIA-DLSS-SDK.txt
+        cp sdk/ffx/LICENSE.txt pkg/main/LICENSES/AMD-FidelityFX-SDK-MIT.txt
+        cp sdk/fsr-vulkan/LICENSE.txt pkg/main/LICENSES/FSR-Vulkan-MIT.txt
+        models=sdk/q2rtx/baseq2/fsr4_shaders
+        cp build-fsr4/shadps4_fsr4.so pkg/addon/fsr4/
+        strip --strip-unneeded pkg/addon/fsr4/shadps4_fsr4.so
+        cp $models/fsr4_model_v07_i8_* $models/rcas.spv $models/spd_auto_exposure.spv \
+          $models/LICENSE-FSR4-v07.txt pkg/addon/fsr4/
+        cp sdk/fsr-vulkan/LICENSE.txt pkg/addon/fsr4/LICENSE-FSR-Vulkan.txt
+        cp LICENSE pkg/addon/fsr4/LICENSE-shadps4_fsr4-GPL-2.0.txt
+        tar -C pkg/main -cJf $name.tar.xz .
+        tar -C pkg/addon -cJf shadPS4-Bloodborne-FSR4-addon-linux-x64-${{ needs.get-info.outputs.shorthash }}.tar.xz fsr4
+        echo "name=$name" >> $GITHUB_ENV
+
+    # Records that these files were built by this workflow from this commit, which anyone can
+    # check with: gh attestation verify <file> --repo <owner>/<repo>
+    - name: Attest
+      if: github.event_name != 'pull_request'
+      uses: actions/attest-build-provenance@v4
+      with:
+        subject-path: shadPS4-Bloodborne-*linux-x64-*.tar.xz
+
+    - name: Upload Linux artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.name }}
+        path: shadPS4-Bloodborne-linux-x64-*.tar.xz
+
+    - name: Upload Linux FSR 4 add-on
+      uses: actions/upload-artifact@v7
+      with:
+        name: shadPS4-Bloodborne-FSR4-addon-linux-x64-${{ needs.get-info.outputs.shorthash }}
+        path: shadPS4-Bloodborne-FSR4-addon-linux-x64-*.tar.xz
