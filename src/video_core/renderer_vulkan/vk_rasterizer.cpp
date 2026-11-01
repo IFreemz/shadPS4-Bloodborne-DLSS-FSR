@@ -1319,6 +1319,13 @@ void Rasterizer::OnSubmissionDecoded() {
     if (!buffer_cache.EarlyWriteback()) {
         return;
     }
+    // Only while the draw recorder has nothing queued: draining it here made the GPU command
+    // thread wait for every queued draw mid-frame, so the two threads stopped overlapping (frames
+    // ~10 ms longer for as long as some memory stayed hot, seconds of judder). With draws queued,
+    // the early flush waits for a later submission and the write-backs for the frame's end.
+    if (draw_pipe && !draw_pipe->Idle()) {
+        return;
+    }
     if (buffer_cache.TakeWritebackFlush()) {
         Flush();
     }
@@ -1341,6 +1348,12 @@ void Rasterizer::OnSubmit() {
     ++stat_frames;
     occlusion_frame.fetch_add(1, std::memory_order_relaxed);
     DrainDrawPipe();
+    // Early write-back: the frame's finished copies, now that the draw recorder is idle anyway.
+    if (buffer_cache.EarlyWriteback()) {
+        for (const auto& writeback : buffer_cache.TakeFinishedWritebacks()) {
+            buffer_cache.WriteBack(writeback);
+        }
+    }
     // F1's Object motion vectors: the velocity draws are replayed only while an upscaler uses them.
     velocity_mirror.SetEnabled(temporal_dlss.ObjectMotionRequested());
     if (draw_pipe) {

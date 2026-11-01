@@ -532,7 +532,7 @@ struct GPUSettings {
     // Threaded renderer: memory a game thread had to wait for a GPU readback of is sent to the GPU
     // as soon as GPU work writes it again, and copied back once the GPU has finished, so the
     // game's next write does not wait. Off: read back only when the game touches it, as before.
-    Setting<bool> bb_early_writeback{true};
+    Setting<bool> bb_early_writeback{false};
     // Threaded renderer: occlusion query results written in order with the queued draws. Off:
     // the decoding thread waits for every queued draw first, as before.
     Setting<bool> bb_occlusion_in_order{true};

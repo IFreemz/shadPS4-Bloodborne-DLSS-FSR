@@ -64,6 +64,109 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
+namespace {
+// Command thread frame timing (Stutter detail): where the GPU command thread's time goes between
+// two flips, including what the per-packet timing doesn't see (the constant engine, which runs
+// as its own task, and the command loop around the tasks). Only touched on the command thread;
+// no timestamps are taken while Stutter detail is off.
+struct CmdFrameTiming {
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point frame_start{};
+    u64 gfx_ns{}, ce_ns{}, ce_in_gfx_ns{}, asc_ns{}, idle_ns{};
+    u32 gfx_runs{}, ce_runs{}, frames{}, reports{};
+    bool in_gfx{}, flip_seen{};
+    double avg_ms{};
+    std::array<u64, 256> ce_op_ns{};
+    std::array<u32, 256> ce_op_count{};
+    std::array<u64, 256> last_opcode_ns{};
+
+    static bool On() noexcept {
+        return Common::GuestStats::detail_timing.load(std::memory_order_relaxed);
+    }
+
+    static u64 Since(Clock::time_point start) {
+        return static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+    }
+
+    void Report() {
+        const auto now = Clock::now();
+        if (frame_start == Clock::time_point{}) {
+            frame_start = now;
+            Reset();
+            return;
+        }
+        const double ms =
+            std::chrono::duration<double, std::milli>(now - frame_start).count();
+        if (ms > 1000.0) {
+            // Stutter detail was off in between: start a fresh frame.
+            for (size_t i = 0; i < last_opcode_ns.size(); ++i) {
+                last_opcode_ns[i] =
+                    Common::GuestStats::cmd_opcode_ns[i].load(std::memory_order_relaxed);
+            }
+            frame_start = now;
+            Reset();
+            return;
+        }
+        u64 packet_ns = 0;
+        for (size_t i = 0; i < last_opcode_ns.size(); ++i) {
+            const u64 v = Common::GuestStats::cmd_opcode_ns[i].load(std::memory_order_relaxed);
+            packet_ns += v >= last_opcode_ns[i] ? v - last_opcode_ns[i] : v;
+            last_opcode_ns[i] = v;
+        }
+        const bool slow = frames > 60 && ms > std::max(1.4 * avg_ms, avg_ms + 5.0);
+        if (!slow && ms < 250.0) {
+            avg_ms = frames == 0 ? ms : avg_ms * 0.95 + ms * 0.05;
+        }
+        ++frames;
+        if ((slow && reports < 400) || frames % 600 == 0) {
+            if (slow) {
+                ++reports;
+            }
+            const double gfx = (gfx_ns - std::min(gfx_ns, ce_in_gfx_ns)) / 1e6;
+            const double ce = ce_ns / 1e6;
+            const double asc = asc_ns / 1e6;
+            const double idle = idle_ns / 1e6;
+            const double packets = packet_ns / 1e6;
+            std::array<std::pair<u64, size_t>, 256> ops{};
+            for (size_t i = 0; i < ops.size(); ++i) {
+                ops[i] = {ce_op_ns[i], i};
+            }
+            std::ranges::sort(ops, std::greater<>{});
+            std::string ce_ops;
+            for (size_t i = 0; i < 4 && ops[i].first >= 50'000; ++i) {
+                ce_ops += fmt::format("{}{:#x} {:.1f} ({})", ce_ops.empty() ? "" : ", ",
+                                      ops[i].second, ops[i].first / 1e6,
+                                      ce_op_count[ops[i].second]);
+            }
+            const auto text = fmt::format(
+                "Command thread frame {:.1f} ms (usual {:.1f}): graphics tasks {:.1f} in {} runs "
+                "(timed packets {:.1f}, outside packets {:.1f}) | constant engine {:.1f} in {} "
+                "runs, {:.1f} of it inside graphics; by opcode: {} | compute queues {:.1f} | "
+                "idle {:.1f} | command loop outside tasks {:.1f}",
+                ms, avg_ms, gfx, gfx_runs, packets, std::max(0.0, gfx - packets), ce, ce_runs,
+                ce_in_gfx_ns / 1e6, ce_ops.empty() ? "-" : ce_ops, asc, idle,
+                std::max(0.0, ms - gfx - ce - asc - idle));
+            if (slow) {
+                LOG_WARNING(Render, "{}", text);
+            } else {
+                LOG_INFO(Render, "{}", text);
+            }
+        }
+        frame_start = now;
+        Reset();
+    }
+
+    void Reset() {
+        gfx_ns = ce_ns = ce_in_gfx_ns = asc_ns = idle_ns = 0;
+        gfx_runs = ce_runs = 0;
+        ce_op_ns.fill(0);
+        ce_op_count.fill(0);
+    }
+};
+CmdFrameTiming cmd_frame;
+} // namespace
+
 // Threaded renderer: graphics packets that leave the draws queued for the draw recording thread.
 // Every other packet runs after that thread has run dry (DrainDrawPipe), as without it. Draws
 // and dispatches decide in the rasterizer; some of the packets below drain in their handlers
@@ -204,7 +307,17 @@ void Liverpool::ProcessCeQueue() {
         }
         task = ce_submits.front();
     }
+    const bool timed = CmdFrameTiming::On();
+    const auto ce_start = timed ? CmdFrameTiming::Clock::now() : CmdFrameTiming::Clock::time_point{};
     task.resume();
+    if (timed) {
+        const u64 ce_ns = CmdFrameTiming::Since(ce_start);
+        cmd_frame.ce_ns += ce_ns;
+        ++cmd_frame.ce_runs;
+        if (cmd_frame.in_gfx) {
+            cmd_frame.ce_in_gfx_ns += ce_ns;
+        }
+    }
     if (task.done()) {
         task.destroy();
         std::scoped_lock lock{queue.m_access};
@@ -249,10 +362,16 @@ void Liverpool::Process(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
         {
             set_state(CmdState::Idle);
+            const bool idle_timed = CmdFrameTiming::On();
+            const auto idle_start = idle_timed ? CmdFrameTiming::Clock::now()
+                                               : CmdFrameTiming::Clock::time_point{};
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken, [this] {
                 return num_commands || num_submits || submit_done || !frame_ends.empty();
             });
+            if (idle_timed) {
+                cmd_frame.idle_ns += CmdFrameTiming::Since(idle_start);
+            }
             set_state(CmdState::Work);
         }
         if (stoken.stop_requested()) {
@@ -280,7 +399,27 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
+            const bool task_timed = CmdFrameTiming::On();
+            const auto task_start = task_timed ? CmdFrameTiming::Clock::now()
+                                               : CmdFrameTiming::Clock::time_point{};
+            const bool gfx_task = curr_qid == GfxQueueId;
+            cmd_frame.in_gfx = gfx_task;
             task.resume();
+            cmd_frame.in_gfx = false;
+            if (task_timed) {
+                if (gfx_task) {
+                    cmd_frame.gfx_ns += CmdFrameTiming::Since(task_start);
+                    ++cmd_frame.gfx_runs;
+                } else {
+                    cmd_frame.asc_ns += CmdFrameTiming::Since(task_start);
+                }
+            }
+            if (cmd_frame.flip_seen) {
+                cmd_frame.flip_seen = false;
+                if (task_timed) {
+                    cmd_frame.Report();
+                }
+            }
 
             if (task.done()) {
                 // Threaded renderer: the next submission is decoded while the draw recorder
@@ -394,6 +533,12 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, CmdCopy cop
         // already reuse the buffer.
         const u32 packet_words = header->type3.NumWords() + 1;
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
+        const bool time_ce_op = CmdFrameTiming::On() &&
+                                opcode != PM4ItOpcode::WaitOnDeCounterDiff &&
+                                opcode != PM4ItOpcode::IndirectBufferConst &&
+                                opcode != PM4ItOpcode::Rewind;
+        const auto ce_op_start = time_ce_op ? CmdFrameTiming::Clock::now()
+                                            : CmdFrameTiming::Clock::time_point{};
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             // const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -502,6 +647,11 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, CmdCopy cop
             const u32 count = header->type3.NumWords();
             UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
                             static_cast<u32>(opcode), count);
+        }
+        if (time_ce_op) {
+            const size_t index = static_cast<size_t>(opcode) & 0xff;
+            cmd_frame.ce_op_ns[index] += CmdFrameTiming::Since(ce_op_start);
+            ++cmd_frame.ce_op_count[index];
         }
         ccb = NextPacket(ccb, packet_words);
     }
@@ -682,6 +832,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, CmdCopy cop
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
                     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    cmd_frame.flip_seen = true;
                     if (time_packet) {
                         namespace GS = Common::GuestStats;
                         const auto end = std::chrono::steady_clock::now();
@@ -1423,8 +1574,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, CmdCopy cop
                 break;
             }
             case PM4ItOpcode::WaitOnCeCounter: {
+                // The game hands constants from the constant engine to draws thousands of times a
+                // frame: run the oldest CE task here until it catches up, as before 0.21.0, instead
+                // of a trip around the whole command loop for every hand-off. Yield only when no
+                // CE work is queued or a CE step made no progress (it waits on this side).
                 while (cblock.ce_count <= cblock.de_count) {
-                    YIELD_GFX();
+                    const auto ce_before = cblock.ce_count;
+                    FIBER_EXIT;
+                    ProcessCeQueue();
+                    FIBER_ENTER(dcb_task_name);
+                    if (cblock.ce_count == ce_before) {
+                        YIELD_GFX();
+                    }
                 }
                 break;
             }
