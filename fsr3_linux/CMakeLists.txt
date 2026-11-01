@@ -44,6 +44,9 @@ set(SWAPCHAIN "${FFX_SDK_ROOT}/sdk/src/backends/vk/FrameInterpolationSwapchain")
 set(CASE_LINKS "${CMAKE_CURRENT_BINARY_DIR}/case_links")
 file(MAKE_DIRECTORY "${CASE_LINKS}")
 file(CREATE_LINK "${SDK}/include/FidelityFX" "${CASE_LINKS}/FidelityFx" SYMBOLIC)
+# AMD's swapchain includes <Windows.h> as well as <windows.h>. Only the latter is in compat/:
+# Windows checkouts cannot hold both names.
+file(WRITE "${CASE_LINKS}/Windows.h" "#pragma once\n#include <windows.h>\n")
 
 # Copies `source` to `output` with each FROM;TO pair of variables replaced, failing loudly when
 # the source no longer contains what is replaced.
