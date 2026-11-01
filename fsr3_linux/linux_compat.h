@@ -6,6 +6,7 @@
 #pragma once
 
 #ifdef __cplusplus
+#include <memory>
 #include <new>
 #endif
 

@@ -9,9 +9,10 @@
 #include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
-// AMD FSR 3.1 frame generation through amd_fidelityfx_vk.dll, for GPUs without DLSS-G. Like
-// DLSS-G it replaces the swapchain: the emulator renders into its images, and it presents a
-// generated frame before each rendered one from its own threads, on queues of its own.
+// AMD FSR 3.1 frame generation through amd_fidelityfx_vk.dll (libamd_fidelityfx_vk.so on Linux),
+// for GPUs without DLSS-G. Like DLSS-G it replaces the swapchain: the emulator renders into its
+// images, and it presents a generated frame before each rendered one from its own threads, on
+// queues of its own.
 namespace Vulkan::FsrFrameGen {
 
 // Used instead of DLSS-G (chosen in FrameGen::Load, before the device is created).
@@ -28,9 +29,10 @@ struct QueuePlan {
     Slot present, acquire, compute;
 };
 // Picks them next to the emulator's queue (index 0 of `graphics_family`). False when the GPU
-// has no other queue that can present; frame generation then stays off.
+// has no other queue that can present; frame generation then stays off. `surface` is the
+// window's, for asking which queues present to it (unused on Windows).
 bool PlanQueues(vk::Instance instance, vk::PhysicalDevice physical, u32 graphics_family,
-                QueuePlan& plan);
+                vk::SurfaceKHR surface, QueuePlan& plan);
 // Once the device exists. Loads the DLL.
 void SetDevice(vk::PhysicalDevice physical, vk::Device device, vk::Queue game_queue,
                u32 game_family, const QueuePlan& plan);

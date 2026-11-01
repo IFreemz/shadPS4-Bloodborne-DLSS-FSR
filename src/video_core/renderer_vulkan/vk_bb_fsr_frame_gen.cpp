@@ -8,16 +8,23 @@
 #include <limits>
 #include <mutex>
 
+#include <fmt/format.h>
+
 #include "common/logging/log.h"
 #include "video_core/renderer_vulkan/vk_bb_fsr_frame_gen.h"
 #include "video_core/renderer_vulkan/vk_fsr_upscaler.h"
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+#if defined(_WIN32) || defined(__linux__)
+#ifndef _WIN32
+// ffx_api.h marks its declarations __declspec(dllexport).
+#define __declspec(x)
+#endif
 #include <ffx_api/ffx_framegeneration.h>
 #include <ffx_api/vk/ffx_api_vk.h>
-#include <windows.h>
+#ifndef _WIN32
+#undef __declspec
+#endif
+#include "video_core/renderer_vulkan/vk_bb_library.h"
 #define BB_FSR_FRAME_GEN 1
 #endif
 
@@ -45,7 +52,7 @@ std::string Problem() {
 
 namespace {
 struct Api {
-    HMODULE module{};
+    void* module{};
     PfnFfxCreateContext create{};
     PfnFfxDestroyContext destroy{};
     PfnFfxConfigure configure{};
@@ -162,13 +169,26 @@ bool EnsureContext(vk::Extent2D display, vk::Extent2D render, bool inverted) {
 }
 } // namespace
 
-bool PlanQueues(vk::Instance instance, vk::PhysicalDevice physical, u32 graphics_family,
-                QueuePlan& plan) {
+bool PlanQueues([[maybe_unused]] vk::Instance instance, vk::PhysicalDevice physical,
+                u32 graphics_family, [[maybe_unused]] vk::SurfaceKHR surface, QueuePlan& plan) {
     const auto families = physical.getQueueFamilyProperties();
+#ifdef _WIN32
     // vkGetPhysicalDeviceWin32PresentationSupportKHR, from VK_KHR_win32_surface.
     using PresentationSupport = VkBool32(VKAPI_PTR*)(VkPhysicalDevice, uint32_t);
     const auto presentation_support = reinterpret_cast<PresentationSupport>(
         instance.getProcAddr("vkGetPhysicalDeviceWin32PresentationSupportKHR"));
+    const auto can_present = [&](u32 family) {
+        return presentation_support &&
+               presentation_support(static_cast<VkPhysicalDevice>(physical), family);
+    };
+#else
+    const auto can_present = [&](u32 family) {
+        if (!surface)
+            return false;
+        const auto [result, supported] = physical.getSurfaceSupportKHR(family, surface);
+        return result == vk::Result::eSuccess && supported;
+    };
+#endif
     std::vector<u32> used(families.size());
     used[graphics_family] = 1; // the emulator's queue
     const auto take = [&](auto&& wanted, bool prefer_other_family) -> QueuePlan::Slot {
@@ -184,12 +204,7 @@ bool PlanQueues(vk::Instance instance, vk::PhysicalDevice physical, u32 graphics
         }
         return {};
     };
-    plan.present = take(
-        [&](u32 family) {
-            return presentation_support &&
-                   presentation_support(static_cast<VkPhysicalDevice>(physical), family);
-        },
-        false);
+    plan.present = take(can_present, false);
     plan.acquire = take([](u32) { return true; }, true);
     plan.compute = take(
         [&](u32 family) {
@@ -229,23 +244,19 @@ void SetDevice(vk::PhysicalDevice physical, vk::Device device_, vk::Queue game_q
     acquire = queue(plan.acquire);
     compute = queue(plan.compute);
 
-    const auto path = []() {
-        std::wstring buffer(MAX_PATH, L'\0');
-        buffer.resize(GetModuleFileNameW(nullptr, buffer.data(), DWORD(buffer.size())));
-        return std::filesystem::path{buffer}.parent_path() / L"amd_fidelityfx_vk.dll";
-    }();
-    api.module = LoadLibraryW(path.c_str());
+    constexpr char name[] = BB_LIBRARY_NAME("amd_fidelityfx_vk.dll", "libamd_fidelityfx_vk.so");
+    api.module = BbLibrary::Load(BbLibrary::ExecutableDirectory() / name);
     if (!api.module)
-        return Fail("amd_fidelityfx_vk.dll is missing next to shadPS4.exe.");
-    const auto get = [](auto& function, const char* name) {
-        function = reinterpret_cast<std::remove_reference_t<decltype(function)>>(
-            GetProcAddress(api.module, name));
+        return Fail(fmt::format("{} is missing next to {}.", name,
+                                BB_LIBRARY_NAME("shadPS4.exe", "shadps4")));
+    const auto get = [](auto& function, const char* symbol) {
+        function = BbLibrary::Find<std::remove_reference_t<decltype(function)>>(api.module, symbol);
         return function != nullptr;
     };
     if (!get(api.create, "ffxCreateContext") || !get(api.destroy, "ffxDestroyContext") ||
         !get(api.configure, "ffxConfigure") || !get(api.query, "ffxQuery") ||
         !get(api.dispatch, "ffxDispatch"))
-        return Fail("amd_fidelityfx_vk.dll is missing entry points.");
+        return Fail(fmt::format("{} is missing entry points.", name));
     active = true;
     LOG_INFO(Render_Vulkan, "[FSR-FG] Ready");
 }
@@ -418,7 +429,7 @@ u32 TakeShown() {
 
 #else
 
-bool PlanQueues(vk::Instance, vk::PhysicalDevice, u32, QueuePlan&) {
+bool PlanQueues(vk::Instance, vk::PhysicalDevice, u32, vk::SurfaceKHR, QueuePlan&) {
     selected = false;
     return false;
 }

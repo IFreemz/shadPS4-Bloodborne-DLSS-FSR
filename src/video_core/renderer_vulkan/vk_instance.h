@@ -584,6 +584,9 @@ private:
     // Constructed before the Vulkan instance (it adds extensions); reset before device teardown.
     std::unique_ptr<DlssNgx> dlss_ngx;
     vk::UniqueInstance instance;
+    // A surface for the window while the device is created, so FSR frame generation can pick
+    // queues that present to it (Linux; Windows asks Win32 directly).
+    vk::SurfaceKHR presentation_probe;
     vk::PhysicalDevice physical_device;
     vk::UniqueDevice device;
     vk::PhysicalDeviceProperties properties;

@@ -21,17 +21,21 @@
 // THE SOFTWARE.
 
 //
-// Linux build of ffx_provider.cpp (FidelityFX SDK v1.1.4): the FSR 3.1 upscaler only. The
-// frame generation swapchain and the AMD driver's external providers are Windows only.
+// Linux build of ffx_provider.cpp (FidelityFX SDK v1.1.4): the FSR 3.1 upscaler and frame
+// generation, without the AMD driver's external providers (a Windows D3D12 extension).
 
 #include "ffx_provider.h"
 
+#include "ffx_provider_framegeneration.h"
 #include "ffx_provider_fsr3upscale.h"
+#include "vk/ffx_provider_framegenerationswapchain_vk.h"
 
 #include <iterator>
 
 static constexpr ffxProvider* providers[] = {
     &ffxProvider_FSR3Upscale::Instance,
+    &ffxProvider_FrameGeneration::Instance,
+    &ffxProvider_FrameGenerationSwapChain_VK::Instance,
 };
 
 const ffxProvider* GetffxProvider(ffxStructType_t descType, uint64_t overrideId, void*)

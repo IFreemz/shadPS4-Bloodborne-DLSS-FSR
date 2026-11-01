@@ -193,7 +193,15 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
+#ifndef _WIN32
+    if (FsrFrameGen::Selected())
+        presentation_probe = CreateSurface(*instance, window);
+#endif
     CreateDevice();
+    if (presentation_probe) {
+        instance->destroySurfaceKHR(presentation_probe);
+        presentation_probe = nullptr;
+    }
     CollectPhysicalMemoryInfo();
     CollectImageFormatInfo();
     CollectToolingInfo();
@@ -473,7 +481,8 @@ bool Instance::CreateDevice() {
     }
 #endif
     if (FsrFrameGen::Selected() &&
-        FsrFrameGen::PlanQueues(*instance, physical_device, queue_family_index, fsr_queues)) {
+        FsrFrameGen::PlanQueues(*instance, physical_device, queue_family_index, presentation_probe,
+                                fsr_queues)) {
         for (const auto& slot : {fsr_queues.present, fsr_queues.acquire, fsr_queues.compute})
             if (slot.family != ~0u)
                 queue_counts[slot.family] = std::max(queue_counts[slot.family], slot.index + 1);
