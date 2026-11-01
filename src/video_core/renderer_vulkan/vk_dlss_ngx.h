@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -11,6 +12,10 @@
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan {
+
+namespace FrameGen {
+struct FrameInputs;
+}
 
 // Loads the optional shadps4_dlss.dll bridge next to the executable. shadPS4 itself contains no
 // NVIDIA code; without the bridge (or on unsupported GPUs) rendering stays unchanged.
@@ -57,6 +62,22 @@ public:
     bool Evaluate(vk::CommandBuffer command, const Resource& color, const Resource& depth,
                   const Resource& motion, const Resource& output, const EvalDesc& eval);
     void ReleaseFeatureAfterGpuDrain();
+
+    // DLSS Frame Generation called directly (Linux; Streamline runs it on Windows): frames it
+    // makes per rendered frame, 0 when unavailable.
+    u32 FrameGenMaxCount() const;
+    struct FrameGenDesc {
+        vk::Extent2D display, render;
+        vk::Format format;
+    };
+    // Releases an existing feature first; the caller must have drained the GPU if one exists.
+    bool FrameGenCreate(vk::CommandBuffer command, const FrameGenDesc& desc);
+    // Everything in the general layout. `hudless` may be null.
+    bool FrameGenEvaluate(vk::CommandBuffer command, const Resource& backbuffer,
+                          const Resource& depth, const Resource& motion, const Resource& output,
+                          const Resource* hudless, const FrameGen::FrameInputs& inputs,
+                          std::array<float, 2> mvec_scale, bool reset);
+    void FrameGenReleaseAfterGpuDrain();
 
 private:
     DlssNgx();

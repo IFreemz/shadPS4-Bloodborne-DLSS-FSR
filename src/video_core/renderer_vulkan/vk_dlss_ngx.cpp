@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 
 #include "../../../dlss_bridge/shadps4_dlss_bridge.h"
+#include "video_core/renderer_vulkan/vk_bb_frame_gen.h"
 #include "video_core/renderer_vulkan/vk_bb_library.h"
 
 namespace Vulkan {
@@ -241,6 +242,74 @@ void DlssNgx::ReleaseFeatureAfterGpuDrain() {
         impl->api->ReleaseFeature();
 }
 
+namespace {
+ShadDlssImage Image(const DlssNgx::Resource& r) {
+    return ShadDlssImage{r.image,
+                         r.view,
+                         static_cast<VkImageSubresourceRange>(r.range),
+                         static_cast<VkFormat>(r.format),
+                         r.extent.width,
+                         r.extent.height};
+}
+} // namespace
+
+u32 DlssNgx::FrameGenMaxCount() const {
+    return impl->available ? u32(std::max(impl->api->FrameGenMaxCount(), 0)) : 0;
+}
+
+bool DlssNgx::FrameGenCreate(vk::CommandBuffer command, const FrameGenDesc& desc) {
+    if (!impl->available)
+        return false;
+    const ShadDlssgFeature feature{desc.display.width, desc.display.height,
+                                   static_cast<VkFormat>(desc.format), desc.render.width,
+                                   desc.render.height};
+    return impl->api->FrameGenCreate(command, &feature) != 0;
+}
+
+bool DlssNgx::FrameGenEvaluate(vk::CommandBuffer command, const Resource& backbuffer,
+                               const Resource& depth, const Resource& motion,
+                               const Resource& output, const Resource* hudless,
+                               const FrameGen::FrameInputs& inputs, std::array<float, 2> mvec_scale,
+                               bool reset) {
+    if (!impl->available)
+        return false;
+    ShadDlssgEvaluate evaluate{};
+    evaluate.backbuffer = Image(backbuffer);
+    evaluate.depth = Image(depth);
+    evaluate.motion = Image(motion);
+    evaluate.output = Image(output);
+    if (hudless)
+        evaluate.hudless = Image(*hudless);
+    evaluate.jitter_x = inputs.jitter[0];
+    evaluate.jitter_y = inputs.jitter[1];
+    evaluate.mvec_scale_x = mvec_scale[0];
+    evaluate.mvec_scale_y = mvec_scale[1];
+    evaluate.camera_near = inputs.near_plane;
+    evaluate.camera_far = inputs.far_plane;
+    evaluate.camera_fov = inputs.fov_y;
+    evaluate.camera_aspect = inputs.aspect;
+    std::ranges::copy(inputs.position, evaluate.camera_position);
+    std::ranges::copy(inputs.up, evaluate.camera_up);
+    std::ranges::copy(inputs.right, evaluate.camera_right);
+    std::ranges::copy(inputs.forward, evaluate.camera_forward);
+    std::memcpy(evaluate.view_to_clip, inputs.view_to_clip.data(), sizeof(evaluate.view_to_clip));
+    std::memcpy(evaluate.clip_to_view, inputs.clip_to_view.data(), sizeof(evaluate.clip_to_view));
+    std::memcpy(evaluate.clip_to_prev_clip, inputs.clip_to_prev_clip.data(),
+                sizeof(evaluate.clip_to_prev_clip));
+    std::memcpy(evaluate.prev_clip_to_clip, inputs.prev_clip_to_clip.data(),
+                sizeof(evaluate.prev_clip_to_clip));
+    evaluate.depth_inverted = inputs.depth_inverted;
+    evaluate.reset = reset;
+    evaluate.multi_frame_count = 1;
+    evaluate.multi_frame_index = 1;
+    return impl->api->FrameGenEvaluate(command, &evaluate) != 0;
+}
+
+void DlssNgx::FrameGenReleaseAfterGpuDrain() {
+    if (impl->api)
+        impl->api->FrameGenRelease();
+}
+
 void DlssNgx::Shutdown() {
     impl->available = false;
     impl->feature.reset();
@@ -276,6 +345,18 @@ bool DlssNgx::Evaluate(vk::CommandBuffer, const Resource&, const Resource&, cons
     return false;
 }
 void DlssNgx::ReleaseFeatureAfterGpuDrain() {}
+u32 DlssNgx::FrameGenMaxCount() const {
+    return 0;
+}
+bool DlssNgx::FrameGenCreate(vk::CommandBuffer, const FrameGenDesc&) {
+    return false;
+}
+bool DlssNgx::FrameGenEvaluate(vk::CommandBuffer, const Resource&, const Resource&, const Resource&,
+                               const Resource&, const Resource*, const FrameGen::FrameInputs&,
+                               std::array<float, 2>, bool) {
+    return false;
+}
+void DlssNgx::FrameGenReleaseAfterGpuDrain() {}
 
 #endif
 

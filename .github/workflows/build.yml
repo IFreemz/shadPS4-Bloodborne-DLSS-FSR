@@ -265,6 +265,7 @@ jobs:
         mkdir -p pkg/main/LICENSES pkg/addon/fsr4
         cp build/shadps4 build-dlss/shadps4_dlss.so build-fsr3/libamd_fidelityfx_vk.so pkg/main/
         cp sdk/dlss/lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.* pkg/main/
+        cp sdk/dlss/lib/Linux_x86_64/rel/libnvidia-ngx-dlssg.so.* pkg/main/
         strip pkg/main/shadps4
         strip --strip-unneeded pkg/main/shadps4_dlss.so pkg/main/libamd_fidelityfx_vk.so
         cp LICENSE pkg/main/LICENSES/shadPS4-GPL-2.0.txt

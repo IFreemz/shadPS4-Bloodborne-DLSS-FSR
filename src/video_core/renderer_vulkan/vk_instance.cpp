@@ -784,8 +784,8 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "[FRAME-GEN] Local test: render queue {}.0, present queue {}.{}",
                  queue_family_index, queue_family_index, present_queue_index);
     }
-    FsrFrameGen::SetDevice(physical_device, *device, graphics_queue, queue_family_index,
-                           fsr_queues);
+    FsrFrameGen::SetDevice(physical_device, *device, graphics_queue, queue_family_index, fsr_queues,
+                           dlss_ngx.get());
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
