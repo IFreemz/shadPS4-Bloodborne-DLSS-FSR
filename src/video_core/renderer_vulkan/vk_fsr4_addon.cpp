@@ -11,44 +11,30 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 #include "../../../fsr4_addon/shadps4_fsr4.h"
-#endif
+#include "video_core/renderer_vulkan/vk_bb_library.h"
 
 namespace Vulkan {
 
 namespace {
+constexpr char AddonName[] = BB_LIBRARY_NAME("shadps4_fsr4.dll", "shadps4_fsr4.so");
+
 std::filesystem::path AddonDirectory() {
-#ifdef _WIN32
-    std::wstring path(MAX_PATH, L'\0');
-    const DWORD length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
-    path.resize(length);
-    return std::filesystem::path{path}.parent_path() / "fsr4";
-#else
-    return std::filesystem::current_path() / "fsr4";
-#endif
+    return BbLibrary::ExecutableDirectory() / "fsr4";
 }
 } // namespace
 
 bool Fsr4Addon::Present() {
-#ifdef _WIN32
     static const bool present = [] {
         const char* setting = std::getenv("SHADPS4_FSR4");
         if (setting && std::string_view{setting} == "0")
             return false;
-        return std::filesystem::is_regular_file(AddonDirectory() / "shadps4_fsr4.dll");
+        return std::filesystem::is_regular_file(AddonDirectory() / AddonName);
     }();
     return present;
-#else
-    return false;
-#endif
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
 
 namespace {
 void AddonLog(int warning, const char* message) {
@@ -86,7 +72,7 @@ ShadFsr4Image Image(const DlssNgx::Resource& r, vk::ImageLayout layout) {
 
 struct Fsr4Addon::Impl {
     Scheduler& scheduler;
-    HMODULE module{};
+    void* module{};
     const ShadFsr4Api* api{};
     std::optional<ContextDesc> desc;
     u64 next_frame{1};
@@ -106,18 +92,14 @@ std::unique_ptr<Fsr4Addon> Fsr4Addon::Create(const Instance& instance, Scheduler
     auto addon = std::unique_ptr<Fsr4Addon>{new Fsr4Addon{scheduler}};
     auto& s = *addon->impl;
     const auto directory = AddonDirectory();
-    // The add-on's own directory, so its dependencies resolve next to it.
-    s.module = LoadLibraryExW((directory / "shadps4_fsr4.dll").c_str(), nullptr,
-                              LOAD_WITH_ALTERED_SEARCH_PATH);
-    const auto get_api =
-        s.module ? reinterpret_cast<ShadFsr4GetApiFn>(GetProcAddress(s.module, "ShadFsr4GetApi"))
-                 : nullptr;
+    s.module = BbLibrary::Load(directory / AddonName);
+    const auto get_api = BbLibrary::Find<ShadFsr4GetApiFn>(s.module, "ShadFsr4GetApi");
     s.api = get_api ? get_api() : nullptr;
     if (!s.api || s.api->abi != SHADPS4_FSR4_ABI) {
-        LOG_WARNING(Render_Vulkan, "[FSR4] shadps4_fsr4.dll is missing or from another version");
+        LOG_WARNING(Render_Vulkan, "[FSR4] {} is missing or from another version", AddonName);
         return {};
     }
-    s.api->Configure(directory.c_str(), AddonLog);
+    s.api->Configure(directory.wstring().c_str(), AddonLog);
     if (!s.api->Initialize(static_cast<VkPhysicalDevice>(instance.GetPhysicalDevice()),
                            static_cast<VkDevice>(instance.GetDevice())))
         return {};
@@ -127,8 +109,7 @@ std::unique_ptr<Fsr4Addon> Fsr4Addon::Create(const Instance& instance, Scheduler
 
 Fsr4Addon::~Fsr4Addon() {
     ReleaseContextAfterGpuDrain();
-    if (impl->module)
-        FreeLibrary(impl->module);
+    BbLibrary::Free(impl->module);
 }
 
 bool Fsr4Addon::HasContext(const ContextDesc& desc) const {

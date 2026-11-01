@@ -16,46 +16,38 @@
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
 #include "../../../dlss_bridge/shadps4_dlss_bridge.h"
-#endif
+#include "video_core/renderer_vulkan/vk_bb_library.h"
 
 namespace Vulkan {
 
 namespace {
-constexpr wchar_t BridgeName[] = L"shadps4_dlss.dll";
-constexpr wchar_t NgxName[] = L"nvngx_dlss.dll";
+constexpr char BridgeName[] = BB_LIBRARY_NAME("shadps4_dlss.dll", "shadps4_dlss.so");
 
-std::filesystem::path ExecutableDirectory() {
+// The DLSS SDK names its Linux library after its version (libnvidia-ngx-dlss.so.310.9.16).
+bool HasNgxLibrary(const std::filesystem::path& directory) {
 #ifdef _WIN32
-    std::wstring path(MAX_PATH, L'\0');
-    const DWORD length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
-    path.resize(length);
-    return std::filesystem::path{path}.parent_path();
+    return std::filesystem::is_regular_file(directory / "nvngx_dlss.dll");
 #else
-    return std::filesystem::current_path();
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator{directory, error})
+        if (entry.path().filename().string().starts_with("libnvidia-ngx-dlss.so.") &&
+            entry.is_regular_file(error))
+            return true;
+    return false;
 #endif
 }
 } // namespace
 
 bool DlssNgx::Present() {
-#ifdef _WIN32
     static const bool present = [] {
         const char* setting = std::getenv("SHADPS4_DLSS");
         if (setting && std::string_view{setting} == "0")
             return false;
-        const auto directory = ExecutableDirectory();
-        return std::filesystem::is_regular_file(directory / BridgeName) &&
-               std::filesystem::is_regular_file(directory / NgxName);
+        const auto directory = BbLibrary::ExecutableDirectory();
+        return std::filesystem::is_regular_file(directory / BridgeName) && HasNgxLibrary(directory);
     }();
     return present;
-#else
-    return false;
-#endif
 }
 
 int DlssNgx::QualityForScale(float scale) {
@@ -63,7 +55,7 @@ int DlssNgx::QualityForScale(float scale) {
     return scale >= 2.9f ? 4 : scale >= 1.95f ? 3 : scale >= 1.65f ? 2 : scale > 1.01f ? 1 : 0;
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
 
 namespace {
 // quick_exit skips Instance destructors; release NGX before the process ends.
@@ -108,7 +100,7 @@ bool CollectExtensions(const VkExtensionProperties* required, u32 count,
 } // namespace
 
 struct DlssNgx::Impl {
-    HMODULE module{};
+    void* module{};
     const ShadDlssApi* api{};
     std::vector<std::string> instance_extensions, device_extensions;
     std::optional<FeatureDesc> feature;
@@ -122,21 +114,18 @@ struct DlssNgx::Impl {
 };
 
 DlssNgx::DlssNgx() : impl{std::make_unique<Impl>()} {
-    const auto directory = ExecutableDirectory();
-    impl->module = LoadLibraryW((directory / BridgeName).c_str());
-    const auto get_api =
-        impl->module
-            ? reinterpret_cast<ShadDlssGetApiFn>(GetProcAddress(impl->module, "ShadDlssGetApi"))
-            : nullptr;
+    const auto directory = BbLibrary::ExecutableDirectory();
+    impl->module = BbLibrary::Load(directory / BridgeName);
+    const auto get_api = BbLibrary::Find<ShadDlssGetApiFn>(impl->module, "ShadDlssGetApi");
     impl->api = get_api ? get_api() : nullptr;
     if (!impl->api || impl->api->abi != SHADPS4_DLSS_BRIDGE_ABI) {
-        impl->Disable("shadps4_dlss.dll is missing or from a different version");
+        impl->Disable(fmt::format("{} is missing or from a different version", BridgeName));
         return;
     }
     const auto data = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "dlss";
     std::error_code error;
     std::filesystem::create_directories(data, error);
-    if (!impl->api->Configure(directory.c_str(), data.c_str(), BridgeLog))
+    if (!impl->api->Configure(directory.wstring().c_str(), data.wstring().c_str(), BridgeLog))
         impl->Disable("bridge configuration failed");
 }
 

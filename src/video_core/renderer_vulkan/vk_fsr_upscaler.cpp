@@ -12,47 +12,34 @@
 #include "video_core/renderer_vulkan/vk_fsr_upscaler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
+#ifndef _WIN32
+// ffx_api.h marks its declarations __declspec(dllexport).
+#define __declspec(x)
 #endif
 #include <ffx_api/ffx_upscale.h>
 #include <ffx_api/vk/ffx_api_vk.h>
-#include <windows.h>
+#ifndef _WIN32
+#undef __declspec
 #endif
+#include "video_core/renderer_vulkan/vk_bb_library.h"
 
 namespace Vulkan {
 
 namespace {
-constexpr wchar_t FsrName[] = L"amd_fidelityfx_vk.dll";
-
-std::filesystem::path ExecutableDirectory() {
-#ifdef _WIN32
-    std::wstring path(MAX_PATH, L'\0');
-    const DWORD length = GetModuleFileNameW(nullptr, path.data(), DWORD(path.size()));
-    path.resize(length);
-    return std::filesystem::path{path}.parent_path();
-#else
-    return std::filesystem::current_path();
-#endif
-}
+constexpr char FsrName[] = BB_LIBRARY_NAME("amd_fidelityfx_vk.dll", "libamd_fidelityfx_vk.so");
 } // namespace
 
 bool FsrUpscaler::Present() {
-#ifdef _WIN32
     static const bool present = [] {
         const char* setting = std::getenv("SHADPS4_FSR");
         if (setting && std::string_view{setting} == "0")
             return false;
-        return std::filesystem::is_regular_file(ExecutableDirectory() / FsrName);
+        return std::filesystem::is_regular_file(BbLibrary::ExecutableDirectory() / FsrName);
     }();
     return present;
-#else
-    return false;
-#endif
 }
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
 
 namespace {
 void FfxMessage(uint32_t type, const wchar_t* message) {
@@ -141,7 +128,7 @@ FfxApiResource ToFfx(const DlssNgx::Resource& resource, bool writable) {
 } // namespace
 
 struct FsrUpscaler::Impl {
-    HMODULE module{};
+    void* module{};
     PfnFfxCreateContext create{};
     PfnFfxDestroyContext destroy{};
     PfnFfxQuery query{};
@@ -163,19 +150,18 @@ std::unique_ptr<FsrUpscaler> FsrUpscaler::Create(const Instance& instance) {
         return {};
     auto fsr = std::unique_ptr<FsrUpscaler>{new FsrUpscaler};
     auto& s = *fsr->impl;
-    s.module = LoadLibraryW((ExecutableDirectory() / FsrName).c_str());
+    s.module = BbLibrary::Load(BbLibrary::ExecutableDirectory() / FsrName);
     if (!s.module) {
-        LOG_WARNING(Render_Vulkan, "[FSR] amd_fidelityfx_vk.dll could not be loaded");
+        LOG_WARNING(Render_Vulkan, "[FSR] {} could not be loaded", FsrName);
         return {};
     }
-    s.create = reinterpret_cast<PfnFfxCreateContext>(GetProcAddress(s.module, "ffxCreateContext"));
-    s.destroy =
-        reinterpret_cast<PfnFfxDestroyContext>(GetProcAddress(s.module, "ffxDestroyContext"));
-    s.query = reinterpret_cast<PfnFfxQuery>(GetProcAddress(s.module, "ffxQuery"));
-    s.dispatch = reinterpret_cast<PfnFfxDispatch>(GetProcAddress(s.module, "ffxDispatch"));
+    s.create = BbLibrary::Find<PfnFfxCreateContext>(s.module, "ffxCreateContext");
+    s.destroy = BbLibrary::Find<PfnFfxDestroyContext>(s.module, "ffxDestroyContext");
+    s.query = BbLibrary::Find<PfnFfxQuery>(s.module, "ffxQuery");
+    s.dispatch = BbLibrary::Find<PfnFfxDispatch>(s.module, "ffxDispatch");
     if (!s.create || !s.destroy || !s.query || !s.dispatch) {
-        LOG_WARNING(Render_Vulkan, "[FSR] amd_fidelityfx_vk.dll is missing entry points");
-        FreeLibrary(s.module);
+        LOG_WARNING(Render_Vulkan, "[FSR] {} is missing entry points", FsrName);
+        BbLibrary::Free(s.module);
         s.module = {};
         return {};
     }
@@ -188,8 +174,7 @@ std::unique_ptr<FsrUpscaler> FsrUpscaler::Create(const Instance& instance) {
 
 FsrUpscaler::~FsrUpscaler() {
     DestroyContextAfterGpuDrain();
-    if (impl->module)
-        FreeLibrary(impl->module);
+    BbLibrary::Free(impl->module);
 }
 
 bool FsrUpscaler::HasContext(const ContextDesc& desc) const {

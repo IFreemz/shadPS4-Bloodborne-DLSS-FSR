@@ -279,6 +279,12 @@ constexpr ShadFsr4Api Api{SHADPS4_FSR4_ABI, Configure, Initialize,     HasContex
 
 } // namespace
 
-extern "C" __declspec(dllexport) const ShadFsr4Api* ShadFsr4GetApi() {
+#ifdef _WIN32
+#define SHADPS4_FSR4_EXPORT __declspec(dllexport)
+#else
+#define SHADPS4_FSR4_EXPORT __attribute__((visibility("default")))
+#endif
+
+extern "C" SHADPS4_FSR4_EXPORT const ShadFsr4Api* ShadFsr4GetApi() {
     return &Api;
 }

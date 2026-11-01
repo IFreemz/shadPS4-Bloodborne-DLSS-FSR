@@ -30,6 +30,7 @@
 #include "video_core/host_shaders/bb_dlss_sharpen_hdr_comp.h"
 #include "video_core/host_shaders/bb_hud_layer_comp.h"
 #include "video_core/host_shaders/bb_hudless_dim_comp.h"
+#include "video_core/renderer_vulkan/vk_bb_library.h"
 #include "video_core/renderer_vulkan/vk_bb_object_motion.h"
 #include "video_core/renderer_vulkan/vk_bb_resolution.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
@@ -96,7 +97,8 @@ BbDlssStatus BbTemporalDlssStatus() {
     copy.dlss_problem = ngx_problem;
     copy.fsr4_installed = Fsr4Addon::Present();
     if (!BbTemporalDlssRequested())
-        copy.reason = "No upscaler files were found next to shadPS4.exe.";
+        copy.reason =
+            "No upscaler files were found next to " BB_LIBRARY_NAME("shadPS4.exe", "shadps4") ".";
     else if (!copy.active && copy.reason.empty())
         copy.reason = "Waiting for gameplay (menus and loading screens use the normal image).";
     return copy;
@@ -942,8 +944,12 @@ struct BbTemporalDlss::Impl {
         const auto dlss = DlssProblem();
         const std::string no_fsr =
             FsrUpscaler::Present()
-                ? "FSR could not be loaded (amd_fidelityfx_vk.dll is damaged or incompatible)."
-                : "FSR needs amd_fidelityfx_vk.dll next to shadPS4.exe.";
+                ? BB_LIBRARY_NAME(
+                      "FSR could not be loaded (amd_fidelityfx_vk.dll is damaged or incompatible).",
+                      "FSR could not be loaded (libamd_fidelityfx_vk.so is damaged or "
+                      "incompatible).")
+                : BB_LIBRARY_NAME("FSR needs amd_fidelityfx_vk.dll next to shadPS4.exe.",
+                                  "FSR needs libamd_fidelityfx_vk.so next to shadps4.");
         if (tune.upscaler == 1)
             return dlss.empty() ? "DLSS is not available on this system." : dlss;
         if (tune.upscaler == 2)
@@ -954,7 +960,8 @@ struct BbTemporalDlss::Impl {
             return Fsr4Addon::Present()
                        ? "FSR 4 could not start (see the log; it needs a Radeon RX 6000 / RTX "
                          "or newer GPU and the complete fsr4 folder)."
-                       : "FSR 4 needs the FSR 4 add-on (the fsr4 folder next to shadPS4.exe).";
+                       : "FSR 4 needs the FSR 4 add-on (the fsr4 folder next to " BB_LIBRARY_NAME(
+                             "shadPS4.exe", "shadps4") ").";
         }
         return (dlss.empty() ? std::string{} : dlss + " ") + no_fsr;
     }

@@ -248,6 +248,12 @@ const ShadDlssApi api{SHADPS4_DLSS_BRIDGE_ABI,
 
 } // namespace
 
-extern "C" __declspec(dllexport) const ShadDlssApi* ShadDlssGetApi() {
+#ifdef _WIN32
+#define SHADPS4_DLSS_EXPORT __declspec(dllexport)
+#else
+#define SHADPS4_DLSS_EXPORT __attribute__((visibility("default")))
+#endif
+
+extern "C" SHADPS4_DLSS_EXPORT const ShadDlssApi* ShadDlssGetApi() {
     return &api;
 }
