@@ -288,6 +288,7 @@ Liverpool::~Liverpool() {
         ce_submits.front().destroy();
         ce_submits.pop();
     }
+    ce_submit_seqs = {};
     for (auto& queue : mapped_queues) {
         while (!queue.submits.empty()) {
             queue.submits.front().destroy();
@@ -322,6 +323,7 @@ void Liverpool::ProcessCeQueue() {
         task.destroy();
         std::scoped_lock lock{queue.m_access};
         ce_submits.pop();
+        ce_submit_seqs.pop();
         --num_submits;
         std::scoped_lock lock2{submit_mutex};
         submit_cv.notify_all();
@@ -2035,13 +2037,18 @@ void Liverpool::RetireFrames() {
             return;
         }
     }
-    // The oldest submission not decoded yet, on any queue (queues finish out of order).
+    // The oldest submission not decoded yet, on any queue (queues finish out of order), the
+    // constant engine's included.
     u64 oldest_pending = ~0ull;
-    for (u32 qid = 0; qid < num_mapped_queues; ++qid) {
+    const u32 queues = num_mapped_queues.load(std::memory_order_relaxed);
+    for (u32 qid = 0; qid < queues; ++qid) {
         auto& queue = mapped_queues[qid];
         std::scoped_lock lock{queue.m_access};
         if (!queue.submit_seqs.empty()) {
             oldest_pending = std::min(oldest_pending, queue.submit_seqs.front());
+        }
+        if (qid == GfxQueueId && !ce_submit_seqs.empty()) {
+            oldest_pending = std::min(oldest_pending, ce_submit_seqs.front());
         }
     }
     u64 frame = 0;
@@ -2106,6 +2113,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         std::scoped_lock lock{submit_mutex, queue.m_access};
         if (!ccb.empty()) {
             ce_submits.emplace(ProcessCeUpdate(ccb, std::move(ccb_copy)).handle);
+            // The same number as its graphics task: a frame is not retired while the constant
+            // engine (its own task since 0.21.0) still reads that frame's commands and memory.
+            ce_submit_seqs.emplace(seq);
             ++num_submits;
         }
         queue.submits.emplace(task.handle);
@@ -2134,7 +2144,9 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     }
 
     std::scoped_lock lk{submit_mutex};
-    num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
+    num_mapped_queues.store(
+        std::max(num_mapped_queues.load(std::memory_order_relaxed), gnm_vqid + 1),
+        std::memory_order_relaxed);
     ++num_submits;
     work_retired = false;
     submit_cv.notify_one();

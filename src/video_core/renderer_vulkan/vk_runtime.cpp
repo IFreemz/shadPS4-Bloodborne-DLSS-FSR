@@ -672,9 +672,9 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->num_samples = num_samples;
         new_backing->image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
         new_backing->image.Create(new_image_ci);
-        if (image->memory_usage_counter) {
-            *image->memory_usage_counter +=
-                Common::AlignUp(image->SizeBytes(), 1024) - previous_size;
+        // Read once: UnregisterImage clears it.
+        if (auto* counter = image->memory_usage_counter) {
+            *counter += Common::AlignUp(image->SizeBytes(), 1024) - previous_size;
         }
 
         Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,

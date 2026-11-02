@@ -285,8 +285,10 @@ private:
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
-    std::queue<Task::Handle> ce_submits;
-    u32 num_mapped_queues{1u}; // GFX is always available
+    std::queue<Task::Handle> ce_submits; ///< guarded by the graphics queue's m_access
+    std::queue<u64> ce_submit_seqs;      ///< each one's submission number (overlapped frames)
+    /// Raised by SubmitAsc (under submit_mutex), read by the command thread without it.
+    std::atomic<u32> num_mapped_queues{1u}; // GFX is always available
 
     VAddr indirect_args_addr{};
 
