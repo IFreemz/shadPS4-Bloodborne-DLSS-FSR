@@ -4,7 +4,7 @@
 # libamd_fidelityfx_vk.so: FSR 3.1 upscaling and frame generation for the Linux build, the
 # counterpart of AMD's amd_fidelityfx_vk.dll. AMD only ships that DLL for Windows, so this builds
 # the same ffx-api from source: AMD's API layer and frame generation swapchain (FidelityFX SDK
-# v1.1.4) over the FSR 3.1.4 effects and Vulkan backend as made portable by FireBurn's
+# v1.1.4, the swapchain patched for up to 4x) over the FSR 3.1.4 effects and Vulkan backend as made portable by FireBurn's
 # FSR-Vulkan, with its pre-compiled SPIR-V.
 #   cmake -S fsr3_linux -B build-fsr3 -DFFX_SDK_ROOT=<FidelityFX SDK v1.1.4> \
 #         -DFSR_VULKAN_ROOT=<FSR-Vulkan> -DCMAKE_CXX_COMPILER=clang++
@@ -46,7 +46,7 @@ file(MAKE_DIRECTORY "${CASE_LINKS}")
 file(CREATE_LINK "${SDK}/include/FidelityFX" "${CASE_LINKS}/FidelityFx" SYMBOLIC)
 # AMD's swapchain includes <Windows.h> as well as <windows.h>. Only the latter is in compat/:
 # Windows checkouts cannot hold both names.
-file(WRITE "${CASE_LINKS}/Windows.h" "#pragma once\n#include <windows.h>\n")
+file(CONFIGURE OUTPUT "${CASE_LINKS}/Windows.h" CONTENT "#pragma once\n#include <windows.h>\n")
 
 # Copies `source` to `output` with each FROM;TO pair of variables replaced, failing loudly when
 # the source no longer contains what is replaced.
@@ -110,14 +110,27 @@ void ffxLinuxEnabledFeatures(VkDeviceContext* context);]])
 patch_source("${API}/src/backends.cpp" "${CMAKE_CURRENT_BINARY_DIR}/backends.cpp"
              DEVICE_CONTEXT:DEVICE_CONTEXT_WITH_FEATURES VK_HEADER:VK_HEADER_WITH_FEATURES)
 
-# AMD's swapchain: two constructs only MSVC accepts.
-set(WAIT_CALLBACK_CAST [[static_cast<FfxWaitCallbackFunc>(valuePtr)]])
-set(WAIT_CALLBACK_REINTERPRET [[reinterpret_cast<FfxWaitCallbackFunc>(valuePtr)]])
-set(TEMPORARY_SEMAPHORES [[toWait, SubmissionSemaphores());]])
-set(NAMED_SEMAPHORES [[toWait, *std::make_unique<SubmissionSemaphores>());]])
-patch_source("${SWAPCHAIN}/FrameInterpolationSwapchainVK.cpp"
-             "${CMAKE_CURRENT_BINARY_DIR}/FrameInterpolationSwapchainVK.cpp"
-             WAIT_CALLBACK_CAST:WAIT_CALLBACK_REINTERPRET TEMPORARY_SEMAPHORES:NAMED_SEMAPHORES)
+# AMD's frame generation swapchain, copied and patched (patches/frame_interpolation_swapchain.patch:
+# up to three generated frames per rendered one, and fixes). The whole folder is copied: its files
+# include the header from their own directory.
+find_program(PATCH_PROGRAM patch REQUIRED)
+set(SWAPCHAIN_PATCH "${CMAKE_CURRENT_SOURCE_DIR}/patches/frame_interpolation_swapchain.patch")
+set(SWAPCHAIN_STAGING "${CMAKE_CURRENT_BINARY_DIR}/swapchain_staging")
+set(PATCHED_SWAPCHAIN "${CMAKE_CURRENT_BINARY_DIR}/swapchain")
+file(REMOVE_RECURSE "${SWAPCHAIN_STAGING}")
+file(COPY "${SWAPCHAIN}/" DESTINATION "${SWAPCHAIN_STAGING}")
+execute_process(COMMAND "${PATCH_PROGRAM}" -p1 --forward --batch -i "${SWAPCHAIN_PATCH}"
+                WORKING_DIRECTORY "${SWAPCHAIN_STAGING}" RESULT_VARIABLE patched OUTPUT_QUIET)
+if (NOT patched EQUAL 0)
+    message(FATAL_ERROR "The FidelityFX SDK's swapchain changed: update ${SWAPCHAIN_PATCH}")
+endif()
+file(MAKE_DIRECTORY "${PATCHED_SWAPCHAIN}")
+file(GLOB staged RELATIVE "${SWAPCHAIN_STAGING}" "${SWAPCHAIN_STAGING}/*")
+foreach(file ${staged})
+    file(COPY_FILE "${SWAPCHAIN_STAGING}/${file}" "${PATCHED_SWAPCHAIN}/${file}" ONLY_IF_DIFFERENT)
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${SWAPCHAIN_PATCH}"
+             "${SWAPCHAIN}/FrameInterpolationSwapchainVK.cpp" "${SWAPCHAIN}/FrameInterpolationSwapchainVK.h")
 
 add_library(amd_fidelityfx_vk SHARED
     ffx_provider_linux.cpp
@@ -140,14 +153,14 @@ add_library(amd_fidelityfx_vk SHARED
     "${SDK}/src/backends/shared/blob_accessors/ffx_fsr3upscaler_shaderblobs.cpp"
     "${SDK}/src/backends/shared/blob_accessors/ffx_frameinterpolation_shaderblobs.cpp"
     "${SDK}/src/backends/shared/blob_accessors/ffx_opticalflow_shaderblobs.cpp"
-    "${CMAKE_CURRENT_BINARY_DIR}/FrameInterpolationSwapchainVK.cpp"
-    "${SWAPCHAIN}/FrameInterpolationSwapchainVK_Helpers.cpp"
-    "${SWAPCHAIN}/FrameInterpolationSwapchainVK_UiComposition.cpp"
-    "${SWAPCHAIN}/FrameInterpolationSwapchainVK_DebugPacing.cpp")
+    "${PATCHED_SWAPCHAIN}/FrameInterpolationSwapchainVK.cpp"
+    "${PATCHED_SWAPCHAIN}/FrameInterpolationSwapchainVK_Helpers.cpp"
+    "${PATCHED_SWAPCHAIN}/FrameInterpolationSwapchainVK_UiComposition.cpp"
+    "${PATCHED_SWAPCHAIN}/FrameInterpolationSwapchainVK_DebugPacing.cpp")
 target_include_directories(amd_fidelityfx_vk PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/compat" "${API}/include" "${API}/src" "${SDK}/include"
     "${CASE_LINKS}" "${SDK}/src/shared" "${SDK}/src/components" "${SDK}/src/backends/shared"
-    "${SDK}/src/backends/shared/blob_accessors" "${SWAPCHAIN}"
+    "${SDK}/src/backends/shared/blob_accessors" "${PATCHED_SWAPCHAIN}"
     "${FSR_VULKAN_ROOT}/generated/ffx-1.1.4/vk/fsr3upscaler"
     "${FSR_VULKAN_ROOT}/generated/ffx-1.1.4/vk/fsr3framegeneration")
 target_compile_definitions(amd_fidelityfx_vk PRIVATE
@@ -156,7 +169,7 @@ target_compile_definitions(amd_fidelityfx_vk PRIVATE
 target_compile_options(amd_fidelityfx_vk PRIVATE
     "SHELL:-include \"${FSR_VULKAN_ROOT}/src/ffx_1_1_4_portability.hpp\""
     "SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/linux_compat.h\"" -fms-extensions -w)
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/exports.map"
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/exports.map" CONTENT
      "{ global: ffxCreateContext; ffxDestroyContext; ffxConfigure; ffxQuery; ffxDispatch; local: *; };")
 target_link_libraries(amd_fidelityfx_vk PRIVATE Vulkan::Vulkan Threads::Threads)
 target_link_options(amd_fidelityfx_vk PRIVATE -Wl,--no-undefined -Wl,--exclude-libs,ALL

@@ -74,6 +74,11 @@ bool active{};
 // presents and paces the frames, and DLSS-G writes the generated one where FSR would.
 DlssNgx* dlss{};
 bool use_dlss{};
+std::atomic<u32> wanted_multiplier{2};
+// Generated frames per rendered frame the swapchain was given (0: not yet, for this swapchain).
+u32 applied_generated{};
+// The key of the Linux library's patched swapchain (fsr3_linux/patches).
+constexpr u64 GeneratedFramesKey = 0x5348;
 
 vk::PhysicalDevice physical_device;
 vk::Device device;
@@ -385,12 +390,10 @@ ffxReturnCode_t GenerateWithDlss(ffxDispatchDescFrameGeneration* params) {
         dlss_feature_format = current_format;
     }
     const auto backbuffer_image = static_cast<VkImage>(params->presentColor.resource);
-    const auto output_image = static_cast<VkImage>(params->outputs[0].resource);
     const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
     const auto format = static_cast<vk::Format>(current_format);
     const DlssNgx::Resource backbuffer{backbuffer_image, ViewOf(backbuffer_image), range, format,
                                        display};
-    const DlssNgx::Resource output{output_image, ViewOf(output_image), range, format, display};
     const DlssNgx::Resource depth{dlss_depth.image, dlss_depth.view, range, dlss_depth.format,
                                   render};
     const DlssNgx::Resource motion{dlss_motion.image, dlss_motion.view, range, dlss_motion.format,
@@ -398,14 +401,23 @@ ffxReturnCode_t GenerateWithDlss(ffxDispatchDescFrameGeneration* params) {
     const DlssNgx::Resource hudless{dlss_hudless.image, dlss_hudless.view, range,
                                     dlss_hudless.format, dlss_hudless.extent};
     const bool with_hudless = dlss_has_hudless && dlss_hudless.extent == display;
-    if (!backbuffer.view || !output.view)
+    if (!backbuffer.view)
         return FFX_API_RETURN_ERROR;
-    // The swapchain hands over the frame in the shader-read layout, the output in the general one.
+    // The swapchain hands over the frame in the shader-read layout, the outputs in the general
+    // one; each generated frame in order.
     Transition(command, backbuffer_image, vk::ImageLayout::eShaderReadOnlyOptimal,
                vk::ImageLayout::eGeneral);
-    const bool generated = dlss->FrameGenEvaluate(command, backbuffer, depth, motion, output,
-                                                  with_hudless ? &hudless : nullptr, *dlss_inputs,
-                                                  MvecScale(render), dlss_reset || params->reset);
+    const u32 count = std::max(params->numGeneratedFrames, 1u);
+    bool generated = true;
+    for (u32 i = 0; i < count && generated; ++i) {
+        const auto output_image = static_cast<VkImage>(params->outputs[i].resource);
+        const DlssNgx::Resource output{output_image, ViewOf(output_image), range, format, display};
+        generated =
+            output.view &&
+            dlss->FrameGenEvaluate(command, backbuffer, depth, motion, output,
+                                   with_hudless ? &hudless : nullptr, *dlss_inputs,
+                                   MvecScale(render), dlss_reset || params->reset, count, i + 1);
+    }
     Transition(command, backbuffer_image, vk::ImageLayout::eGeneral,
                vk::ImageLayout::eShaderReadOnlyOptimal);
     dlss_reset = false;
@@ -514,6 +526,14 @@ bool UsingDlss() {
     return active && use_dlss;
 }
 
+void SetMultiplier(u32 frames_shown) {
+    wanted_multiplier = frames_shown;
+}
+
+u32 MaxMultiplier() {
+    return UsingDlss() ? dlss->FrameGenMaxCount() + 1 : 2;
+}
+
 bool Active() {
     return active;
 }
@@ -572,6 +592,7 @@ vk::Result CreateSwapchain(const vk::SwapchainCreateInfoKHR& info, vk::Swapchain
     }
     swapchain = handle;
     current_swapchain = handle;
+    applied_generated = 0;
     current_format = create_info.imageFormat;
     last_present_count = functions.pOutGetLastPresentCountFFXAPI
                              ? functions.pOutGetLastPresentCountFFXAPI(handle)
@@ -626,6 +647,23 @@ void SetFrame(const FrameGen::FrameInputs* inputs, const FrameGen::OverlayInputs
         inputs = nullptr;
     if (!context)
         return;
+
+    if (use_dlss) {
+        const u32 generated = std::clamp(wanted_multiplier.load(), 2u, MaxMultiplier()) - 1;
+        if (generated != applied_generated) {
+            u32 value = generated;
+            ffxConfigureDescFrameGenerationSwapChainKeyValueVK key{};
+            key.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_KEYVALUE_VK;
+            key.key = GeneratedFramesKey;
+            key.ptr = &value;
+            if (api.configure(&swapchain_context, &key.header) == FFX_API_RETURN_OK)
+                LOG_INFO(Render_Vulkan, "[FSR-FG] DLSS-G {}x", generated + 1);
+            else
+                LOG_WARNING(Render_Vulkan, "[FSR-FG] The swapchain took no multiplier ({}x)",
+                            generated + 1);
+            applied_generated = generated;
+        }
+    }
 
     ++frame_id;
     ffxConfigureDescFrameGeneration config{};
@@ -696,6 +734,10 @@ u32 TakeShown() {
 
 bool UsingDlss() {
     return false;
+}
+void SetMultiplier(u32) {}
+u32 MaxMultiplier() {
+    return 2;
 }
 bool PlanQueues(vk::Instance, vk::PhysicalDevice, u32, vk::SurfaceKHR, QueuePlan&) {
     selected = false;

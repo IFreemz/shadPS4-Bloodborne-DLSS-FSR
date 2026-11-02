@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright 2026 IFreemz
+# SPDX-License-Identifier: MIT
+
+# Patches for files outside this repository: blank context lines are a single space, and
+# patch(1) needs LF line endings.
+*.patch text eol=lf -whitespace

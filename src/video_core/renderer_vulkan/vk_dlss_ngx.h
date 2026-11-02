@@ -72,11 +72,12 @@ public:
     };
     // Releases an existing feature first; the caller must have drained the GPU if one exists.
     bool FrameGenCreate(vk::CommandBuffer command, const FrameGenDesc& desc);
-    // Everything in the general layout. `hudless` may be null.
+    // Everything in the general layout. `hudless` may be null. Frame `index` (1 ..
+    // `count`) of the `count` generated between two rendered frames.
     bool FrameGenEvaluate(vk::CommandBuffer command, const Resource& backbuffer,
                           const Resource& depth, const Resource& motion, const Resource& output,
                           const Resource* hudless, const FrameGen::FrameInputs& inputs,
-                          std::array<float, 2> mvec_scale, bool reset);
+                          std::array<float, 2> mvec_scale, bool reset, u32 count, u32 index);
     void FrameGenReleaseAfterGpuDrain();
 
 private:

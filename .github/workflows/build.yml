@@ -188,7 +188,7 @@ jobs:
     - name: Install
       run: |
         sudo apt update
-        sudo apt install -y clang-19 clang-tools-19 libstdc++-14-dev ninja-build \
+        sudo apt install -y clang-19 clang-tools-19 libstdc++-14-dev ninja-build patch \
           libasound2-dev libpulse-dev libopenal-dev libssl-dev zlib1g-dev libedit-dev \
           libudev-dev libevdev-dev libjack-dev libsndio-dev libvulkan-dev libpng-dev \
           libusb-1.0-0-dev libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \

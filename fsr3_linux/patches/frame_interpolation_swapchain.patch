@@ -1,0 +1,346 @@
+SPDX-FileCopyrightText: Copyright (C) 2024 Advanced Micro Devices, Inc.
+SPDX-FileCopyrightText: Copyright 2026 IFreemz
+SPDX-License-Identifier: MIT
+
+AMD's Vulkan frame generation swapchain (FidelityFX SDK v1.1.4), for Linux:
+- up to three generated frames per rendered one (DLSS Multi Frame Generation), set with the
+  swapchain key FFX_FI_SWAPCHAIN_CONFIGURE_KEY_GENERATED_FRAMES, paced evenly;
+- a failed generation shows only the rendered frame instead of a stale generated one;
+- two constructs only MSVC accepts.
+Applied by CMakeLists.txt to a copy of the swapchain sources.
+
+--- a/FrameInterpolationSwapchainVK.h
++++ b/FrameInterpolationSwapchainVK.h
+@@ -46,6 +46,9 @@
+ #define FFX_FRAME_INTERPOLATION_SWAP_CHAIN_VERSION                     1
+ #define FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT            6
+ #define FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_ACQUIRE_SEMAPHORE_COUNT 8
++// shadPS4 (Linux): up to three generated frames per rendered one, for DLSS Multi Frame Generation.
++#define FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_GENERATED_FRAMES        3
++#define FFX_FI_SWAPCHAIN_CONFIGURE_KEY_GENERATED_FRAMES                0x5348
+ 
+ //////////////////////////////////////////////
+ /// Vulkan API overridden functions
+@@ -117,6 +120,8 @@
+     typedef enum FrameType
+     {
+         Interpolated_1,
++        Interpolated_2,
++        Interpolated_3,
+         Real,
+         Count
+     } FrameType;
+@@ -252,6 +257,7 @@
+     VkCommandBuffer getInterpolationCommandList();
+     void            registerUiResource(FfxResource uiResource, uint32_t flags);
+     void            setWaitCallback(FfxWaitCallbackFunc waitCallbackFunc);
++    void            setGeneratedFrameCount(uint32_t count);
+     void            getGpuMemoryUsage(FfxEffectMemoryUsage* vramUsage);
+ 
+ private:
+@@ -276,7 +282,7 @@
+     VkResult queuePresentNonInterpolated(VkCommands* pCommands, uint32_t imageIndex, SubmissionSemaphores& semaphoresToWait);
+ 
+     void     dispatchInterpolationCommands(uint32_t              currentBackBufferIndex,
+-                                           FfxResource*          pInterpolatedFrame,
++                                           FfxResource*          pInterpolatedFrames,
+                                            FfxResource*          pRealFrame,
+                                            SubmissionSemaphores& semaphoresToWait);
+     void     discardOutstandingInterpolationCommandLists();
+@@ -316,7 +322,9 @@
+     
+     uint32_t            gameBufferCount                                                             = 0;
+     ReplacementResource replacementSwapBuffers[FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_BUFFER_COUNT] = {};
+-    ReplacementResource interpolationOutputs[2]                                                     = {};
++    // Double-buffered, one set per generated frame.
++    ReplacementResource interpolationOutputs[2 * FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_GENERATED_FRAMES] = {};
++    uint32_t            generatedFrameCount                                                         = 1;
+     ReplacementResource uiReplacementBuffer                                                         = {};
+     uint32_t            replacementSwapBufferIndex                                                  = 0;
+     uint32_t            interpolationBufferIndex                                                    = 0;
+--- a/FrameInterpolationSwapchainVK.cpp
++++ b/FrameInterpolationSwapchainVK.cpp
+@@ -28,6 +28,8 @@
+ 
+ #include <FidelityFX/host/ffx_assert.h>
+ 
++#include <algorithm>
++
+ ///////////////////////////////////////////////////////////////////
+ //                    MODES EXPLAINED
+ ///////////////////////////////////////////////////////////////////
+@@ -660,7 +662,7 @@
+         switch (key)
+         {
+             case FFX_FI_SWAPCHAIN_CONFIGURE_KEY_WAITCALLBACK:
+-                pSwapChainVK->setWaitCallback(static_cast<FfxWaitCallbackFunc>(valuePtr));
++                pSwapChainVK->setWaitCallback(reinterpret_cast<FfxWaitCallbackFunc>(valuePtr));
+             break;
+             case FFX_FI_SWAPCHAIN_CONFIGURE_KEY_FRAMEPACINGTUNING:
+                 if (valuePtr != nullptr)
+@@ -668,6 +670,11 @@
+                     pSwapChainVK->setFramePacingTuning(static_cast<FfxSwapchainFramePacingTuning*>(valuePtr));
+                 }
+             break;
++            case FFX_FI_SWAPCHAIN_CONFIGURE_KEY_GENERATED_FRAMES:
++                if (valuePtr == nullptr)
++                    return FFX_ERROR_INVALID_ARGUMENT;
++                pSwapChainVK->setGeneratedFrameCount(*static_cast<const uint32_t*>(valuePtr));
++                return FFX_OK;
+             return FFX_OK;
+         }
+     }
+@@ -847,7 +854,7 @@
+         ImageBarrierHelper preCallbackBarriers;
+         if (pPresenter->interpolationQueue.familyIndex != compositionQueue.familyIndex)
+         {
+-            if (frameType == PacingData::FrameType::Interpolated_1)
++            if (frameType != PacingData::FrameType::Real)
+             {
+                 // this is the interpolation buffer
+                 preCallbackBarriers.add(static_cast<VkImage>(frameInfo.resource.resource),
+@@ -1184,7 +1191,7 @@
+                     // if no frame was presented, we still need to update the semaphore
+                     if (toWait.count > 0)
+                     {
+-                        presenter->presentQueue.submit(VK_NULL_HANDLE, toWait, SubmissionSemaphores());
++                        presenter->presentQueue.submit(VK_NULL_HANDLE, toWait, *std::make_unique<SubmissionSemaphores>());
+                     }
+ 
+                     numFramesSentForPresentation = entry.numFramesSentForPresentationBase + entry.numFramesToPresent;
+@@ -1264,10 +1271,11 @@
+ 
+                     // set presentation time: reduce based on variance and subract safety margin so we don't lock on a framerate lower than necessary
+                     int64_t qpcSafetyMargin         = int64_t(qpcFrequency * presenter->safetyMarginInSec);
+-                    const int64_t conservativeAvg   = int64_t(frameTime.getAverage() * 0.5 - frameTime.getVariance() * presenter->varianceFactor);
++                    const double  framesShown       = entry.numFramesToPresent > 0 ? double(entry.numFramesToPresent) : 2.0;
++                    const int64_t conservativeAvg   = int64_t(frameTime.getAverage() / framesShown - frameTime.getVariance() * presenter->varianceFactor);
+                     const int64_t deltaToUse        = conservativeAvg > qpcSafetyMargin ? (conservativeAvg - qpcSafetyMargin) : 0;
+-                    entry.frames[PacingData::FrameType::Interpolated_1].presentQpcDelta = deltaToUse;
+-                    entry.frames[PacingData::FrameType::Real].presentQpcDelta           = deltaToUse;
++                    for (uint32_t frameType = 0; frameType < PacingData::FrameType::Count; frameType++)
++                        entry.frames[frameType].presentQpcDelta = deltaToUse;
+ 
+                     // schedule presents
+                     EnterCriticalSection(&presenter->scheduledFrameCriticalSection);
+@@ -1942,18 +1950,18 @@
+ 
+ FfxResource FrameInterpolationSwapChainVK::interpolationOutput(int index)
+ {
+-    index = interpolationBufferIndex;
++    index = interpolationBufferIndex * FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_GENERATED_FRAMES + index;
+ 
+     FfxResourceDescription interpolateDesc = interpolationOutputs[index].description;
+     return ffxGetResourceVK(interpolationOutputs[index].image, interpolateDesc, nullptr, FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+ }
+ 
+ void FrameInterpolationSwapChainVK::dispatchInterpolationCommands(uint32_t              currentBackBufferIndex,
+-                                                                  FfxResource*          pInterpolatedFrame,
++                                                                  FfxResource*          pInterpolatedFrames,
+                                                                   FfxResource*          pRealFrame,
+                                                                   SubmissionSemaphores& semaphoresToWait)
+ {
+-    FFX_ASSERT(pInterpolatedFrame);
++    FFX_ASSERT(pInterpolatedFrames);
+     FFX_ASSERT(pRealFrame);
+ 
+     VkImage                currentBackBuffer      = replacementSwapBuffers[currentBackBufferIndex].image;
+@@ -1962,16 +1970,23 @@
+ 
+     *pRealFrame = backbuffer;
+ 
++    // The registered command list path generates one frame.
++    const uint32_t frameCount = registeredInterpolationCommandLists[currentBackBufferIndex] != nullptr ? 1 : generatedFrameCount;
++    const uint32_t firstOutput = interpolationBufferIndex * FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_GENERATED_FRAMES;
++    uint64_t outputsAvailable = 0;
++    for (uint32_t i = 0; i < frameCount; ++i)
++        outputsAvailable = std::max(outputsAvailable, interpolationOutputs[firstOutput + i].availabilitySemaphoreValue);
++
+     // interpolation queue must wait for output resource to become available
+     if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnPresentQueue)
+     {
+         // in those cases, interpolation output is available after composition
+-        semaphoresToWait.add(presentInfo.compositionSemaphore, interpolationOutputs[interpolationBufferIndex].availabilitySemaphoreValue);
++        semaphoresToWait.add(presentInfo.compositionSemaphore, outputsAvailable);
+     }
+     else if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnGameQueue)
+     {
+         // when there is a copy on the present queue from the present thread, the interpolation output will be available when the present semaphore is signaled
+-        semaphoresToWait.add(presentInfo.presentSemaphore, interpolationOutputs[interpolationBufferIndex].availabilitySemaphoreValue);
++        semaphoresToWait.add(presentInfo.presentSemaphore, outputsAvailable);
+     }
+ 
+     // check necessary transitions
+@@ -1988,8 +2003,9 @@
+     }
+ 
+     // interpolation texture previous content doesn't matter here so we can use an undefined source layout
+-    preInterpolationBarriers.add(
+-        interpolationOutputs[interpolationBufferIndex].image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
++    for (uint32_t i = 0; i < frameCount; ++i)
++        preInterpolationBarriers.add(
++            interpolationOutputs[firstOutput + i].image, 0, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+     
+     auto pRegisteredCommandList = registeredInterpolationCommandLists[currentBackBufferIndex];
+     if (pRegisteredCommandList != nullptr)
+@@ -2016,24 +2032,20 @@
+         FFX_ASSERT_MESSAGE_FORMAT(res == VK_SUCCESS, "dispatchInterpolationCommands failed with error %d", res);
+ 
+         frameInterpolationResetCondition = false;
+-        *pInterpolatedFrame = interpolationOutput();
++        pInterpolatedFrames[0] = interpolationOutput(0);
+     }
+     else
+     {
+         VkCommands* interpolationCommandList = presentInfo.commandPool.get(presentInfo.device, presentInfo.interpolationQueue, "interpolationCommandList");
+         VkCommandBuffer interpolationCommandBuffer = interpolationCommandList->reset();
+ 
+-        FfxResource interpolatedResource = interpolationOutput();
+-        VkImage     interpolatedImage    = static_cast<VkImage>(interpolatedResource.resource);
+-
+-        FFX_ASSERT_MESSAGE(interpolationOutputs[interpolationBufferIndex].image == interpolatedImage, "Error when querying interpolation output");
+-
+         FfxFrameGenerationDispatchDescription desc{};
+         desc.commandList                = ffxGetCommandListVK(interpolationCommandBuffer);
+-        desc.outputs[0]                 = interpolatedResource;
++        for (uint32_t i = 0; i < frameCount; ++i)
++            desc.outputs[i] = interpolationOutput(int(i));
+         desc.presentColor               = backbuffer;
+         desc.reset                      = frameInterpolationResetCondition;
+-        desc.numInterpolatedFrames      = 1;
++        desc.numInterpolatedFrames      = frameCount;
+         desc.backBufferTransferFunction = static_cast<FfxBackbufferTransferFunction>(backBufferTransferFunction);
+         desc.minMaxLuminance[0]         = minLuminance;
+         desc.minMaxLuminance[1]         = maxLuminance;
+@@ -2043,7 +2055,8 @@
+         // execute the necessary transitions
+         preInterpolationBarriers.record(interpolationCommandBuffer);
+ 
+-        if (frameGenerationCallback(&desc, frameGenerationCallbackContext) == FFX_OK)
++        const bool generated = frameGenerationCallback(&desc, frameGenerationCallbackContext) == FFX_OK;
++        if (generated)
+         {
+             SubmissionSemaphores semaphoresToSignal;
+ 
+@@ -2062,13 +2075,14 @@
+             if (presentInfo.interpolationQueue.familyIndex != compositionQueueFamily)
+             {
+                 // interpolation output queue family ownership transfer
+-                postInterpolationBarriers.add(interpolatedImage,
+-                                              InterpolationBufferTransferState.accessMask,
+-                                              InterpolationBufferTransferState.accessMask,
+-                                              InterpolationBufferTransferState.layout,
+-                                              InterpolationBufferTransferState.layout,
+-                                              presentInfo.interpolationQueue.familyIndex,
+-                                              compositionQueueFamily);
++                for (uint32_t i = 0; i < frameCount; ++i)
++                    postInterpolationBarriers.add(static_cast<VkImage>(desc.outputs[i].resource),
++                                                  InterpolationBufferTransferState.accessMask,
++                                                  InterpolationBufferTransferState.accessMask,
++                                                  InterpolationBufferTransferState.layout,
++                                                  InterpolationBufferTransferState.layout,
++                                                  presentInfo.interpolationQueue.familyIndex,
++                                                  compositionQueueFamily);
+ 
+                 // backbuffer queue family ownership transfer
+                 if (!presentInterpolatedOnly)
+@@ -2094,11 +2108,12 @@
+             interpolationCommandList->drop();
+         }
+ 
+-        // reset condition if at least one frame was interpolated
+-        if (desc.numInterpolatedFrames > 0)
++        // reset condition if at least one frame was interpolated; nothing generated, nothing to show
++        if (generated && desc.numInterpolatedFrames > 0)
+         {
+             frameInterpolationResetCondition = false;
+-            *pInterpolatedFrame              = interpolationOutput();
++            for (uint32_t i = 0; i < desc.numInterpolatedFrames; ++i)
++                pInterpolatedFrames[i] = desc.outputs[i];
+         }
+     }
+ }
+@@ -2174,9 +2189,9 @@
+     SubmissionSemaphores ToWaitInterpolationQueue;
+     ToWaitInterpolationQueue.add(presentInfo.gameSemaphore, gameSemaphoreValue);
+ 
+-    FfxResource interpolatedFrame{}, realFrame{};
++    FfxResource interpolatedFrames[FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_GENERATED_FRAMES]{}, realFrame{};
+     dispatchInterpolationCommands(
+-        currentBackBufferIndex, &interpolatedFrame, &realFrame, ToWaitInterpolationQueue);
++        currentBackBufferIndex, interpolatedFrames, &realFrame, ToWaitInterpolationQueue);
+ 
+     EnterCriticalSection(&presentInfo.scheduledFrameCriticalSection);
+ 
+@@ -2198,14 +2213,17 @@
+     entry.usePremulAlphaComposite          = (presentInfo.uiCompositionFlags & FFX_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA) != 0;
+     entry.currentFrameID                   = currentFrameID;
+ 
+-    // interpolated
+-    PacingData::FrameInfo& fiInterpolated = entry.frames[PacingData::FrameType::Interpolated_1];
+-    if (interpolatedFrame.resource != nullptr)
+-    {
+-        fiInterpolated.doPresent                            = true;
+-        fiInterpolated.resource                             = interpolatedFrame;
+-        fiInterpolated.interpolationCompletedSemaphoreValue = interpolationSemaphoreValue;
+-        fiInterpolated.presentIndex                         = ++framesSentForPresentation;
++    // interpolated, in order
++    for (uint32_t i = 0; i < FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_GENERATED_FRAMES; ++i)
++    {
++        PacingData::FrameInfo& fiInterpolated = entry.frames[PacingData::FrameType::Interpolated_1 + i];
++        if (interpolatedFrames[i].resource != nullptr)
++        {
++            fiInterpolated.doPresent                            = true;
++            fiInterpolated.resource                             = interpolatedFrames[i];
++            fiInterpolated.interpolationCompletedSemaphoreValue = interpolationSemaphoreValue;
++            fiInterpolated.presentIndex                         = ++framesSentForPresentation;
++        }
+     }
+ 
+     // real
+@@ -2224,7 +2242,14 @@
+     entry.replacementBufferSemaphoreSignal = framesSentForPresentation;
+     entry.numFramesToPresent               = static_cast<uint32_t>(framesSentForPresentation - entry.numFramesSentForPresentationBase);
+ 
+-    interpolationOutputs[interpolationBufferIndex].availabilitySemaphoreValue = entry.numFramesSentForPresentationBase + fiInterpolated.doPresent;
++    // Each output is free again once its frame was presented.
++    for (uint32_t i = 0; i < FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_GENERATED_FRAMES; ++i)
++    {
++        const PacingData::FrameInfo& fiInterpolated = entry.frames[PacingData::FrameType::Interpolated_1 + i];
++        if (fiInterpolated.doPresent)
++            interpolationOutputs[interpolationBufferIndex * FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_GENERATED_FRAMES + i].availabilitySemaphoreValue =
++                fiInterpolated.presentIndex;
++    }
+ 
+     if (presentInfo.compositionMode == FGSwapchainCompositionMode::eComposeOnGameQueue)
+     {
+@@ -2259,6 +2284,11 @@
+     presentInfo.waitCallback = waitCallbackFunc;
+ }
+ 
++void FrameInterpolationSwapChainVK::setGeneratedFrameCount(uint32_t count)
++{
++    generatedFrameCount = std::clamp<uint32_t>(count, 1, FFX_FRAME_INTERPOLATION_SWAP_CHAIN_MAX_GENERATED_FRAMES);
++}
++
+ 
+ void FrameInterpolationSwapChainVK::getGpuMemoryUsage(FfxEffectMemoryUsage* vramUsage)
+ {
+@@ -2695,7 +2725,7 @@
+     // Unregister any potential command list
+     registeredInterpolationCommandLists[currentBackBufferIndex] = nullptr;
+     presentCount++;
+-    interpolationBufferIndex = presentCount % _countof(interpolationOutputs);
++    interpolationBufferIndex = presentCount % 2;
+ 
+     // update active backbuffer and block when no buffer is available
+     replacementSwapBufferIndex = presentCount % gameBufferCount;
+@@ -2823,7 +2853,7 @@
+         // if no frame was presented, we still need to update the semaphore
+         if (toWait.count > 0)
+         {
+-            res = presentInfo.gameQueue.submit(VK_NULL_HANDLE, toWait, SubmissionSemaphores());
++            res = presentInfo.gameQueue.submit(VK_NULL_HANDLE, toWait, *std::make_unique<SubmissionSemaphores>());
+         }
+     }
+ 

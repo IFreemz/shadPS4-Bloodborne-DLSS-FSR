@@ -111,11 +111,11 @@ void SetMultiplier(u32 value) {
     value = std::clamp<u32>(value, 2, 6);
     if (multiplier.exchange(value) != value)
         RecordTiming("multiplier", 0, 0, value);
+    FsrFrameGen::SetMultiplier(value);
 }
 
 u32 MaxMultiplier() {
-    // FSR 3.1 generates one frame per rendered frame.
-    return FsrFrameGen::Active() ? 2 : max_multiplier.load();
+    return FsrFrameGen::Active() ? FsrFrameGen::MaxMultiplier() : max_multiplier.load();
 }
 
 std::string Problem() {

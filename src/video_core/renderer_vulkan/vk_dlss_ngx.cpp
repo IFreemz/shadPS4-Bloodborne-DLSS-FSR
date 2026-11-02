@@ -270,7 +270,7 @@ bool DlssNgx::FrameGenEvaluate(vk::CommandBuffer command, const Resource& backbu
                                const Resource& depth, const Resource& motion,
                                const Resource& output, const Resource* hudless,
                                const FrameGen::FrameInputs& inputs, std::array<float, 2> mvec_scale,
-                               bool reset) {
+                               bool reset, u32 count, u32 index) {
     if (!impl->available)
         return false;
     ShadDlssgEvaluate evaluate{};
@@ -300,8 +300,8 @@ bool DlssNgx::FrameGenEvaluate(vk::CommandBuffer command, const Resource& backbu
                 sizeof(evaluate.prev_clip_to_clip));
     evaluate.depth_inverted = inputs.depth_inverted;
     evaluate.reset = reset;
-    evaluate.multi_frame_count = 1;
-    evaluate.multi_frame_index = 1;
+    evaluate.multi_frame_count = count;
+    evaluate.multi_frame_index = index;
     return impl->api->FrameGenEvaluate(command, &evaluate) != 0;
 }
 
@@ -353,7 +353,7 @@ bool DlssNgx::FrameGenCreate(vk::CommandBuffer, const FrameGenDesc&) {
 }
 bool DlssNgx::FrameGenEvaluate(vk::CommandBuffer, const Resource&, const Resource&, const Resource&,
                                const Resource&, const Resource*, const FrameGen::FrameInputs&,
-                               std::array<float, 2>, bool) {
+                               std::array<float, 2>, bool, u32, u32) {
     return false;
 }
 void DlssNgx::FrameGenReleaseAfterGpuDrain() {}

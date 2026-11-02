@@ -49,6 +49,10 @@ void SetDevice(vk::PhysicalDevice physical, vk::Device device, vk::Queue game_qu
 bool Active();
 // Active, with DLSS-G generating the frames.
 bool UsingDlss();
+// Frames shown per rendered frame (dlss.ini fg_multiplier), within MaxMultiplier.
+void SetMultiplier(u32 frames_shown);
+// 2 with FSR, up to 4 with DLSS-G on RTX 50 series cards.
+u32 MaxMultiplier();
 // Why it is not active although it was selected (empty otherwise).
 std::string Problem();
 // Before the device is destroyed, after the swapchain.
